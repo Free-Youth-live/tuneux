@@ -1,0 +1,54 @@
+# =============================================================================
+# tuneux · Cargo workspace 根
+#
+# 版权所有 © 2026 不羁的青春（FreeYouth）
+# 本项目采用木兰宽松许可证，第 2 版（MulanPSL-2.0）开源。
+#
+# 架构：mono repo + Cargo workspace 四 crate 同仓。
+# 单一 Cargo.lock 保证跨 crate 依赖类型一致。
+# =============================================================================
+
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+# -----------------------------------------------------------------------------
+# workspace 级统一依赖版本（各 crate 以 .workspace = true 引用，杜绝版本漂移）
+# -----------------------------------------------------------------------------
+[workspace.dependencies]
+# 音频后端：纯 symphonia + cpal（不使用 rodio）
+cpal = "0.15"
+symphonia = { version = "0.6", features = [
+    "mp3", "aac", "alac", "flac", "isomp4", "ogg", "vorbis", "wav", "pcm",
+] }
+# 线程间通信与缓冲
+ringbuf = "0.4"
+crossbeam-channel = "0.5"
+# 重采样与频谱
+rubato = "0.15"
+rustfft = "6"
+# 终端 UI
+ratatui = "0.30.2"
+unicode-width = "0.1"
+crossterm = "0.28"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# 配置文件
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
+# 歌词编码检测
+encoding_rs = "0.8"
+
+# -----------------------------------------------------------------------------
+# workspace 级统一 lint（规范：生产路径零 unsafe）
+# -----------------------------------------------------------------------------
+[workspace.lints]
+rust.unsafe_code = "forbid"
+
+# -----------------------------------------------------------------------------
+# 优化配置（仅认 workspace 根；release 构建优化体积与性能）
+# -----------------------------------------------------------------------------
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
