@@ -75,6 +75,12 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo dpkg --add-architecture arm64
+          # 添加 Ubuntu ports 源（提供 arm64 的包）
+          echo 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble main universe restricted multiverse' | sudo tee /etc/apt/sources.list.d/ports-arm64.list
+          echo 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble-updates main universe restricted multiverse' | sudo tee -a /etc/apt/sources.list.d/ports-arm64.list
+          echo 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble-security main universe restricted multiverse' | sudo tee -a /etc/apt/sources.list.d/ports-arm64.list
+          # 限制默认源只取 amd64（关键：避免默认源尝试 arm64 导致 404）
+          sudo sed -i '/^Types: deb$/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu libasound2-dev:arm64
 
