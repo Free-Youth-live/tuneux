@@ -135,6 +135,7 @@ jobs:
       - name: 创建发布并上传
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "发布已存在，仅上传产物"
