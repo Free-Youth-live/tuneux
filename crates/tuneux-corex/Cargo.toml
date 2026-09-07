@@ -10,7 +10,7 @@
 
 [package]
 name = "tuneux-corex"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 license = "MulanPSL-2.0"
 authors = ["不羁的青春（FreeYouth）"]

@@ -2,8 +2,7 @@
 //!
 //! 解析标准 `.cue` 文本（红皮书 CUE 语法子集），提取曲目分轨信息，
 //! 供播放器把"整轨音频文件 + .cue"展开为多首可独立播放的曲目。
-//!
-//! 纯 Rust、零依赖、零 unsafe；`#![warn(missing_docs)]` 已覆盖。
+//! 纯 Rust、零依赖、零 unsafe；`#![deny(missing_docs)]` 已覆盖。
 
 use std::fmt;
 

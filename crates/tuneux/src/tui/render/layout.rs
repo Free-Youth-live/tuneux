@@ -94,8 +94,7 @@ pub struct LayoutMetrics {
 /// - 搜索框 = vertical([Length(1), Min(1)]) 的第一段 → 再减 1 行。
 ///
 /// 注意：ratatui 的 50% 上下分割在奇数高度下可能把多出的 1 行分给
-/// 任一段（求解器行为），这里的 main_h / 2 按下取整——与改造前
-/// main.rs 的推算完全一致（行为不变优先）。
+/// 任一段（求解器行为），这里的 main_h / 2 按下取整（行为不变优先）。
 pub fn layout_metrics(
     term_size: (u16, u16),
     spectrum_mode: SpectrumMode,
@@ -116,14 +115,14 @@ pub fn layout_metrics(
     let playlist_panel_h = match spectrum_mode {
         SpectrumMode::Hidden => main_h,
         SpectrumMode::Half => main_h / 2,
-        // 全屏频谱：列表根本不渲染
-        SpectrumMode::Full => 0,
+        // 全屏频谱/示波器：列表根本不渲染
+        SpectrumMode::Full | SpectrumMode::Oscilloscope => 0,
     };
     // 频谱面板高度：与播放列表互补。
     let spectrum_panel_h = match spectrum_mode {
         SpectrumMode::Hidden => 0,
         SpectrumMode::Half => main_h - main_h / 2,
-        SpectrumMode::Full => main_h,
+        SpectrumMode::Full | SpectrumMode::Oscilloscope => main_h,
     };
 
     // 搜索状态拆分：浏览器搜索占浏览器顶部 1 行；列表搜索占列表顶部 1 行。
@@ -131,8 +130,7 @@ pub fn layout_metrics(
     let playlist_searching = search_mode && search_target == SearchTarget::Playlist;
 
     // 播放列表可视行数：外框 - 上下边框 2 行；列表搜索时再让 1 行输入框。
-    // 注意：列表搜索的 -1 是 render.rs（draw_playlist）的实际行为，
-    // 改造前 main.rs 漏算了这一行（见任务记录），此处以 render.rs 为准。
+    // 注意：列表搜索的 -1 以 render.rs（draw_playlist）的实际行为为准。
     let playlist_visible_rows = playlist_panel_h
         .saturating_sub(PANEL_BORDERS_H)
         .saturating_sub(if playlist_searching { SEARCH_LINE_H } else { 0 })

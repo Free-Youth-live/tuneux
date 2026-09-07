@@ -34,27 +34,16 @@
 //! 实现上用 `OsStr::to_str()`（返回 `Option`，严格判定）而非
 //! `to_string_lossy()`（容忍替换成占位符），从源头杜绝乱码。
 
+// 本模块与插件版（tuneux-fx）fs_browser 同源；异步化导航后 navigate_to/enter_selected/go_up
+// 仅由 FsBrowser::open 与单元测试使用，临时豁免 dead_code 警告。
+#![allow(dead_code)]
+
 use std::path::{Path, PathBuf};
 
-/// tuneux 支持的音乐文件扩展名（小写，不含点）。
-///
-/// 这个列表必须与 README 中"支持的音频格式"一致，也与
-/// symphonia 启用的解码 feature 对应——只列出能实际播放的格式，
-/// 避免在浏览器里展示一个选了却播不了的文件。
-///
-/// 注：`m4a` 容器可能承载 AAC 或 ALAC，二者 symphonia 均支持；
-/// `alac` 单独列出以兼容少数直接用该扩展名的文件。
-pub const SUPPORTED_EXTS: &[&str] = &[
-    "mp3",  // MPEG-1/2 Audio Layer III
-    "flac", // FLAC 无损
-    "wav",  // RIFF WAV（PCM）
-    "ogg",  // Ogg Vorbis
-    "m4a",  // MP4 容器（AAC / ALAC）
-    "aac",  // 裸 AAC 流
-    "alac", // Apple Lossless（多数用 m4a，此处兼容）
-    "opus", // Ogg Opus（纯 Rust 解码器）
-    "wv",   // WavPack 无损（纯 Rust 解码器）
-];
+/// tuneux 认识的音乐文件扩展名（小写，不含点），清单由内核统一维护
+/// （`tuneux_corex::KNOWN_AUDIO_EXTS`：原生 + ffmpeg 长尾）。浏览器只负责
+/// 显示"认识"的格式；能否播放由解码时判定，不能播放的会自动跳过并提示。
+pub use tuneux_corex::KNOWN_AUDIO_EXTS as SUPPORTED_EXTS;
 
 /// 判断文件路径是否为 tuneux 支持的音乐文件。
 ///
@@ -154,8 +143,14 @@ pub struct FsBrowser {
     search_all: Vec<Entry>,
 
     /// 搜索是否因超过条目数上限而被截断。
-    /// begin_search 时设置，渲染层据此提示"目录过大，仅搜索了部分内容"。
+    /// 由 apply_search_collected 提交收集结果时设置（begin_search 先置
+    /// false），渲染层据此提示"目录过大，仅搜索了部分内容"。
     search_truncated: bool,
+
+    /// 目录树异步收集是否仍在进行（begin_search 置真，
+    /// apply_search_collected / end_search 置假）：期间 set_filter 只记
+    /// 关键字不过滤——缓存尚空，此刻过滤会把列表清成空白。
+    search_collecting: bool,
 
     /// 进入搜索前的一级条目（退出搜索时恢复）。
     saved_entries: Vec<Entry>,
@@ -187,6 +182,7 @@ impl FsBrowser {
             searching: false,
             search_all: Vec::new(),
             search_truncated: false,
+            search_collecting: false,
             saved_entries: Vec::new(),
             saved_selected: 0,
             saved_scroll: 0,
@@ -242,21 +238,37 @@ impl FsBrowser {
         self.entries.get(self.selected)
     }
 
-    /// 进入搜索模式：保存当前一级条目状态，并递归收集整个目录树。
+    /// 进入搜索模式：保存当前一级条目状态，标记「目录树收集中」。
     ///
-    /// 进入后 `entries` 变为递归收集的完整结果（关键字尚未过滤），
-    /// 用户随后的每次输入通过 [`FsBrowser::set_filter`] 从该缓存中过滤。
-    /// 必须成对调用 [`FsBrowser::end_search`] 恢复一级条目。
+    /// 收集已异步化（App 侧后台线程调 [`collect_recursive_entries`]，
+    /// 结果经 [`FsBrowser::apply_search_collected`] 提交）：收集期间
+    /// entries 维持一级列表、[`FsBrowser::set_filter`] 只记关键字不过滤，结果到达后
+    /// 按当前关键字过滤立即生效。必须成对调用 [`FsBrowser::end_search`]
+    /// 恢复一级条目。
     pub fn begin_search(&mut self) {
         self.saved_entries = self.entries.clone();
         self.saved_selected = self.selected;
         self.saved_scroll = self.scroll;
-        let (entries, truncated) = self.collect_recursive_entries();
+        self.search_all = Vec::new();
+        self.search_truncated = false;
+        self.searching = true;
+        self.search_collecting = true;
+        self.filter.clear();
+        // 不替换 entries：等待异步收集结果（apply_search_collected）。
+    }
+
+    /// 提交异步收集的目录树结果（主循环在代次匹配后调用）。
+    ///
+    /// 到达后按**当前关键字**重新过滤一遍，让收集期间已输入的内容立即生效；
+    /// 若用户已退出搜索（Esc / 导航），直接丢弃返回。
+    pub fn apply_search_collected(&mut self, entries: Vec<Entry>, truncated: bool) {
+        if !self.searching {
+            return;
+        }
         self.search_all = entries;
         self.search_truncated = truncated;
-        self.searching = true;
-        self.filter.clear();
-        self.entries = self.search_all.clone();
+        self.search_collecting = false;
+        self.entries = filter_entries_by_name(&self.search_all, &self.filter);
         self.selected = 0;
         self.scroll = 0;
     }
@@ -265,8 +277,14 @@ impl FsBrowser {
     ///
     /// 前置条件：已调用 [`FsBrowser::begin_search`]。每次关键字变化
     /// （增/删字符）都调用，保证选中项始终落在过滤结果内。
+    /// 收集仍在进行（search_collecting）时只记录关键字、不动列表——
+    /// 缓存还是空的，此刻过滤会把列表清成空白；结果到达时
+    /// [`FsBrowser::apply_search_collected`] 会按当前关键字补一次过滤立即生效。
     pub fn set_filter(&mut self, query: &str) {
         self.filter = query.to_string();
+        if self.search_collecting {
+            return;
+        }
         self.entries = filter_entries_by_name(&self.search_all, &self.filter);
         self.selected = 0;
         self.scroll = 0;
@@ -285,6 +303,7 @@ impl FsBrowser {
         self.scroll = self.saved_scroll;
         self.filter.clear();
         self.search_all.clear();
+        self.search_collecting = false;
         self.searching = false;
     }
 
@@ -311,106 +330,28 @@ impl FsBrowser {
             return false;
         }
 
-        // 读取目录条目
-        let read = match std::fs::read_dir(&resolved) {
-            Ok(rd) => rd,
+        // 读取目录条目（读目录 + 过滤 + 排序 + Windows 盘符）。
+        let entries = match compute_entries(&resolved) {
+            Ok(e) => e,
             Err(e) => {
-                self.last_error = Some(format!("无法读取目录“{}”：{e}", resolved.display()));
+                self.last_error = Some(e);
                 return false;
             }
         };
+        self.apply_loaded(resolved, entries);
+        true
+    }
 
-        // 收集并过滤条目
-        let mut dirs = Vec::new();
-        let mut files = Vec::new();
-        for entry in read {
-            let entry = match entry {
-                Ok(e) => e,
-                // 单个条目读取失败（如权限不足）跳过该项，不影响整体
-                Err(_) => continue,
-            };
-
-            let path = entry.path();
-
-            // UTF-8 严格策略（见模块文档）：仅纳入有效 UTF-8 文件名。
-            let name = match entry.file_name().to_str() {
-                Some(s) => s.to_owned(),
-                None => continue,
-            };
-
-            // 跳过隐藏文件（Unix 以 . 开头）。隐藏文件通常是非音乐资源
-            // （配置、缓存），展示出来徒增干扰。
-            if name.starts_with('.') {
-                continue;
-            }
-
-            // 判断类型：is_dir 会跟随符号链接，可能把链接目录误判——
-            // 这里我们想让符号链接目录表现为目录（用户可进入），故用 path.is_dir()
-            if path.is_dir() {
-                dirs.push(Entry::Dir { name, path });
-            } else if is_supported(&path) {
-                // 仅保留受支持的音乐文件，其他文件忽略
-                files.push(Entry::File { name, path });
-            }
-            // 非音乐文件直接丢弃
-        }
-
-        // Windows：盘符根目录（如 C:\）额外列出其他盘符，支持跨盘导航。
-        // Unix 有统一根目录 /，Windows 则分多个盘符；go_up 到盘符根后
-        // 无法再向上，若不列盘符就无法切换到 D:、E: 等其它盘。
-        #[cfg(windows)]
-        {
-            // 判断是否为盘符根（C:\ 或 \\?\C:\）：components 为 [Prefix, RootDir]
-            let mut comps = resolved.components();
-            let is_drive_root = matches!(comps.next(), Some(std::path::Component::Prefix(_)))
-                && matches!(comps.next(), Some(std::path::Component::RootDir))
-                && comps.next().is_none();
-            if is_drive_root {
-                // 提取当前盘符字母（兼容 C:\ 与 \\?\C:\ 两种形式）
-                let current_drive = resolved
-                    .components()
-                    .find_map(|c| match c {
-                        std::path::Component::Prefix(p) => match p.kind() {
-                            std::path::Prefix::Disk(d) => Some(d as char),
-                            std::path::Prefix::VerbatimDisk(d) => Some(d as char),
-                            _ => None,
-                        },
-                        _ => None,
-                    })
-                    .unwrap_or('C');
-                // 遍历 A-Z，列出除当前盘外的其它存在盘符
-                for letter in b'A'..=b'Z' {
-                    let letter = letter as char;
-                    if letter == current_drive {
-                        continue;
-                    }
-                    let root = format!("{letter}:\\");
-                    let path = PathBuf::from(&root);
-                    if path.exists() {
-                        dirs.push(Entry::Dir { name: root, path });
-                    }
-                }
-            }
-        }
-
-        // 同类内按名称不区分大小写排序
-        sort_by_name(&mut dirs);
-        sort_by_name(&mut files);
-
-        // 目录拼接在前、文件在后
-        dirs.extend(files);
-
-        // 提交状态变更
-        self.cwd = resolved;
-        self.entries = dirs;
+    /// 用已载入的目录条目提交导航状态（cwd + 条目 + 复位选中/滚动/搜索）。
+    pub(crate) fn apply_loaded(&mut self, cwd: PathBuf, entries: Vec<Entry>) {
+        self.cwd = cwd;
+        self.entries = entries;
         self.selected = 0;
         self.scroll = 0;
-        // 进入新目录后清空搜索状态：旧关键字/递归缓存对新目录内容无意义。
         self.filter = String::new();
         self.search_all.clear();
         self.searching = false;
         self.last_error = None;
-        true
     }
 
     /// 返回上一级目录。
@@ -442,6 +383,25 @@ impl FsBrowser {
             }
             // 文件或空列表：不进入
             _ => false,
+        }
+    }
+
+    /// 校验目标目录并返回规范化路径（不读目录）。供异步导航使用。
+    pub(crate) fn resolve_target(&self, target: &Path) -> Result<PathBuf, String> {
+        let resolved = target
+            .canonicalize()
+            .map_err(|e| format!("无法打开目录“{}”：{e}", target.display()))?;
+        if !resolved.is_dir() {
+            return Err(format!("“{}”不是目录", resolved.display()));
+        }
+        Ok(resolved)
+    }
+
+    /// 选中项为目录时返回其路径（供异步进入），否则 None。
+    pub(crate) fn selected_dir(&self) -> Option<PathBuf> {
+        match self.current() {
+            Some(Entry::Dir { path, .. }) => Some(path.clone()),
+            _ => None,
         }
     }
 
@@ -504,112 +464,6 @@ impl FsBrowser {
         }
     }
 
-    /// 递归收集 cwd 下所有目录与音乐文件（含子目录），用于搜索。
-    ///
-    /// 条目 name 使用**相对 cwd 的路径**（如 "专辑/01 - 稻香.mp3"），
-    /// 让用户在搜索结果里一眼看出文件位于哪个子目录。
-    /// 带符号链接环防护（同 collect_music_recursive）。
-    fn collect_recursive_entries(&self) -> (Vec<Entry>, bool) {
-        let mut dirs = Vec::new();
-        let mut files = Vec::new();
-        let mut visited = std::collections::HashSet::new();
-        if let Ok(real) = self.cwd.canonicalize() {
-            visited.insert(real);
-        }
-        let mut progress = SearchProgress {
-            count: 0,
-            truncated: false,
-        };
-        self.walk_recursive(
-            &self.cwd,
-            &mut dirs,
-            &mut files,
-            &mut visited,
-            SEARCH_MAX_ENTRIES,
-            &mut progress,
-        );
-        // 目录在前、文件在后，同类按名排序
-        sort_by_name(&mut dirs);
-        sort_by_name(&mut files);
-        dirs.extend(files);
-        (dirs, progress.truncated)
-    }
-
-    /// 递归遍历目录树，收集目录与音乐文件（带符号链接环防护）。
-    ///
-    /// 相对路径始终以 `self.cwd` 为基准；每收集一个条目 `progress.count`
-    /// 加一，达到 `max_entries` 时置 `progress.truncated` 并停止，防止超大
-    /// 目录遍历拖垮 UI。
-    fn walk_recursive(
-        &self,
-        dir: &Path,
-        dirs: &mut Vec<Entry>,
-        files: &mut Vec<Entry>,
-        visited: &mut std::collections::HashSet<PathBuf>,
-        max_entries: usize,
-        progress: &mut SearchProgress,
-    ) {
-        if progress.truncated {
-            return;
-        }
-        let rd = match std::fs::read_dir(dir) {
-            Ok(rd) => rd,
-            Err(_) => return, // 无权限等：跳过此目录
-        };
-        for entry in rd.flatten() {
-            if progress.truncated {
-                return;
-            }
-            let path = entry.path();
-
-            // UTF-8 严格策略（见模块文档）：跳过非 UTF-8 文件名。
-            let Some(name) = entry.file_name().to_str().map(|s| s.to_owned()) else {
-                continue;
-            };
-            // 跳过隐藏文件/目录
-            if name.starts_with('.') {
-                continue;
-            }
-
-            // 相对 cwd 的显示名（各段文件名均已是有效 UTF-8）。
-            let rel_name = path
-                .strip_prefix(&self.cwd)
-                .ok()
-                .and_then(|r| r.to_str().map(|s| s.to_owned()))
-                .unwrap_or_else(|| name.clone());
-
-            if path.is_dir() {
-                // 符号链接环防护：解析真实路径，已访问则跳过
-                let real = match path.canonicalize() {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
-                if visited.insert(real) {
-                    self.walk_recursive(&path, dirs, files, visited, max_entries, progress);
-                    dirs.push(Entry::Dir {
-                        name: rel_name,
-                        path,
-                    });
-                    progress.count += 1;
-                    if progress.count >= max_entries {
-                        progress.truncated = true;
-                        return;
-                    }
-                }
-            } else if is_supported(&path) {
-                files.push(Entry::File {
-                    name: rel_name,
-                    path,
-                });
-                progress.count += 1;
-                if progress.count >= max_entries {
-                    progress.truncated = true;
-                    return;
-                }
-            }
-        }
-    }
-
     /// 收集指定目录（递归）下所有支持的音乐文件路径。
     ///
     /// 用于"把整个目录加入播放列表"（按 `a` 键）。
@@ -638,12 +492,22 @@ impl FsBrowser {
         for entry in rd.flatten() {
             let path = entry.path();
 
-            // UTF-8 严格策略（见模块文档）：跳过非 UTF-8 文件名。
-            if entry.file_name().to_str().is_none() {
+            // 跳过非 UTF-8 文件名与隐藏文件/目录（以 . 开头），
+            // 与浏览器展示策略一致。
+            let file_name = entry.file_name();
+            let name = match file_name.to_str() {
+                Some(s) => s,
+                None => continue,
+            };
+            if name.starts_with('.') {
                 continue;
             }
 
             if path.is_dir() {
+                #[cfg(windows)]
+                if dir_is_hidden_system(&path) {
+                    continue;
+                }
                 // 符号链接环防护：解析真实路径，已访问则跳过。
                 // canonicalize 失败（如目标不存在）的坏链接也直接跳过。
                 let real = match path.canonicalize() {
@@ -677,6 +541,74 @@ struct SearchProgress {
     truncated: bool,
 }
 
+/// 读取并过滤一个已规范化目录的条目：读目录、UTF-8/隐藏过滤、目录/文件分类、
+/// 排序（目录在前、文件在后）；Windows 盘符根额外列出其他盘符。
+/// 供同步导航（navigate_to）与后台异步载入共用。
+pub(crate) fn compute_entries(resolved: &Path) -> Result<Vec<Entry>, String> {
+    let read = std::fs::read_dir(resolved)
+        .map_err(|e| format!("无法读取目录“{}”：{e}", resolved.display()))?;
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    for entry in read {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        let name = match entry.file_name().to_str() {
+            Some(s) => s.to_owned(),
+            None => continue,
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            #[cfg(windows)]
+            if dir_is_hidden_system(&path) {
+                continue;
+            }
+            dirs.push(Entry::Dir { name, path });
+        } else if is_supported(&path) {
+            files.push(Entry::File { name, path });
+        }
+    }
+    #[cfg(windows)]
+    {
+        let mut comps = resolved.components();
+        let is_drive_root = matches!(comps.next(), Some(std::path::Component::Prefix(_)))
+            && matches!(comps.next(), Some(std::path::Component::RootDir))
+            && comps.next().is_none();
+        if is_drive_root {
+            let current_drive = resolved
+                .components()
+                .find_map(|c| match c {
+                    std::path::Component::Prefix(p) => match p.kind() {
+                        std::path::Prefix::Disk(d) => Some(d as char),
+                        std::path::Prefix::VerbatimDisk(d) => Some(d as char),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .unwrap_or('C');
+            for letter in b'A'..=b'Z' {
+                let letter = letter as char;
+                if letter == current_drive {
+                    continue;
+                }
+                let root = format!("{letter}:\\");
+                let path = PathBuf::from(&root);
+                if path.exists() {
+                    dirs.push(Entry::Dir { name: root, path });
+                }
+            }
+        }
+    }
+    sort_by_name(&mut dirs);
+    sort_by_name(&mut files);
+    dirs.extend(files);
+    Ok(dirs)
+}
+
 /// 对条目列表按显示名不区分大小写升序排序。
 ///
 /// 抽成独立函数便于目录和文件分别调用。用 `to_lowercase` 比较
@@ -705,6 +637,131 @@ fn filter_entries_by_name(entries: &[Entry], query: &str) -> Vec<Entry> {
         .filter(|e| e.name().to_lowercase().contains(&q))
         .cloned()
         .collect()
+}
+
+/// 递归收集 cwd 下所有目录与音乐文件（含子目录），用于浏览器搜索。
+///
+/// 条目 name 使用**相对 cwd 的路径**（如 "专辑/01 - 稻香.mp3"），让用户在
+/// 搜索结果里一眼看出文件位于哪个子目录。带符号链接环防护与条目数上限
+/// （超过 [`SEARCH_MAX_ENTRIES`] 截断）。自由函数（只读磁盘、无 UI 状态），
+/// 供 App 的后台线程异步调用——大目录按 `/` 不再卡 UI。
+pub(crate) fn collect_recursive_entries(cwd: &Path) -> (Vec<Entry>, bool) {
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    if let Ok(real) = cwd.canonicalize() {
+        visited.insert(real);
+    }
+    let mut progress = SearchProgress {
+        count: 0,
+        truncated: false,
+    };
+    walk_recursive(
+        cwd,
+        cwd,
+        &mut dirs,
+        &mut files,
+        &mut visited,
+        SEARCH_MAX_ENTRIES,
+        &mut progress,
+    );
+    // 目录在前、文件在后，同类按名排序
+    sort_by_name(&mut dirs);
+    sort_by_name(&mut files);
+    dirs.extend(files);
+    (dirs, progress.truncated)
+}
+
+/// 递归遍历目录树，收集目录与音乐文件（带符号链接环防护）。
+///
+/// 相对路径始终以 `base`（收集起点）为基准；每收集一个条目 `progress.count`
+/// 加一，达到 `max_entries` 时置 `progress.truncated` 并停止，防止超大
+/// 目录遍历拖垮调用方。
+fn walk_recursive(
+    base: &Path,
+    dir: &Path,
+    dirs: &mut Vec<Entry>,
+    files: &mut Vec<Entry>,
+    visited: &mut std::collections::HashSet<PathBuf>,
+    max_entries: usize,
+    progress: &mut SearchProgress,
+) {
+    if progress.truncated {
+        return;
+    }
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return, // 无权限等：跳过此目录
+    };
+    for entry in rd.flatten() {
+        if progress.truncated {
+            return;
+        }
+        let path = entry.path();
+
+        // UTF-8 严格策略（见模块文档）：跳过非 UTF-8 文件名。
+        let Some(name) = entry.file_name().to_str().map(|s| s.to_owned()) else {
+            continue;
+        };
+        // 跳过隐藏文件/目录
+        if name.starts_with('.') {
+            continue;
+        }
+
+        // 相对 base 的显示名（各段文件名均已是有效 UTF-8）。
+        let rel_name = path
+            .strip_prefix(base)
+            .ok()
+            .and_then(|r| r.to_str().map(|s| s.to_owned()))
+            .unwrap_or_else(|| name.clone());
+
+        if path.is_dir() {
+            #[cfg(windows)]
+            if dir_is_hidden_system(&path) {
+                continue;
+            }
+            // 符号链接环防护：解析真实路径，已访问则跳过
+            let real = match path.canonicalize() {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if visited.insert(real) {
+                walk_recursive(base, &path, dirs, files, visited, max_entries, progress);
+                dirs.push(Entry::Dir {
+                    name: rel_name,
+                    path,
+                });
+                progress.count += 1;
+                if progress.count >= max_entries {
+                    progress.truncated = true;
+                    return;
+                }
+            }
+        } else if is_supported(&path) {
+            files.push(Entry::File {
+                name: rel_name,
+                path,
+            });
+            progress.count += 1;
+            if progress.count >= max_entries {
+                progress.truncated = true;
+                return;
+            }
+        }
+    }
+}
+
+/// Windows：判断目录是否带「隐藏 / 系统」文件属性——浏览器与递归扫描应跳过
+/// （$RECYCLE.BIN、System Volume Information 等系统目录读入慢且对音乐浏览无意义）。
+/// 仅用于目录分支；隐藏的音乐文件不受影响（与主流播放器一致）。
+#[cfg(windows)]
+fn dir_is_hidden_system(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
+    std::fs::metadata(path)
+        .map(|md| md.file_attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0)
+        .unwrap_or(false)
 }
 
 // =============================================================================
@@ -802,8 +859,12 @@ mod tests {
         // 初始一级条目：1 目录 + 2 文件 = 3
         assert_eq!(br.entries().len(), 3);
 
-        // 进入搜索：递归收集整棵树（1 目录 + 3 文件 = 4）
+        // 进入搜索：收集已异步化，这里同步模拟主循环的提交路径
+        //（后台线程调 collect_recursive_entries，结果经 apply_search_collected）。
         br.begin_search();
+        assert_eq!(br.entries().len(), 3, "收集结果到达前维持一级列表");
+        let collected = collect_recursive_entries(br.cwd());
+        br.apply_search_collected(collected.0, collected.1);
         assert_eq!(br.entries().len(), 4, "递归收集应含子目录文件");
 
         // 搜索"稻"：只匹配子目录里的 稻香.mp3
@@ -815,6 +876,36 @@ mod tests {
         // 退出搜索：恢复一级条目
         br.end_search();
         assert_eq!(br.entries().len(), 3, "退出后应恢复一级条目");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// 收集未到达期间键入关键字：列表必须维持一级条目（不被空缓存清空），
+    /// 收集结果到达后按已输入的关键字过滤立即生效。
+    /// 回归旧缺陷：set_filter 无条件从空的 search_all 过滤，第一次键入
+    /// 就把列表清成空白，大目录收集期间浏览器长时间空白。
+    #[test]
+    fn set_filter_during_collection_keeps_one_level_list() {
+        let tmp = std::env::temp_dir().join("tuneux_browser_collecting_test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("周杰伦")).unwrap();
+        fs::File::create(tmp.join("周杰伦/稻香.mp3")).unwrap();
+        fs::File::create(tmp.join("青花瓷.mp3")).unwrap();
+        fs::File::create(tmp.join("晴天.flac")).unwrap();
+
+        let mut br = FsBrowser::open(&tmp);
+        assert_eq!(br.entries().len(), 3);
+
+        // 进入搜索后、结果到达前键入关键字：一级列表必须保留
+        br.begin_search();
+        br.set_filter("稻");
+        assert_eq!(br.entries().len(), 3, "收集期间键入不应清空一级列表");
+
+        // 结果到达：按已输入的关键字补过滤，立即只剩匹配项
+        let collected = collect_recursive_entries(br.cwd());
+        br.apply_search_collected(collected.0, collected.1);
+        assert_eq!(br.entries().len(), 1, "结果到达后应按当前关键字过滤");
+        assert_eq!(br.entries()[0].name(), "周杰伦/稻香.mp3");
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -832,6 +923,8 @@ mod tests {
 
         let mut br = FsBrowser::open(&tmp);
         br.begin_search();
+        let collected = collect_recursive_entries(br.cwd());
+        br.apply_search_collected(collected.0, collected.1);
         br.set_filter("歌");
         // 匹配：a歌.mp3、子目录/b歌.mp3、子目录/c歌.flac（按名排序）
         assert_eq!(br.entries().len(), 3, "应匹配 3 个含'歌'的文件（含子目录）");
@@ -865,7 +958,7 @@ mod tests {
             fs::File::create(tmp.join(format!("{i}.mp3"))).unwrap();
         }
 
-        let br = FsBrowser::open(&tmp);
+        let _br = FsBrowser::open(&tmp);
         let mut dirs = Vec::new();
         let mut files = Vec::new();
         let mut visited = std::collections::HashSet::new();
@@ -876,7 +969,15 @@ mod tests {
         };
 
         // 上限 3：应只收集 3 个文件并置截断标志
-        br.walk_recursive(&tmp, &mut dirs, &mut files, &mut visited, 3, &mut progress);
+        walk_recursive(
+            &tmp,
+            &tmp,
+            &mut dirs,
+            &mut files,
+            &mut visited,
+            3,
+            &mut progress,
+        );
 
         assert!(progress.truncated, "超过上限应置截断标志");
         assert_eq!(files.len(), 3, "应只收集 3 个文件");

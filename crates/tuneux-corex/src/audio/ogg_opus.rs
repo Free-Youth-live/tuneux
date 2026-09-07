@@ -184,9 +184,9 @@ impl OggOpusReader {
         }
 
         let header_type = header[5];
-        let granule_position = u64::from_le_bytes(header[6..14].try_into().expect("固定 8 字节"));
-        let serial = u32::from_le_bytes(header[14..18].try_into().expect("固定 4 字节"));
-        let sequence = u32::from_le_bytes(header[18..22].try_into().expect("固定 4 字节"));
+        let granule_position = u64::from_le_bytes(header[6..14].try_into().unwrap_or_default());
+        let serial = u32::from_le_bytes(header[14..18].try_into().unwrap_or_default());
+        let sequence = u32::from_le_bytes(header[18..22].try_into().unwrap_or_default());
         // header[22..26] 为 CRC32，首版不校验。
         let segment_count = header[26] as usize;
 
@@ -398,7 +398,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // 任务 1：Ogg 页头字段解析
+    // Ogg 页头字段解析
     // ----------------------------------------------------------------
     /// BOS 页（header_type=0x02）+ 单段：next_packet 读出 payload=
     /// [0x11,0x22,0x33]；granule / serial / sequence 写入后并不影响
@@ -442,7 +442,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // 任务 2：段表与负载重组
+    // 段表与负载重组
     // ----------------------------------------------------------------
     /// 单段：[10]，payload=10 字节 → 一个完整 10 字节包。
     #[test]
@@ -495,7 +495,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // 任务 3：跨页逻辑包重组
+    // 跨页逻辑包重组
     // ----------------------------------------------------------------
     /// 一个逻辑包跨两页：page1 末尾是 255 续段（包未完），
     /// page2 起点继续该包，最后一段 <255 收尾。
@@ -545,7 +545,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // 任务 4：非法输入
+    // 非法输入
     // ----------------------------------------------------------------
     /// 魔数不是 OggS：首 4 字节换为 "XXXX"，read_page 应报 Decode 错误。
     #[test]

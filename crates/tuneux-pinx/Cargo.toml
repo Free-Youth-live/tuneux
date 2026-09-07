@@ -1,0 +1,38 @@
+# =============================================================================
+# tuneux-pinx · 插件宿主运行时（lib）
+#
+# 版权所有 © 2026 不羁的青春（FreeYouth）
+# 本项目采用木兰宽松许可证，第 2 版（MulanPSL-2.0）开源。
+# =============================================================================
+
+[package]
+name = "tuneux-pinx"
+version = "0.1.0"
+edition = "2021"
+license = "MulanPSL-2.0"
+authors = ["不羁的青春（FreeYouth）"]
+description = "tuneux 系列插件宿主运行时：WASM 插件的能力仲裁、验签三态、网络代发钩子与加载记录（能力总线，永不自行联网）"
+rust-version = "1.88"
+
+[features]
+# 网络能力开关：默认关闭。开启后插件才可能被授予网络能力；
+# 真实网络栈仍由发行版注入传输层实现，本 crate 永不自行联网、
+# 也不引入任何网络相关依赖。
+network = []
+
+[lints]
+workspace = true
+
+[dependencies]
+# WASM 解释器运行时（控制面沙箱）。
+wasmi.workspace = true
+# 插件验签：Ed25519 数字签名（身份三态的真实性 + 完整性）
+ed25519-dalek.workspace = true
+# 音频能力薄适配：插件控制面写均衡器参数，落到 corex 音频线程槽位（DSP 在 corex）。
+tuneux-corex = { path = "../tuneux-corex" }
+
+[dev-dependencies]
+# 测试：把 WAT 文本编译成 wasm 字节，构建第一方插件（均衡器）验证宿主函数。
+wat = "1"
+# 开发工具：官方签名密钥生成的系统安全随机源（仅 gen_signing_key 示例用，离线）。
+getrandom = "0.2"

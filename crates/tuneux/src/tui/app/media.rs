@@ -2,14 +2,13 @@
 //!
 //! 本模块是 App 的媒体信息域（叶子模块，不依赖其他子模块）。
 
-use crate::lyrics;
-use crate::metadata;
 use image;
+use tuneux_mediax::lyrics;
+use tuneux_mediax::metadata;
 
 use super::App;
 
 impl App {
-    /// 取元数据：优先从缓存读，miss 时调 from_file 并写入缓存。
     /// 加载当前曲目的歌词（统一入口，消除两处重复逻辑）。
     ///
     /// 优先级：
@@ -29,28 +28,88 @@ impl App {
         })
     }
 
+    /// 取元数据：优先从缓存读，miss 时调 from_file 并写入缓存。
     pub fn get_or_extract_metadata(&mut self, path: &std::path::Path) -> metadata::TrackMetadata {
         if let Some(cached) = self.metadata_cache.get(path) {
             return cached.clone();
         }
-        // 容量上限：元数据缓存（含封面原始字节）无限增长会持续积累内存。
+        // 容量上限：元数据缓存无限增长会持续积累内存。
         // 超过上限时只清掉**非当前曲目**的条目——保留正在播放的元数据
-        //（封面/歌词频繁读取），避免整体清空后下一帧又得重提当前曲目
-        //（原实现 O(500) 整体清空 + 热数据全丢）。
+        //（封面/歌词频繁读取），避免整体清空后下一帧又得重提当前曲目。
         const METADATA_CACHE_MAX: usize = 500;
         if self.metadata_cache.len() >= METADATA_CACHE_MAX {
-            self.metadata_cache.retain(|k, _| {
-                // 保留当前播放曲目（若有）
-                self.current_path.as_ref() != Some(k)
-            });
-            // 极端情况：全是当前曲目（不太可能），仍强制留一个空位
+            // 只保留当前播放曲目，逐出其余（retain 保留谓词为真的条目）。
+            self.metadata_cache
+                .retain(|k, _| self.current_path.as_ref() == Some(k));
+            // 极端情况：当前曲目不在缓存（path 与 key 不一致），仍强制留一个空位。
             if self.metadata_cache.len() >= METADATA_CACHE_MAX {
                 self.metadata_cache.clear();
             }
         }
         let md = metadata::TrackMetadata::from_file(path);
-        self.metadata_cache.insert(path.to_path_buf(), md.clone());
+        // 缓存不保留封面原始字节（封面可达数百 KB，500 条缓存会积累大量内存）：
+        // 封面只随当前曲目保留在 current_metadata；命中缓存切回时按需补提取。
+        let mut cached = md.clone();
+        cached.cover = None;
+        self.metadata_cache.insert(path.to_path_buf(), cached);
         md
+    }
+
+    /// 按路径 + 目标尺寸取封面网格缩略图（带缓存）。
+    ///
+    /// 封面浏览网格专用：命中缓存直接返回 RGBA；未命中则提取封面字节→解码→缩放，
+    /// 结果按 (路径, 目标宽, 目标高) 缓存（None=无封面/解码失败，也缓存避免重复探测）。
+    /// 与 `get_or_extract_metadata`（缓存剥离封面字节）不同，这里专门保封面，供网格持久显示。
+    pub fn cover_grid_thumb(
+        &mut self,
+        path: &std::path::Path,
+        max_w: u32,
+        max_h: u32,
+    ) -> Option<&image::RgbaImage> {
+        let key = (path.to_path_buf(), max_w, max_h);
+        if !self.cover_thumb_cache.contains_key(&key) {
+            let thumb = Self::build_cover_thumb(path, max_w, max_h);
+            self.cover_thumb_cache.insert(key.clone(), thumb);
+        }
+        self.cover_thumb_cache.get(&key).and_then(|o| o.as_ref())
+    }
+
+    /// 提取封面字节并解码缩放为 RGBA 缩略图（无封面/解码失败返回 None）。
+    fn build_cover_thumb(
+        path: &std::path::Path,
+        max_w: u32,
+        max_h: u32,
+    ) -> Option<image::RgbaImage> {
+        let cover = metadata::TrackMetadata::from_file(path).cover?;
+        let img = image::load_from_memory(&cover.bytes).ok()?;
+        let (sw, sh) = (img.width().max(1), img.height().max(1));
+        let scale = (max_w as f32 / sw as f32).min(max_h as f32 / sh as f32);
+        let dw = ((sw as f32 * scale).round() as u32).max(1).min(max_w);
+        let dh = ((sh as f32 * scale).round() as u32).max(1).min(max_h);
+        Some(
+            img.resize_exact(dw, dh, image::imageops::FilterType::Triangle)
+                .to_rgba8(),
+        )
+    }
+
+    /// 收集封面浏览的专辑列表：去重的 (专辑名, 代表曲目路径)。
+    ///
+    /// 代表曲目 = 该专辑在播放列表中的第一首（用于取封面 + Enter 播放）。
+    pub fn cover_browser_albums(&self) -> Vec<(String, std::path::PathBuf)> {
+        // 去重键 = 专辑名 + 父目录：同名不同专辑（如多张 "Greatest Hits"）
+        // 不误合并；同目录同名仍归并。用 HashSet 使去重 O(n)——原为 O(n²)
+        // 线性扫描，大列表下每帧/每键各调用一次会卡顿（与 fx 同源）。
+        let mut seen: std::collections::HashSet<(String, Option<std::path::PathBuf>)> =
+            std::collections::HashSet::new();
+        let mut albums: Vec<(String, std::path::PathBuf)> = Vec::new();
+        for item in self.playlist.items() {
+            let album = item.album.clone().unwrap_or_else(|| "未知专辑".to_string());
+            let dir = item.path.parent().map(|p| p.to_path_buf());
+            if seen.insert((album.clone(), dir)) {
+                albums.push((album, item.path.clone()));
+            }
+        }
+        albums
     }
 
     /// 取当前曲目的封面（已解码），触发缓存填充。
@@ -59,6 +118,10 @@ impl App {
             (Some(p), Some(md)) => (p.clone(), md.cover.as_ref()?),
             _ => return None,
         };
+        // 负缓存：该曲目封面解码已失败过，直接跳过——避免每帧重试解码 + 刷日志。
+        if self.cover_failed_path.as_ref() == Some(&path) {
+            return None;
+        }
         if let Some((cached_path, _)) = &self.cover_cache {
             if cached_path == &path {
                 return self.cover_cache.as_ref().map(|(_, img)| img);
@@ -66,9 +129,54 @@ impl App {
         }
         // 缓存未命中——解码（慢路径，仅第一次）。
         // 按优先级尝试多种格式检测：MIME → 魔术字节 → JPEG/PNG 遍历。
-        let img = Self::decode_cover_bytes(&cover.bytes, &cover.mime)?;
-        self.cover_cache = Some((path, img));
-        self.cover_cache.as_ref().map(|(_, img)| img)
+        match Self::decode_cover_bytes(&cover.bytes, &cover.mime) {
+            Some(img) => {
+                self.cover_cache = Some((path, img));
+                self.cover_cache.as_ref().map(|(_, img)| img)
+            }
+            None => {
+                // 解码失败：记入负缓存（本曲不再重试），并经 UI 提示一次（自动过期）。
+                self.cover_failed_path = Some(path);
+                self.last_error = Some("封面解码失败（已跳过）".to_string());
+                self.last_error_at = Some(std::time::Instant::now());
+                None
+            }
+        }
+    }
+
+    /// 确保当前曲目封面面板缩略图已就绪（按路径 + 目标像素区缓存，命中跳过 resize）。
+    /// 每帧只做一次键比较，不再逐帧 resize_exact + to_rgba8（回灌 fx）。
+    pub fn ensure_cover_thumb(&mut self, pixel_w: u32, pixel_h: u32) {
+        let Some(path) = self.current_path.clone() else {
+            return;
+        };
+        // 命中缓存（路径 + 目标像素区一致）：无需重算。
+        if let Some((cp, pw, ph, _, _, _)) = &self.cover_thumb {
+            if cp == &path && *pw == pixel_w && *ph == pixel_h {
+                return;
+            }
+        }
+        // 未命中：清旧条目，解码原图 + 按比例缩放，写入缓存。
+        self.cover_thumb = None;
+        let Some(img) = self.current_decoded_cover() else {
+            return;
+        };
+        let (sw, sh) = (img.width().max(1), img.height().max(1));
+        let scale = (pixel_w as f32 / sw as f32).min(pixel_h as f32 / sh as f32);
+        let w = ((sw as f32 * scale).round() as u32).max(1).min(pixel_w);
+        let h = ((sh as f32 * scale).round() as u32).max(1).min(pixel_h);
+        let rgba = img
+            .resize_exact(w, h, image::imageops::FilterType::Triangle)
+            .to_rgba8();
+        self.cover_thumb = Some((path, pixel_w, pixel_h, w, h, rgba));
+    }
+
+    /// 取当前封面面板缩略图（只读借用）。调用前应先 `ensure_cover_thumb` 命中。
+    /// 返回 (实际缩放宽, 实际缩放高, RGBA)；无封面时 None。
+    pub fn cover_thumb(&self) -> Option<(u32, u32, &image::RgbaImage)> {
+        self.cover_thumb
+            .as_ref()
+            .map(|(_, _, _, dw, dh, rgba)| (*dw, *dh, rgba))
     }
 
     /// 解码封面原始字节为 DynamicImage。
@@ -91,7 +199,7 @@ impl App {
                 return Some(img);
             }
         }
-        eprintln!("[封面] 解码失败（MIME={mime}，{} 字节）", bytes.len());
+        // 解码失败不在此打日志：调用方已记负缓存并经 UI last_error 提示一次。
         None
     }
 }

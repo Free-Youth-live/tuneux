@@ -27,6 +27,34 @@ pub(crate) fn rng_next(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// 把 N_BANDS 频段 max-pool 到 `total_w` 显示列：每显示列取对应连续频段的
+/// 最大值，保证任意宽度下画满、峰值不丢（宽屏剩余列补 0）。
+fn pool_to_columns(bands: &[f32; audio::spectrum::N_BANDS], total_w: usize) -> Vec<f32> {
+    let n = audio::spectrum::N_BANDS;
+    if total_w >= n {
+        let mut v = bands.to_vec();
+        v.resize(total_w, 0.0);
+        v
+    } else {
+        let bands_per_col = n as f32 / total_w as f32;
+        let mut v = Vec::with_capacity(total_w);
+        for col in 0..total_w {
+            let start = ((col as f32 * bands_per_col) as usize).min(n);
+            let end = (((col + 1) as f32 * bands_per_col) as usize)
+                .min(n)
+                .max(start + 1);
+            let mut max_v = 0.0f32;
+            for &b in &bands[start..end] {
+                if b > max_v {
+                    max_v = b;
+                }
+            }
+            v.push(max_v);
+        }
+        v
+    }
+}
+
 /// 实时电平柱图：左右声道分别用一条**水平**柱显示。
 ///
 /// 数据来源：音频回调每 ~10ms 累计 L/R peak amplitude 写入 `SharedState`，
@@ -160,6 +188,8 @@ pub(super) fn draw_audio_panel(
     area: Rect,
     engine: &Option<audio::Engine>,
     frame_tick: u64,
+    peaks: &std::cell::RefCell<audio::spectrum::SpectrumPeakHold>,
+    dt: std::time::Duration,
 ) {
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         " 频 谱 ",
@@ -191,53 +221,21 @@ pub(super) fn draw_audio_panel(
     let total_w = inner.width as usize;
     let h = inner.height as usize;
     let bar_max_h = h.saturating_sub(1); // 最底行是基线
+    let active = total_w.min(n_bands);
 
-    // —— 自适应：把 N_BANDS 频段降到 total_w 显示列 ——
-    //
-    // 目的：N_BANDS=256 在 120 列终端显示不下，需要把 256 个频段
-    // 压缩到 ~116 列；4K 屏反过来——列数 > 频段数，剩余列留空。
-    //
-    // 压缩策略：max-pooling（每显示列 = 该列对应一组频段的最大值）。
-    // 选 max 而非 mean，因为：
-    //   - 保留峰值（人眼对频谱的"突起"敏感，max 让高亮不丢）；
-    //   - mean 会把窄而强的瞬态拉平成"模糊的小山"；
-    //   - 与图像处理里的 max-pooling 下采样同思路。
-    //
-    // 两种分支：
-    //   - total_w >= n_bands：1:1 前 n_bands 段，剩余列 = 0（4K 屏）
-    //   - total_w <  n_bands：max-pooling（普通终端）
-    let display_spectrum: Vec<f32> = if total_w >= n_bands {
-        // 先把前 n_bands 段 1:1 拷进来，再 resize 补齐到 total_w（多余列 = 0）
-        let mut v = spectrum[..n_bands].to_vec();
-        v.resize(total_w, 0.0);
-        v
-    } else {
-        // bands_per_col = 每个显示列平均覆盖多少个频段。
-        // 用浮点而非整数：最后一列的 `end = total_w * bands_per_col` 刚好
-        // 等于 n_bands，确保最高频段不会被截断。
-        //
-        // 边界处理：
-        //   - `start.min(n_bands)` 防止最后一列 start 越界；
-        //   - `end.max(start+1)` 防止 total_w > n_bands 的极端情况下
-        //     某列区间为 [start, start)（空窗），会触发空切片 panic。
-        let bands_per_col = n_bands as f32 / total_w as f32;
-        let mut v = Vec::with_capacity(total_w);
-        for col in 0..total_w {
-            let start = (col as f32 * bands_per_col) as usize;
-            let end = ((col + 1) as f32 * bands_per_col) as usize;
-            let start = start.min(n_bands);
-            let end = end.min(n_bands).max(start + 1);
-            // max-pooling 核心：扫该列对应频段取最大值
-            let mut max_v = 0.0f32;
-            for &b in &spectrum[start..end] {
-                if b > max_v {
-                    max_v = b;
-                }
-            }
-            v.push(max_v);
-        }
-        v
-    };
+    // —— 峰值保持白帽 ——
+    // 绿柱实时跟随当前能量；白帽保存每频段历史峰值，能量低于峰值时按固定
+    // 每秒速率线性缓落（明显慢于绿柱），且永不低于当前能量。峰值在频段维度
+    // 保持，窗口改宽不重置；当前能量与峰值分别 max-pool 到显示列后绘制。
+    let peaks_out = peaks.borrow_mut().update(&spectrum, dt);
+    let display_spectrum = pool_to_columns(&spectrum, total_w);
+    let display_peaks = pool_to_columns(&peaks_out, total_w);
+    let mut bar_hs = vec![0usize; active];
+    let mut peak_hs = vec![0usize; active];
+    for i in 0..active {
+        bar_hs[i] = (display_spectrum[i] * bar_max_h as f32).ceil() as usize;
+        peak_hs[i] = (display_peaks[i] * bar_max_h as f32).ceil() as usize;
+    }
 
     // 频段颜色 + 字符：Matrix 风格——纯绿 + 细字符。
     // 配色：从青改成 LightGreen（Matrix 标志性的亮绿），
@@ -284,31 +282,23 @@ pub(super) fn draw_audio_panel(
         } else {
             // 当前行距基线的"高度距离"（row 0 → h-1, from_bottom = h-1 → 1）
             let from_bottom = h - 1 - row;
-            // 拆分两个循环：active 列画频谱，超宽屏尾部留空。
-            // 避免在循环里写 `if col >= n_bands { ... continue }`，
-            // 让 clippy 满意、也少一层分支。
-            let active = total_w.min(n_bands);
-            for &value in display_spectrum[..active].iter() {
-                // bar_h：value 对应的柱高（0..=bar_max_h）
-                //   - value=0 → bar_h=0（不画）
-                //   - value=1 → bar_h=bar_max_h（满柱）
-                // ceil 而非 round：宁可柱顶多 1 格也别矮 1 格丢失"亮"的瞬间
-                let bar_h = (value * bar_max_h as f32).ceil() as usize;
-
-                if from_bottom <= bar_h && bar_h > 0 {
-                    // 柱顶一格白色高亮，其余亮绿（LightGreen）——
-                    // 让眼睛能跟上"条顶位置"而不是被乱码字符糊住
-                    let cell_color = if from_bottom == bar_h {
-                        Color::White
-                    } else {
-                        BAR_COLOR
-                    };
+            // active 列画频谱（峰值帽 + 绿柱），超宽屏尾部留空。
+            for i in 0..active {
+                let bar_h = bar_hs[i];
+                let peak_h = peak_hs[i];
+                if peak_h > 0 && from_bottom == peak_h {
+                    // 白色峰值帽（可能悬浮在绿柱上方）。
                     let r = rng_next(&mut rng);
                     let ch = POOL[(r as usize) % POOL.len()];
                     spans.push(Span::styled(
                         ch.to_string(),
-                        Style::default().fg(cell_color),
+                        Style::default().fg(Color::White),
                     ));
+                } else if bar_h > 0 && from_bottom <= bar_h {
+                    // 绿色柱体。
+                    let r = rng_next(&mut rng);
+                    let ch = POOL[(r as usize) % POOL.len()];
+                    spans.push(Span::styled(ch.to_string(), Style::default().fg(BAR_COLOR)));
                 } else {
                     spans.push(Span::raw(" "));
                 }
@@ -321,4 +311,98 @@ pub(super) fn draw_audio_panel(
         lines.push(Line::from(spans));
     }
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// 示波器：左右声道时域波形（双边，中线上下摆动）。
+///
+/// 数据来自 [`audio::Engine::waveform_lr`]（每通道 WAVEFORM_LEN 点，-1.0~1.0）。
+/// 每个声道占一半高度：中线基线 '-'，波形点 '#' 上下摆动，幅度为半高。
+pub(super) fn draw_oscilloscope(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    engine: &Option<audio::Engine>,
+    frame_tick: u64,
+) {
+    let block = Block::default().borders(Borders::ALL).title(Span::styled(
+        " 示波器 ",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width < 8 || inner.height < 4 {
+        return;
+    }
+
+    let [l, r] = engine
+        .as_ref()
+        .map(|e| e.waveform_lr())
+        .unwrap_or([[0.0; audio::spectrum::WAVEFORM_LEN]; 2]);
+    let rows =
+        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(inner);
+    draw_wave_band(frame, rows[0], &l, "L", frame_tick);
+    draw_wave_band(frame, rows[1], &r, "R", frame_tick);
+}
+
+/// 单个声道的双边波形：中线基线 '-'，波形点用随机字符（随帧变化）。
+fn draw_wave_band(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    wave: &[f32],
+    label: &str,
+    frame_tick: u64,
+) {
+    if area.width < 3 || area.height < 3 {
+        return;
+    }
+    let h = area.height as usize;
+    let w = area.width as usize;
+    // 中线行索引与上下摆动幅度（行数）。
+    let mid = h / 2;
+    let amp = (mid.saturating_sub(1)).max(1) as f32;
+    // 左侧标签占 2 列（"L " / "R "），其余画波形。
+    let label_text = format!("{label} ");
+    let bar_w = w.saturating_sub(label_text.chars().count());
+    if bar_w == 0 {
+        return;
+    }
+    // 随机字符池（纯 ASCII，1 列宽，避免歧义宽度）。
+    const POOL: &[char] = &['1', '0'];
+    let mut rng = frame_tick ^ 0x9E37_79B9;
+    let mut lines = Vec::with_capacity(h);
+    for row in 0..h {
+        let mut spans = Vec::with_capacity(w);
+        if row == 0 {
+            spans.push(Span::styled(
+                label_text.clone(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::raw("  "));
+        }
+        for col in 0..bar_w {
+            let idx = col * audio::spectrum::WAVEFORM_LEN / bar_w;
+            let v = (wave[idx] * 3.0).clamp(-1.0, 1.0); // 增益 ×3，低电平也撑满 // 带符号 -1.0~1.0
+                                                        // 波形点行：v=1 到顶、v=0 中线、v=-1 到底。
+            let wave_row = mid as f32 - v * amp;
+            let ch = if (wave_row - row as f32).abs() < 0.5 {
+                // 波形点用随机字符（随帧变化，像老式点阵示波器）。
+                POOL[(rng_next(&mut rng) as usize) % POOL.len()]
+            } else if row == mid {
+                '-'
+            } else {
+                ' '
+            };
+            spans.push(Span::styled(
+                ch.to_string(),
+                Style::default().fg(Color::Green),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }

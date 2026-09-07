@@ -78,6 +78,18 @@ fn is_header_packet(packet: &[u8]) -> bool {
     packet.len() >= 8 && (&packet[..8] == OPUS_HEAD_MAGIC || &packet[..8] == OPUS_TAGS_MAGIC)
 }
 
+/// 轻量探测 Opus 输出采样率：读 OpusHead 输入采样率，映射解码输出率。
+///
+/// 供直通判断（[`super::decoder::probe_sample_rate`]）：Opus 输出率由
+/// OpusHead 决定（8/12/16/24/48k 原生；44.1k 等按 48k 编码），并非恒 48k——
+/// 读头而非硬编码，避免把 24k 语音文件误判成 48k 直通（会变调）。
+pub(crate) fn probe_sample_rate(path: &Path) -> Option<u32> {
+    // 第一个逻辑包必为 OpusHead（RFC 7845 §4.2），读它即可，不建解码器。
+    let head_packet = OggOpusReader::open(path).ok()?.next_packet().ok()??;
+    let (input_rate, _, _) = parse_opus_head(&head_packet).ok()?;
+    Some(choose_output_rate(input_rate))
+}
+
 /// 判断路径是否应交给 Opus 后端：扩展名为 `.opus`，或 Ogg 首包魔数为 OpusHead。
 pub(crate) fn is_opus_path(path: &Path) -> bool {
     if path

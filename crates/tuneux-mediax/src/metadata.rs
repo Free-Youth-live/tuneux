@@ -11,7 +11,7 @@
 //!
 //! ## 码率估算
 //!
-//! symphonia 不直接提供码率（它只负责解封装/解码）。本模块用标准做法估算：
+//! 底层解码库不直接提供码率。本模块用标准做法估算：
 //! `码率 = 文件大小(字节) × 8 / 时长(秒)`，得到平均码率（bps）。
 //! 对 CBR 文件较准；VBR 文件反映整首曲目的平均值。
 //!
@@ -20,20 +20,13 @@
 //! 容器记录的 `Track.duration`（time_base 单位）+ `Track.time_base` 换算为秒。
 //! 部分格式（如某些 MP3 无头部时长信息）可能为 None，此时显示"未知"。
 
-// duration_label / channels_label / tech_summary 目前仅在单元测试中调用，
-// 生产代码尚未使用；保留以备后续 TUI 布局复用，模块级豁免 dead_code 警告。
-#![allow(dead_code)]
-
 use std::path::Path;
 
-use symphonia::core::formats::{FormatReader, TrackType};
-use symphonia::core::meta::{MetadataRevision, StandardTag};
-
-use tuneux_corex::AudioParams;
+use tuneux_corex::{probe_metadata, AudioParams};
 
 /// 一首曲目的完整元数据（标签 + 技术参数）。
 ///
-/// 字符串字段用 Option<String>：None 表示该标签缺失（如现场录音可能无专辑名），
+/// 字符串字段用 `Option<String>`：None 表示该标签缺失（如现场录音可能无专辑名），
 /// 显示时降级为"未知"。技术参数同理。
 #[derive(Debug, Clone, Default)]
 pub struct TrackMetadata {
@@ -48,10 +41,10 @@ pub struct TrackMetadata {
     pub track_number: Option<u32>,
     /// 内嵌歌词文本（来自标签，如 ID3v2 USLT / Vorbis LYRICS / MP4 ©lyr）。
     ///
-    /// symphonia 0.6 把这些统统归一为 StandardTag::Lyrics(Arc<String>)，
-    /// 因此这里拿到的是原始歌词字符串（可能是带时间戳的 LRC，也可能是纯文本）。
-    /// 解析与展示交给 lyrics 模块（Lyrics::from_embedded）。
-    /// 注意：ID3v2 的 SYLT（同步歌词）帧 symphonia 0.6 不支持，属后续工作。
+    /// 底层探测把这些统统归一为内嵌歌词字段，因此这里拿到的是原始歌词字符串
+    ///（可能是带时间戳的 LRC，也可能是纯文本）。解析与展示交给 lyrics 模块
+    ///（Lyrics::from_embedded）。
+    /// 注意：ID3v2 的 SYLT（同步歌词）帧底层暂不支持，属后续工作。
     pub lyrics: Option<String>,
 
     // —— 技术参数 ——
@@ -78,7 +71,7 @@ pub struct TrackMetadata {
 /// 封面图原始数据。
 ///
 /// 字节 + MIME 一并保存——解码时按 MIME 选 image crate loader
-///（image 0.25 默认 feature 即可解 PNG/JPEG；WebP 需额外开 feature）。
+///（image 0.25 关闭默认 feature、显式开启 jpeg/png 即可解 PNG/JPEG；WebP 需额外开 feature）。
 #[derive(Debug, Clone)]
 pub struct CoverImage {
     /// 原始编码字节（PNG/JPEG/etc.）。
@@ -93,7 +86,7 @@ impl TrackMetadata {
     /// 内部打开文件读取标签与技术参数后立即关闭（不做完整解码）。
     /// 失败字段降级为 None，绝不返回 Err——元数据缺失不应阻塞播放。
     ///
-    /// **标题兜底**：`title` 字段无论打开成功与否（symphonia 没读到或文件
+    /// **标题兜底**：`title` 字段无论打开成功与否（底层探测没读到或文件
     /// 根本打不开）都会用 file_stem 兜底——告诉用户"是哪个文件"，不至于
     /// 看到"（无标题）"以为是首歌叫这个名字。TUI 层用 is_playing 状态
     /// 区分"能播"和"打不开"两种场景。
@@ -105,51 +98,25 @@ impl TrackMetadata {
         md
     }
 
-    /// 尝试从 symphonia 读取元数据。失败（文件不存在/损坏/无音频轨）返回 None。
+    /// 尝试读取元数据（经 corex 的 `probe_metadata` 探测）。失败（文件不存在/损坏/无音频轨）返回 None。
     ///
     /// 与 [`Self::from_file`] 的区别：本函数不应用任何兜底策略——调用方拿到
     /// `None` 后可决定下一步行为（from_file 的策略是套上默认 + file_stem）。
     fn try_extract(path: &Path) -> Option<Self> {
-        // reader 需要 mut 才能调 .metadata()（FormatReader::metadata 签名）
-        let (params, mut reader, track_duration) = open_for_metadata(path)?;
-
-        // 标签：先把 Metadata 绑定到本地变量，避开"临时值 drop 后还在用"
-        // 的借用问题（reader.metadata() 返回 Metadata<'_> 是临时值，
-        // 链式 .current() 拿到的引用就指向它）。
-        let metadata = reader.metadata();
-        let tags = metadata.current();
-
+        let (params, tags) = probe_metadata(path)?;
+        // from_params 已把 params.duration 填入 md.duration，这里只补标签与封面。
         let mut md = Self::from_params(&params);
-        if let Some(rev) = tags {
-            Self::fill_tags(&mut md, rev);
-        }
+        md.title = tags.title;
+        md.artist = tags.artist;
+        md.album = tags.album;
+        md.track_number = tags.track_number;
+        md.lyrics = tags.lyrics;
+        md.cover = tags.cover.map(|(bytes, mime)| CoverImage { bytes, mime });
 
-        // 封面：symphonia 把 FLAC PICTURE / MP3 APIC 都归一为 `Visual`。
-        // 取第一个有数据的（跳过 usage=FileIcon 之类的小图标——我们只
-        // 要"封面图"，即 CoverArt / CoverFront 用途的）。
-        if let Some(rev) = tags {
-            md.cover = rev
-                .media
-                .visuals
-                .iter()
-                .find(|v| !v.data.is_empty())
-                .and_then(|v| {
-                    v.media_type.clone().map(|m| CoverImage {
-                        bytes: v.data.to_vec(),
-                        mime: m,
-                    })
-                });
-        }
-
-        // 时长与码率
-        if let Some(dur) = track_duration {
-            md.duration = Some(dur);
-            // 码率 = 文件大小 × 8 / 时长
-            // 注意：必须全程浮点计算，不能用 `dur as u64` 作除数——
-            // 时长在 (0, 1) 秒时截断为 0 会触发整数除零 panic
-            // （0.5 秒的提示音/采样文件真实存在，违反"生产路径零 panic"基线）。
-            // 用 `(size * 8) as f64 / dur` 也顺带修正了 1~2 秒文件按 1 秒
-            // 除、码率高估近 2 倍的问题。
+        // 码率 = 文件大小 × 8 / 时长
+        // 注意：必须全程浮点计算，不能用 `dur as u64` 作除数——
+        // 时长在 (0, 1) 秒时截断为 0 会触发整数除零 panic。
+        if let Some(dur) = params.duration {
             if dur > 0.0 {
                 if let Ok(meta) = std::fs::metadata(path) {
                     let size = meta.len();
@@ -170,7 +137,7 @@ impl TrackMetadata {
     ///   Some(".gitignore")（Rust Path 将其整体视为 stem，无扩展名）；
     /// - `to_str()` 失败（非 UTF-8 文件名）时返回 None，让调用方走
     ///   "（无标题）"占位而非乱码——与 fs_browser 的 UTF-8 严格策略一致。
-    pub(crate) fn fallback_title_from_path(path: &Path) -> Option<String> {
+    fn fallback_title_from_path(path: &Path) -> Option<String> {
         path.file_stem()
             .and_then(|s| s.to_str())
             .map(|s| s.to_owned())
@@ -192,51 +159,6 @@ impl TrackMetadata {
             duration: params.duration,
             bitrate: None,
             cover: None,
-        }
-    }
-
-    /// 从 symphonia 的 MetadataRevision 填充标签字段。
-    /// 遍历所有 Tag，匹配 StandardTag 枚举变体取值。
-    fn fill_tags(md: &mut Self, rev: &MetadataRevision) {
-        for tag in &rev.media.tags {
-            // 仅处理被识别的标准标签（has_std_tag）
-            if let Some(std) = &tag.std {
-                match std {
-                    StandardTag::TrackTitle(name) => md.title = Some((**name).clone()),
-                    StandardTag::Artist(name) => md.artist = Some((**name).clone()),
-                    StandardTag::AlbumArtist(name) => {
-                        // 优先用 Artist，缺失时退到 AlbumArtist
-                        if md.artist.is_none() {
-                            md.artist = Some((**name).clone());
-                        }
-                    }
-                    StandardTag::Album(name) => md.album = Some((**name).clone()),
-                    // symphonia 0.6 把"CD 曲目索引"叫 CdTrackIndex(u8)，
-                    // 不是 CdTrackNumber；与 TrackNumber(u64) 互补：
-                    // 前者来自 CUESHEET，后者来自 ID3 TRCK / Vorbis TRACKNUMBER。
-                    StandardTag::CdTrackIndex(n) => md.track_number = Some(*n as u32),
-                    StandardTag::TrackNumber(n) => md.track_number = Some(*n as u32),
-                    // 内嵌歌词：symphonia 已把 ID3v2 USLT / Vorbis LYRICS(+UNSYNCEDLYRICS)
-                    // / MP4 ©lyr / APE Lyrics 归一为 Lyrics 变体。多个 Lyrics 标签
-                    //（如多语言 USLT）取第一个非空的。
-                    StandardTag::Lyrics(text) if md.lyrics.is_none() && !text.is_empty() => {
-                        md.lyrics = Some((**text).clone());
-                    }
-                    _ => {}
-                }
-            } else {
-                // 兜底：未被 symphonia 识别为标准标签的原始 Tag，按 key
-                // 大小写不敏感匹配歌词（各容器写法不一：
-                // lyrics / LYRICS / unsyncedlyrics）。值只接受字符串型。
-                let key = tag.raw.key.to_ascii_lowercase();
-                if matches!(key.as_str(), "lyrics" | "unsyncedlyrics") {
-                    if let symphonia::core::meta::RawValue::String(val) = &tag.raw.value {
-                        if md.lyrics.is_none() && !val.is_empty() {
-                            md.lyrics = Some((**val).clone());
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -311,56 +233,6 @@ impl TrackMetadata {
         }
         parts.join(" · ")
     }
-}
-
-/// 打开文件并提取 AudioParams + track duration（秒）。
-/// 返回 (params, reader, duration_secs)，失败返回 None。
-///
-/// duration 从 Track.duration + time_base 计算。部分格式无此信息则为 None。
-fn open_for_metadata(path: &Path) -> Option<(AudioParams, Box<dyn FormatReader>, Option<f64>)> {
-    let file = std::fs::File::open(path).ok()?;
-    let mss = symphonia::core::io::MediaSourceStream::new(Box::new(file), Default::default());
-
-    let mut hint = symphonia::core::formats::probe::Hint::new();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        hint.with_extension(ext);
-    }
-
-    let reader = symphonia::default::get_probe()
-        .probe(
-            &hint,
-            mss,
-            symphonia::core::formats::FormatOptions::default(),
-            symphonia::core::meta::MetadataOptions::default(),
-        )
-        .ok()?;
-
-    let track = reader.default_track(TrackType::Audio)?;
-    let track_id = track.id;
-
-    let audio_params = track.codec_params.as_ref().and_then(|cp| cp.audio())?;
-
-    let params = AudioParams::new(
-        audio_params.sample_rate,
-        audio_params.channels.as_ref().map(|c| c.count() as u16),
-        audio_params.bits_per_sample,
-        tuneux_corex::codec_name_or_ext(&audio_params.codec, path),
-        track_id,
-        None, // from_file 自己算（带 bitrate），这里不复用
-    );
-
-    // 时长：Track.duration（Duration 是 time_base tick 数）+ time_base 换算
-    let duration_secs = track.duration.and_then(|dur| {
-        track.time_base.map(|tb| {
-            // Duration 的内部 u64 是私有的，用 .get() 取；
-            // Timestamp 没有 From<u64>，转 i64：时长永远非负，位转换安全。
-            let time =
-                tb.calc_time_saturating(symphonia::core::units::Timestamp::from(dur.get() as i64));
-            time.as_secs_f64()
-        })
-    });
-
-    Some((params, reader, duration_secs))
 }
 
 // =============================================================================
@@ -446,7 +318,7 @@ mod tests {
         assert_eq!(md.title.as_deref(), Some("我的歌"));
     }
 
-    /// `fallback_title_from_path` 的纯函数单测：不依赖文件系统、symphonia。
+    /// `fallback_title_from_path` 的纯函数单测：不依赖文件系统、音频探测。
     #[test]
     fn fallback_title_normal() {
         // 普通文件：去扩展名

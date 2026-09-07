@@ -58,7 +58,7 @@ pub(super) fn draw_about(frame: &mut ratatui::Frame, area: Rect) {
         ]),
         Line::from("这是一个基于命令行的音乐播放器"),
         Line::from(""),
-        Line::from("支持 MP3 · FLAC · WAV · OGG · M4A · AAC · ALAC"),
+        Line::from("支持 MP3 · FLAC · WAV · OGG · OPUS · WV · M4A · AAC · ALAC"),
         Line::from("中文界面 · 纯离线 · 不收集任何数据"),
         Line::from(""),
         Line::from("本项目采用木兰宽松许可证 v2（MulanPSL-2.0）"),

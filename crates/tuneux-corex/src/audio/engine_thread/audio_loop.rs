@@ -1,8 +1,7 @@
 //! 音频线程主循环：持 cpal Stream + HeapCons，分发 AudioCmd 命令。
 //!
 //! 从 engine_thread.rs 拆分。音频线程独占 cpal::Stream（macOS 非 Send）与
-//! HeapCons；命令分发 match 原样保留；设备热切换轮询逻辑内联在本模块
-//!（设备热切换轮询逻辑内联在本模块）。
+//! HeapCons；命令分发 match 原样保留；设备热切换轮询逻辑内联在本模块。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
@@ -31,6 +30,7 @@ pub(super) fn audio_loop(
     dec_cmd_tx: Sender<DecoderCmd>,
     state: Arc<SharedState>,
     finished_tx: Sender<()>,
+    failed_tx: Sender<()>,
     close: Arc<AtomicBool>,
     init_tx: SyncSender<Result<(), String>>,
 ) {
@@ -49,8 +49,7 @@ pub(super) fn audio_loop(
     );
 
     if initial_stream.is_none() {
-        // 建流失败：通知主线程、唤醒解码线程退出，避免线程泄漏。
-        eprintln!("[音频] 创建输出流失败");
+        // 建流失败：init_tx 已把原因通知主线程（UI 状态栏），不再 eprintln。
         let _ = init_tx.send(Err("创建输出流失败".into()));
         close.store(true, Ordering::Relaxed);
         return;
@@ -109,13 +108,7 @@ pub(super) fn audio_loop(
                 .and_then(|d| d.name().ok());
             // 名称变了才视为"设备切换"；都不可用（Some→None 或 None→None 同名）则跳过。
             if new_device_name != last_default_device_name {
-                match new_device_name.as_deref() {
-                    Some(name) => eprintln!(
-                        "[音频] 默认输出设备变化：{:?} → {name:?}",
-                        last_default_device_name
-                    ),
-                    None => eprintln!("[音频] 默认输出设备不可用（被拔？）"),
-                }
+                // 设备变化：走下方重建逻辑即可，状态栏无需逐次刷屏。
                 last_default_device_name = new_device_name;
 
                 // 有播放路径即重建（含暂停态——暂停时拔插耳机，恢复后不能绑旧设备；
@@ -147,12 +140,9 @@ pub(super) fn audio_loop(
                             .default_output_config()
                             .map(|c| c.sample_rate().0)
                             .unwrap_or(device_sample_rate);
-                        // 重建目标采样率 = 新设备的默认（若与当前流一致则无需重建，避免无谓开销）
-                        let target_sr = if new_default_sr != current_stream_sr {
-                            new_default_sr
-                        } else {
-                            current_stream_sr
-                        };
+                        // 重建目标采样率 = 新设备的默认采样率（无论与当前流是否
+                        // 一致，取值都等于 new_default_sr，无需分支）。
+                        let target_sr = new_default_sr;
                         let rebuilt = rebuild_stream(
                             &new_device,
                             target_sr,
@@ -175,23 +165,22 @@ pub(super) fn audio_loop(
                                 // 用户对"接着上次"的预期弱于"听见声音"，重新开始是更稳的取舍）。
                                 let _ = dec_cmd_tx.send(DecoderCmd::Load(path));
                                 // 进度基准清零：重建后从文件头重播，回调 add_frames 从 0 起，
-                                // 否则进度显示错位超前（建议）。
+                                // 否则进度显示错位超前。
                                 state.reset_position(0.0);
                                 // 新流按设备默认采样率：文件原生率大概率不同，保守标为非直通
-                                //（避免 UI"直通"标识失真——建议）。
+                                //（避免 UI"直通"标识失真）。
                                 state.set_bitstream(false);
                                 // 若之前在播放：必须显式 play()——cpal 流 pause 后回调不运行，
-                                // 等"自然消费"会永久静音（高危缺陷）。
+                                // 等"自然消费"会永久静音。
                                 if state.is_playing() {
                                     if let Some(s) = stream.as_ref() {
                                         let _ = s.play();
                                     }
                                 }
-                                eprintln!("[音频] 设备切换完成，已重建流并重载当前文件");
                             }
+
                             None => {
                                 // 新设备建流失败：保留 device_sample_rate 回退（最后一次机会）
-                                eprintln!("[音频] 新设备建流失败，回退到初始采样率重试");
                                 match rebuild_stream(
                                     &new_device,
                                     device_sample_rate,
@@ -215,14 +204,15 @@ pub(super) fn audio_loop(
                                                 let _ = s.play();
                                             }
                                         }
-                                        eprintln!("[音频] 设备切换回退成功");
                                     }
                                     None => {
-                                        eprintln!(
-                                            "[音频] 新设备建流彻底失败，保持静音（用户需手动恢复）"
-                                        );
                                         // stream 已 drop，保持 None——下一拍 is_playing=true
                                         // 但 stream=None 不影响线程健康，只是听不见声音。
+                                        // 彻底失败必须让用户知道（听不见声音），走 UI 错误通道。
+                                        state.set_last_error(
+                                            "音频设备不可用：新设备建流失败，已保持静音"
+                                                .to_string(),
+                                        );
                                         current_stream_sr = device_sample_rate;
                                         state.set_stream_sample_rate(device_sample_rate);
                                     }
@@ -343,6 +333,7 @@ pub(super) fn audio_loop(
     let _ = dec_cmd_tx.send(DecoderCmd::Exit);
     // drop Stream：停止播放、释放设备（Option 自动 drop 内部 Stream）
     drop(stream);
-    // finished_tx 不再需要，drop 让接收端能感知结束
+    // finished_tx / failed_tx 不再需要，drop 让接收端能感知结束
     drop(finished_tx);
+    drop(failed_tx);
 }

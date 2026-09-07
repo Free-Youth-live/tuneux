@@ -137,8 +137,8 @@ pub struct Playlist {
     /// 已播历史（最近的在末尾），用于 shuffle 模式下的 prev 撤回
     history: Vec<usize>,
     shuffle: bool,
-    rng: Lcg,
-    /// 显示行滚动偏移：渲染时从 visible_rows[scroll] 开始画。
+    rng: SplitMix64,
+    /// 显示行滚动偏移：渲染时从 `visible_rows[scroll]` 开始画。
     /// 由 ensure_visible 根据选中项位置维护，让选中项始终在可视区内。
     scroll: usize,
     /// 当前显示视图（Flat 平铺 / ByAlbum 分组）。
@@ -155,11 +155,11 @@ pub struct Playlist {
 /// 简单伪随机数生成器（splitmix64），避免引入 `rand` 依赖。
 /// 分布对洗牌足够用，单测用固定种子验证确定性。
 #[derive(Debug, Clone)]
-struct Lcg {
+struct SplitMix64 {
     state: u64,
 }
 
-impl Lcg {
+impl SplitMix64 {
     fn new() -> Self {
         // 默认种子：固定常量。洗牌会话间不可复现但单测可设自己的种子。
         Self {
@@ -205,7 +205,7 @@ impl Playlist {
             selected: None,
             history: Vec::new(),
             shuffle: false,
-            rng: Lcg::new(),
+            rng: SplitMix64::new(),
             scroll: 0,
             view: PlaylistView::ByAlbum,
             collapsed_albums: HashSet::new(),
@@ -222,7 +222,7 @@ impl Playlist {
             selected: None,
             history: Vec::new(),
             shuffle: false,
-            rng: Lcg::with_seed(seed),
+            rng: SplitMix64::with_seed(seed),
             scroll: 0,
             view: PlaylistView::ByAlbum,
             collapsed_albums: HashSet::new(),
@@ -364,6 +364,8 @@ impl Playlist {
         }
         self.items.remove(index);
         self.invalidate_display_order();
+        // 回收 scroll：删除条目后行数减少，防止 skip(scroll) 越过新行数致面板空白。
+        self.scroll = self.scroll.min(self.items.len().saturating_sub(1));
 
         // 调整 current
         self.current = match self.current {
@@ -399,8 +401,6 @@ impl Playlist {
     }
 
     /// 条目数量。
-    // 仅单元测试使用；二进制 crate 中 pub 方法仍会触发 dead_code 警告，故保留此 allow。
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.items.len()
     }
@@ -605,7 +605,10 @@ impl Playlist {
             return false;
         }
         if let Some(curr) = self.current {
-            self.history.push(curr);
+            // 目标即当前项：无需压 history（否则 p 键"回到"仍是本曲，无意义）。
+            if curr != index {
+                self.history.push(curr);
+            }
         }
         self.current = Some(index);
         true
@@ -690,12 +693,6 @@ impl Playlist {
         }
     }
 
-    /// 进入下一曲（按 repeat + shuffle 算）。
-    /// 同时把旧的 current push 到 history（shuffle 模式 prev 用）。
-    ///
-    /// 顺序模式按 **display 顺序**走（按 album/track 排序后的顺序），
-    /// 与面板上 ↑/↓ 的导航一致——用户看到啥、播下一首就是啥的下一首。
-    /// shuffle 模式不受影响（随机从所有未播过项里抽，不依赖顺序）。
     /// 预览下一曲路径（不改变状态；Gapless 预载用）。
     ///
     /// 仅顺序播放可预测：单曲循环 / 随机播放返回 None（不预载，
@@ -708,21 +705,43 @@ impl Playlist {
         if matches!(repeat, RepeatMode::Single) || self.shuffle || self.items.len() == 1 {
             return None;
         }
-        // 未播放（current=None）预测第一首；已播放预测 current 的下一首
-        let idx = match self.current {
-            Some(c) => c + 1,
-            None => 0,
+        // 顺序模式：与 next() 完全同口径，按 display_order 预测下一曲，
+        // 保证 Gapless 预载目标 = 实际切换目标（插入序≠显示序时不致切错曲）。
+        let order = self.display_order();
+        let next_idx = match self
+            .current
+            .and_then(|c| order.iter().position(|&i| i == c))
+        {
+            Some(pos) if pos + 1 < order.len() => Some(order[pos + 1]),
+            Some(_) if matches!(repeat, RepeatMode::List) => order.first().copied(),
+            Some(_) => None,
+            None => order.first().copied(),
         };
-        if idx < self.items.len() {
-            self.items.get(idx).map(|i| i.path.clone())
-        } else if matches!(repeat, RepeatMode::List) {
-            // 列表循环：回到第一首
-            self.items.first().map(|i| i.path.clone())
-        } else {
-            None // 顺序播放到末尾且不循环
-        }
+        next_idx
+            .and_then(|idx| self.items.get(idx))
+            .and_then(|next| {
+                // 下一曲是同一整轨文件的 CUE 分轨时不预载：分轨切换走文件内
+                // Seek；若照常预载，整轨播到文件尾时解码线程会把同一文件
+                // 无缝重开（自预载），与前端的分轨推进互相错位。普通曲目
+                // 同路径重复加入不受影响（无缝重开是正确行为）。
+                let cur_same_file = self
+                    .current
+                    .and_then(|c| self.items.get(c))
+                    .is_some_and(|cur| cur.path == next.path);
+                if cur_same_file && next.cue.is_some() {
+                    None
+                } else {
+                    Some(next.path.clone())
+                }
+            })
     }
 
+    /// 进入下一曲（按 repeat + shuffle 算）。
+    /// 同时把旧的 current push 到 history（shuffle 模式 prev 用）。
+    ///
+    /// 顺序模式按 **display 顺序**走（按 album/track 排序后的顺序），
+    /// 与面板上 ↑/↓ 的导航一致——用户看到啥、播下一首就是啥的下一首。
+    /// shuffle 模式不受影响（随机从所有未播过项里抽，不依赖顺序）。
     pub fn next(&mut self, repeat: RepeatMode) -> NavOutcome {
         if self.items.is_empty() {
             return NavOutcome::End;
@@ -1524,5 +1543,23 @@ mod tests {
 
         assert_eq!(p.current_index(), None, "排序后 current 应重置");
         assert_eq!(p.selected(), None, "排序后 selected 应重置");
+    }
+
+    /// 预载守卫：下一曲是同一整轨文件的 CUE 分轨时不预载——否则整轨播到
+    /// 文件尾时解码线程会把同一文件无缝重开，与前端的分轨推进错位。
+    #[test]
+    fn peek_next_skips_same_file_cue_fragment() {
+        let mut p = Playlist::new();
+        p.add(cue_item("/album.flac", 1, "Track 1"));
+        p.add(cue_item("/album.flac", 2, "Track 2"));
+        p.add(cue_item("/album.flac", 3, "Track 3"));
+        p.set_current(0);
+        assert_eq!(p.peek_next(RepeatMode::Off), None, "同文件下一分轨不应预载");
+        p.set_current(2);
+        assert_eq!(
+            p.peek_next(RepeatMode::List),
+            None,
+            "环绕回同文件分轨不应预载"
+        );
     }
 }

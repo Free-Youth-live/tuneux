@@ -17,8 +17,11 @@ use cpal::{SampleFormat, Stream, StreamConfig};
 use crossbeam_channel::Sender;
 use ringbuf::{traits::*, HeapCons, HeapProd, HeapRb};
 
+use crate::audio::compressor::CompressorEffect;
 use crate::audio::engine::{DecoderCmd, SharedState};
 use crate::audio::engine_thread::sample_utils::accumulate_spectrum;
+use crate::audio::equalizer::EqEffect;
+use crate::audio::playback_medium::MediumEffects;
 use crate::audio::spectrum;
 
 pub(super) const RING_CAPACITY: usize = 48000 * 2 * 2;
@@ -137,8 +140,7 @@ pub(super) fn switch_stream_for_playback(
                 state.set_stream_sample_rate(target_sr);
             }
             None => {
-                // 重建失败：回退用初始采样率重建（降级）。极端情况。
-                eprintln!("[音频] 流重建失败（{target_sr} Hz），回退降级");
+                // 重建失败：回退用初始采样率重建（降级）。极端情况，静默（raw 屏幕）。
                 *stream = rebuild_stream(
                     device,
                     device_sample_rate,
@@ -177,7 +179,7 @@ pub(super) fn build_stream(
     device_channels: usize,
 ) -> Option<Stream> {
     if sample_format != SampleFormat::F32 {
-        eprintln!("[音频] 当前设备样本格式 {sample_format:?} 非 f32，暂不支持");
+        // 样本格式非 f32 暂不支持：返回 None，由上层错误通道（init/设备切换）提示。
         return None;
     }
 
@@ -220,6 +222,14 @@ pub(super) fn build_stream(
         [Complex::new(0.0, 0.0); spectrum::FFT_SIZE_FOR_BUF];
     let mut fft_plan_scratch_r: [Complex<f32>; spectrum::FFT_SIZE_FOR_BUF] =
         [Complex::new(0.0, 0.0); spectrum::FFT_SIZE_FOR_BUF];
+    // 播放介质效果器集合（磁带 / 黑胶有状态，随闭包常驻；None 直通）。
+    let mut medium_effects = MediumEffects::default();
+    // 均衡器效果器槽位池（v2 动态多槽位：最多 EQ_SLOTS 个叠加，随闭包常驻）。
+    let mut eq_effects: [EqEffect; crate::audio::equalizer::EQ_SLOTS] =
+        std::array::from_fn(|_| EqEffect::default());
+    // 压缩器效果器槽位池。
+    let mut comp_effects: [CompressorEffect; crate::audio::compressor::COMP_SLOTS] =
+        std::array::from_fn(|_| CompressorEffect::default());
     let stream = device
         .build_output_stream::<f32, _, _>(
             config,
@@ -237,15 +247,60 @@ pub(super) fn build_stream(
                     l_buf.fill(0.0);
                     r_buf.fill(0.0);
                     buf_idx = 0;
+                    // 重置介质效果器状态，避免上一曲延迟线 / 相位残留带进新曲。
+                    medium_effects.reset();
+                    for e in &mut eq_effects {
+                        e.reset();
+                    }
+                    for c in &mut comp_effects {
+                        c.reset();
+                    }
                 }
 
                 // 从 ringbuf 取样本（非阻塞）
                 let n = consumer.pop_slice(data);
-                // 应用音量 + ReplayGain 标准化增益（叠加）
-                let vol = state.volume();
+                // 先应用 ReplayGain 标准化增益（介质 DSP 之前，让介质听感与监听音量无关）。
+                // replay_gain() 在开关关闭时恒返回 1.0（引擎内部判断）。
                 let rg = state.replay_gain();
                 for s in data[..n].iter_mut() {
-                    *s *= vol * rg;
+                    *s *= rg;
+                }
+                // 播放介质风格 DSP：ReplayGain 之后、音量之前、频谱累计之前。
+                // 介质底噪 / 噼啪是加性信号、磁饱和是电平相关非线性，必须放在音量之前，
+                // 否则静音时噪声仍输出、且调音量会改变介质音色。
+                medium_effects.apply(
+                    state.medium(),
+                    &mut data[..n],
+                    device_channels.max(1),
+                    device_sample_rate,
+                );
+                // 均衡器 DSP：介质之后、音量之前（EQ 是音色修饰，与监听音量解耦）。
+                // 按槽位升序遍历，空槽（未分配）跳过。
+                for (i, e) in eq_effects.iter_mut().enumerate() {
+                    if state.eq_slot_used(i) {
+                        e.process(
+                            &mut data[..n],
+                            device_channels.max(1),
+                            device_sample_rate,
+                            state.eq_slot(i),
+                        );
+                    }
+                }
+                // 压缩器 DSP：均衡器之后、音量之前。
+                for (i, c) in comp_effects.iter_mut().enumerate() {
+                    if state.comp_slot_used(i) {
+                        c.process(
+                            &mut data[..n],
+                            device_channels.max(1),
+                            device_sample_rate,
+                            state.comp_slot(i),
+                        );
+                    }
+                }
+                // 再应用音量（介质 DSP 之后）。
+                let vol = state.volume();
+                for s in data[..n].iter_mut() {
+                    *s *= vol;
                 }
                 // 不足部分静音
                 for s in data[n..].iter_mut() {
@@ -312,12 +367,25 @@ pub(super) fn build_stream(
                     );
                     state.set_spectrum_lr(&bands_l, &bands_r);
 
+                    // 波形：从 FFT 环形缓冲（≈85ms 时窗）按步长降采样到 WAVEFORM_LEN，
+                    // 覆盖写入。示波器显示最近一小段时域波形（每 ~10ms 刷新一次）。
+                    let step = spectrum::FFT_SIZE_FOR_BUF / spectrum::WAVEFORM_LEN;
+                    let mut wf_l = [0.0f32; spectrum::WAVEFORM_LEN];
+                    let mut wf_r = [0.0f32; spectrum::WAVEFORM_LEN];
+                    for i in 0..spectrum::WAVEFORM_LEN {
+                        wf_l[i] = l_sorted[i * step];
+                        wf_r[i] = r_sorted[i * step];
+                    }
+                    state.set_waveform_lr(&wf_l, &wf_r);
+
                     window_frames = 0;
                     window_peak_l = 0.0;
                     window_peak_r = 0.0;
                 }
             },
-            |err| eprintln!("[音频] 流错误：{err:?}"),
+            // 流运行期错误：静默。设备断开会由音频线程的 2s 轮询检测并走
+            // 重建/报错通道（last_error），这里打印只会弄脏 raw-mode 屏幕。
+            |_| {},
             None,
         )
         .ok()?;

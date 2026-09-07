@@ -20,8 +20,14 @@ pub mod cue;
 pub mod rg;
 
 // 显式白名单（收官）：杜绝 glob 泄漏，公开面逐项冻结
+pub use audio::compressor::{CompressorParams, COMP_SLOTS};
 pub use audio::decoder::{
-    codec_name_or_ext, open_backend, AudioParams, DecodeError, DecoderBackend,
+    codec_name_or_ext, open_backend, AudioParams, DecodeError, DecoderBackend, KNOWN_AUDIO_EXTS,
 };
 pub use audio::engine::{AudioCmd, Engine};
+pub use audio::equalizer::{
+    EqParams, EQ_BANDS, EQ_FREQS, EQ_GAIN_MAX_DB, EQ_GAIN_MIN_DB, EQ_SLOTS,
+};
+pub use audio::playback_medium::{PlaybackMedium, UnknownMedium};
+pub use audio::probe::{probe_metadata, ProbeTags};
 pub use audio::spectrum;

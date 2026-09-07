@@ -37,7 +37,7 @@ confidence-threshold = 0.8
 # 0.20 语法：仅白名单（allow），白名单之外的许可（含任何 GPL 家族）默认拒绝
 
 [bans]
-# 同一 crate 多版本：警告（防重复，）
+# 同一 crate 多版本：警告
 multiple-versions = "warn"
 # 硬封联网依赖（规范 2：内核零联网）。若未来宿主需联网能力，由宿主 crate 单独引入并单独检查。
 deny = [

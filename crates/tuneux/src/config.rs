@@ -84,26 +84,29 @@ pub enum PlaylistView {
     Flat,
 }
 
-/// 频谱面板的显示模式（`v` 键切换：关 → 半屏 → 全屏 → 关）。
+/// 可视化面板的显示模式（`v` 键切换：关 → 频谱半屏 → 频谱全屏 → 示波器 → 关）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SpectrumMode {
-    /// 不显示频谱。
+    /// 不显示可视化。
     #[default]
     Hidden,
     /// 频谱占主区一半（与播放列表上下分屏）。
     Half,
     /// 频谱占满整个主区。
     Full,
+    /// 示波器（左右声道时域波形）占满整个主区。
+    Oscilloscope,
 }
 
 impl SpectrumMode {
-    /// 循环到下一模式：Hidden → Half → Full → Hidden。
+    /// 循环到下一模式：Hidden → Half → Full → Oscilloscope → Hidden。
     pub fn next(self) -> Self {
         match self {
             SpectrumMode::Hidden => SpectrumMode::Half,
             SpectrumMode::Half => SpectrumMode::Full,
-            SpectrumMode::Full => SpectrumMode::Hidden,
+            SpectrumMode::Full => SpectrumMode::Oscilloscope,
+            SpectrumMode::Oscilloscope => SpectrumMode::Hidden,
         }
     }
 }
@@ -138,8 +141,10 @@ pub enum LeftPanel {
     Hidden,
     /// 左侧显示文件浏览器。
     Browser,
-    /// 左侧显示专辑封面。
+    /// 左侧显示单张专辑封面。
     Cover,
+    /// 左侧显示封面网格浏览（按专辑）。
+    CoverBrowser,
 }
 
 /// 应用配置。
@@ -157,6 +162,11 @@ pub struct Config {
     /// 存为 f32 而非百分比，避免整数除法；TUI 显示时再 ×100。
     #[serde(default = "default_volume")]
     pub volume: f32,
+
+    /// ReplayGain 响度归一开关（默认关 = 不做任何增益改动）。
+    /// 开启后播放中测量响度（-14 LUFS 目标），后续播放按缓存增益归一。
+    #[serde(default)]
+    pub replay_gain: bool,
 
     /// 循环模式。
     #[serde(default)]
@@ -181,6 +191,12 @@ pub struct Config {
     /// 左侧面板状态（隐藏 / 浏览器 / 封面），退出时保留。
     #[serde(default)]
     pub left_panel: LeftPanel,
+
+    /// 播放介质风格（corex 全部 9 档的字符串名；兼容旧短名 tape/vinyl）。
+    /// 只作用于声音（DSP 修饰），界面布局不受影响。
+    /// 退出时保留，下次启动沿用。
+    #[serde(default = "default_playback_medium")]
+    pub playback_medium: String,
 
     /// 文件浏览器占终端宽度的比例（0.1 ~ 0.9）。
     /// 例如 0.4 表示左侧浏览器占 40%，右侧元数据/播放列表占 60%。
@@ -228,6 +244,11 @@ pub struct Config {
 /// 作为 serde default 函数，仅在配置文件缺该字段时使用。
 fn default_volume() -> f32 {
     1.0
+}
+
+/// 播放介质风格的默认值（字符串）。
+fn default_playback_medium() -> String {
+    "none".to_string()
 }
 
 /// 默认浏览器比例：0.4（左 40%）。
@@ -367,12 +388,14 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             volume: default_volume(),
+            replay_gain: false,
             repeat: RepeatMode::default(),
             shuffle: false,
             playlist_view: PlaylistView::ByAlbum,
             spectrum_mode: SpectrumMode::Hidden,
             lyrics_mode: LyricsMode::Hidden,
             left_panel: LeftPanel::Hidden,
+            playback_medium: "none".to_string(),
             browser_ratio: default_browser_ratio(),
             last_dir: None,
             dedup_on_add: default_dedup_on_add(),
@@ -499,17 +522,13 @@ fn is_writable(dir: &Path) -> bool {
     writable
 }
 
-/// 加载配置（对外接口）。
-///
-/// 始终返回有效 Config：加载失败时打印警告并回退默认值，
-/// 保证程序在任何情况下都能启动。
-/// keymap 合法动作名白名单（与 app.rs execute_action 支持的动作一致）。
+/// keymap 合法动作名白名单（与 keys.rs 支持的动作一致）。
 const KEYMAP_ACTIONS: &[&str] = &["toggle_play", "next", "prev", "volume_up", "volume_down"];
 
 /// 校验并清理 keymap：剔除非法动作名（未知动作 / 空白键描述），
 /// 避免用户误配导致快捷键静默失效或与退出键（q/Ctrl+C）冲突。
 ///
-/// 建议：非法映射打警告并剔除；保留键冲突由文档警示。
+/// 非法映射打警告并剔除；保留键冲突由文档警示。
 pub(crate) fn validate_keymap(keymap: &mut HashMap<String, String>) {
     keymap.retain(|action, desc| {
         let action_ok = KEYMAP_ACTIONS.contains(&action.as_str());
@@ -565,13 +584,11 @@ fn load_from(path: &Path) -> ConfigResult<Config> {
 
 /// 保存配置到默认路径（对外接口）。
 ///
-/// 保存失败仅打印警告，不向上传播错误——配置丢失不影响音频播放，
-/// 不应阻塞程序退出流程。
+/// 保存失败静默吞掉、不向上传播——配置丢失不影响音频播放，不应阻塞
+/// 程序退出流程；且运行期定期保存时 eprintln 会弄脏 raw-mode 屏幕。
 pub fn save(cfg: &Config) {
     let path = config_path();
-    if let Err(e) = save_to(&path, cfg) {
-        eprintln!("[配置] 保存失败（{}）：{e}", path.display());
-    }
+    let _ = save_to(&path, cfg);
 }
 
 /// 保存配置到指定路径（内部接口，便于单元测试）。
@@ -601,12 +618,10 @@ pub fn load_playlist_state() -> PlaylistState {
 
 /// 保存播放状态到独立文件 `playlist.toml`。
 ///
-/// 保存失败仅打印警告，不阻塞退出。
+/// 保存失败静默吞掉、不阻塞退出（理由同 [`save`]：运行期打印会弄脏屏幕）。
 pub fn save_playlist_state(state: &PlaylistState) {
     let path = playlist_state_path();
-    if let Err(e) = save_playlist_state_to(&path, state) {
-        eprintln!("[配置] 保存播放状态失败（{}）：{e}", path.display());
-    }
+    let _ = save_playlist_state_to(&path, state);
 }
 
 /// 保存播放状态到指定路径（内部接口，便于单元测试）。
@@ -644,12 +659,14 @@ mod tests {
 
         let original = Config {
             volume: 0.42,
+            replay_gain: true,
             repeat: RepeatMode::Single,
             shuffle: true,
             playlist_view: PlaylistView::Flat,
             spectrum_mode: SpectrumMode::Half,
             lyrics_mode: LyricsMode::Visible,
             left_panel: LeftPanel::Browser,
+            playback_medium: "vinyl".to_string(),
             browser_ratio: 0.55,
             last_dir: Some(PathBuf::from("/tmp/music")),
             dedup_on_add: false,
