@@ -1,0 +1,36 @@
+# =============================================================================
+# tuneux-corex · 共享音频内核（lib）
+#
+# 版权所有 © 2026 不羁的青春（FreeYouth）
+# 本项目采用木兰宽松许可证，第 2 版（MulanPSL-2.0）开源。
+#
+# 契约化一等 crate：独立版本线、独立 publish、零 UI/零网络/零插件。
+# 版本线从 0.1.0 起步，与产品线版本解耦。
+# =============================================================================
+
+[package]
+name = "tuneux-corex"
+version = "0.1.0"
+edition = "2021"
+license = "MulanPSL-2.0"
+authors = ["不羁的青春（FreeYouth）"]
+description = "tuneux 系列共享音频内核：解码、三线程引擎、播放时钟、无缝状态机（零 UI、零网络、零插件）"
+rust-version = "1.88"
+
+[features]
+# 测试辅助方法（set_*_for_test），仅供同仓前端测试启用，不进 release
+test-helpers = []
+
+[dependencies]
+# 纯音频依赖集（禁 UI：ratatui/crossterm/egui 严禁加入；禁网络依赖——规范）
+cpal.workspace = true
+symphonia.workspace = true
+ringbuf.workspace = true
+crossbeam-channel.workspace = true
+rubato.workspace = true
+rustfft.workspace = true
+opus-decoder = "0.1.1"
+wavicle = "0.1.0"
+
+[lints]
+workspace = true

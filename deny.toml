@@ -1,0 +1,50 @@
+# =============================================================================
+# tuneux 供应链锁定配置（cargo-deny）
+#
+# 依据以下规范：
+#   规范 1 许可：木兰宽松许可证 v2；核心仓库零 GPL；新增依赖须兼容
+#   规范 2 安全：内核纯离线，禁止引入任何联网依赖（此处硬封）
+# =============================================================================
+
+[graph]
+# 全 workspace 统一检查
+
+[advisories]
+# cargo-deny 0.20 语法：vulnerability（RUSTSEC 漏洞）默认硬拒绝，不可配置降级
+# unmaintained/unsound 用 Scope（all/workspace/transitive/none）：检查全部依赖
+unmaintained = "all"
+unsound = "all"
+# yanked：警告即可
+yanked = "warn"
+# 白名单豁免：当前无豁免项（ratatui 0.30.2 升级已消除 paste/lru 问题）
+
+[licenses]
+# 白名单：MulanPSL-2.0 自身 + 依赖常见宽松许可；MPL-2.0 为 symphonia（兼容）
+allow = [
+    "MulanPSL-2.0",
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "OpenSSL",
+]
+confidence-threshold = 0.8
+# 0.20 语法：仅白名单（allow），白名单之外的许可（含任何 GPL 家族）默认拒绝
+
+[bans]
+# 同一 crate 多版本：警告（防重复，）
+multiple-versions = "warn"
+# 硬封联网依赖（规范 2：内核零联网）。若未来宿主需联网能力，由宿主 crate 单独引入并单独检查。
+deny = [
+    { crate = "reqwest", reason = "内核纯离线：禁止任何联网依赖混入" },
+    { crate = "ureq", reason = "内核纯离线：禁止任何联网依赖混入" },
+    { crate = "curl", reason = "内核纯离线：禁止任何联网依赖混入" },
+    { crate = "hyper", reason = "内核纯离线：禁止任何联网依赖混入" },
+    { crate = "tungstenite", reason = "内核纯离线：禁止任何联网依赖混入" },
+    { crate = "libcurl-sys", reason = "内核纯离线：禁止任何联网依赖混入" },
+]
