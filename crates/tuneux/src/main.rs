@@ -10,9 +10,7 @@
 // 项目内部模块
 mod config;
 mod fs_browser;
-mod lyrics;
 mod media_key;
-mod metadata;
 mod playlist;
 mod tui;
 
@@ -27,7 +25,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use crate::config::Config;
+use crate::config::{Config, RepeatMode};
 use crate::tui::app::App;
 use crate::tui::render::{draw, layout_metrics};
 
@@ -122,6 +120,8 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>, config: &mut Config) ->
     };
     // 上次自动保存时间：用于定期落盘，防止直接关窗口丢失状态。
     let mut last_save = std::time::Instant::now();
+    // 上一帧时刻：用于计算帧间隔，驱动频谱峰值按秒衰减（帧率无关）。
+    let mut last_frame = std::time::Instant::now();
 
     loop {
         // 在绘制前，根据当前终端尺寸调整浏览器滚动偏移，确保选中项可见。
@@ -148,21 +148,76 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>, config: &mut Config) ->
             app.search_target,
             config.browser_ratio,
         );
+        // 目录异步载入结果：到达后应用到浏览器（后台线程读大目录不卡 UI；
+        // 放在 ensure_visible/draw 之前，导航结果未应用前不参与本帧渲染）。
+        if let Ok((gen, resolved, result)) = app.dir_load_rx.try_recv() {
+            // 只应用最新一次导航的结果，丢弃陈旧结果。
+            if gen + 1 == app.dir_load_gen {
+                match result {
+                    Ok(entries) => {
+                        // 搜索期间到达的导航结果：新目录使搜索范围失效，
+                        // 一并退出搜索态（apply_loaded 会复位浏览器搜索状态，
+                        // 这里同步清 App 侧标志，避免两边状态错位）。
+                        if app.in_browser_search() {
+                            app.search_mode = false;
+                            app.search_query.clear();
+                        }
+                        // 应用即记录「上次目录」：异步导航的 cwd 此刻才变，
+                        // 只在按键后记录会存进旧目录（Enter 后立即退出尤甚）。
+                        config.last_dir = Some(resolved.clone());
+                        app.browser.apply_loaded(resolved, entries);
+                    }
+                    Err(e) => {
+                        app.last_error = Some(e);
+                        app.last_error_at = Some(std::time::Instant::now());
+                    }
+                }
+            }
+        }
+        // 浏览器搜索的异步收集结果：代次匹配（重进搜索前的陈旧收集丢弃）
+        // 且仍在搜索态时提交给浏览器；已退出搜索则由其内部丢弃。
+        if let Ok((gen, entries, truncated)) = app.search_load_rx.try_recv() {
+            if gen + 1 == app.search_load_gen {
+                app.browser.apply_search_collected(entries, truncated);
+            }
+        }
+        // 目录递归加入的后台结果：批量合入（条目 + 新探测元数据补缓存）。
+        // 多批次全部生效——加入是累积语义（与导航的「最新生效」不同）。
+        if let Ok((dir, items, mds)) = app.add_load_rx.try_recv() {
+            app.apply_dir_add(dir, items, mds, config);
+        }
+        // 播放列表行每帧只算一次，供滚动可见性校正与渲染共用（与 fx 同源）。
+        let rows = app.playlist_rows();
         app.browser.ensure_visible(metrics.browser_visible_h);
-        // 播放列表同样需要滚动跟随（选中项移出可视区时滚动）。
-        // playlist_visible_rows 已扣除边框 2 行与（列表搜索时的）输入框 1 行。
-        app.ensure_playlist_visible(metrics.playlist_visible_rows);
+        app.ensure_playlist_visible(&rows, metrics.playlist_visible_rows);
 
         // 渲染界面（draw 需要 &mut app：电平乱码每帧推进 rng 状态）
-        terminal.draw(|frame| draw(frame, &mut app, config))?;
+        let dt = last_frame.elapsed();
+        last_frame = std::time::Instant::now();
+        terminal.draw(|frame| draw(frame, &mut app, config, &rows, dt))?;
 
         // 拉取 engine 错误 + 自动清除过期——每帧都做（100ms 一次轮询）
         app.refresh_last_error();
 
-        // 事件等待：用 poll（100ms 超时）而非阻塞 read，
-        // 这样每 100ms 能醒来检查音频引擎的 EOF 事件（用于自动下一曲等），
+        // 切曲守卫递减：Play/Seek 异步生效，若干帧内 position 仍是旧值，
+        // 守卫期内主循环不做 CUE 终点判定（防点选更早分轨被滞后 position 误判连跳）。
+        if app.switch_guard > 0 {
+            app.switch_guard -= 1;
+        }
+
+        // 帧率自适应：播放中且频谱可见时缩短 poll 超时（约 30 FPS），
+        // 让频谱动画（含峰值保持白帽）顺滑；否则维持 100 ms，降低空转开销。
+        let animating = app.spectrum_mode != crate::config::SpectrumMode::Hidden
+            && app.engine.as_ref().is_some_and(|e| e.is_playing());
+        let frame_wait = if animating {
+            std::time::Duration::from_millis(33)
+        } else {
+            std::time::Duration::from_millis(100)
+        };
+        // 事件等待：用 poll（frame_wait 超时）而非阻塞 read，
+        // 这样每帧能醒来检查音频引擎的 EOF 事件（用于自动下一曲等），
         // 同时也让进度条等动态信息能周期性刷新。
-        if event::poll(std::time::Duration::from_millis(100))? {
+        if event::poll(frame_wait)? {
             if let Event::Key(key) = event::read()? {
                 // KeyEventKind::Press 过滤掉释放/重复事件，只处理按下
                 if key.kind == KeyEventKind::Press {
@@ -180,6 +235,11 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>, config: &mut Config) ->
             .engine
             .as_ref()
             .is_some_and(|e| e.poll_finished().is_some());
+        // 播放失败事件（打开/解码/重采样失败）：强制下一首，单曲循环也不重复失败曲。
+        let got_failed = app
+            .engine
+            .as_ref()
+            .is_some_and(|e| e.poll_failed().is_some());
         // Gapless 无缝切曲事件：解码线程已无缝切换到预载曲目，
         // 前端只更新 UI 状态（不重发 Play，避免打断无缝衔接）。
         let gapless_switched = app
@@ -187,6 +247,7 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>, config: &mut Config) ->
             .as_ref()
             .is_some_and(|e| e.poll_track_switched().is_some());
         if gapless_switched {
+            app.consecutive_failures = 0;
             // ReplayGain：无缝切曲也保存旧曲分析结果（引擎在切换时已写入）
             if let Some(db) = app.engine.as_ref().and_then(|e| e.take_measured_gain_db()) {
                 if let Some(path) = app.current_path.clone() {
@@ -199,19 +260,21 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>, config: &mut Config) ->
         // CUE 分轨曲目到达终点（position >= end_ms）：整轨文件未 EOF，
         // 但本曲（INDEX 片段）已播完，同样视为"本曲结束"触发切下一曲
         // （修复：无结束边界会一路播到整轨末尾）。
-        let cue_finished = app
-            .playlist
-            .current_index()
-            .and_then(|i| app.playlist.items().get(i))
-            .and_then(|item| item.cue.as_ref())
-            .and_then(|cue| cue.end_ms)
-            .is_some_and(|end_ms| {
-                app.engine
-                    .as_ref()
-                    .is_some_and(|e| e.position() >= end_ms as f64 / 1000.0)
-            });
+        let cue_finished = app.switch_guard == 0
+            && app
+                .playlist
+                .current_index()
+                .and_then(|i| app.playlist.items().get(i))
+                .and_then(|item| item.cue.as_ref())
+                .and_then(|cue| cue.end_ms)
+                .is_some_and(|end_ms| {
+                    app.engine
+                        .as_ref()
+                        .is_some_and(|e| e.position() >= end_ms as f64 / 1000.0)
+                });
         // ReplayGain：曲目分析完成，把整曲增益缓存（下次播放该曲生效）
         if got_finished || cue_finished {
+            app.consecutive_failures = 0;
             if let Some(db) = app.engine.as_ref().and_then(|e| e.take_measured_gain_db()) {
                 if let Some(path) = app.current_path.clone() {
                     app.replay_gain_cache.insert(path, db);
@@ -229,6 +292,27 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>, config: &mut Config) ->
                 }
             }
         }
+        if got_failed {
+            app.consecutive_failures += 1;
+            if app.consecutive_failures >= 10 {
+                // 连续失败达到上限：停止自动跳曲，避免列表全损坏时无限循环刷屏。
+                app.last_error = Some("连续 10 首无法播放，已停止自动切换".to_string());
+                app.last_error_at = Some(std::time::Instant::now());
+                app.consecutive_failures = 0;
+            } else {
+                // 播放失败：强制跳下一首（单曲循环按"顺序"语义，不重复失败曲）。
+                // 错误提示已由 refresh_last_error 显示（"打开失败/解码错误"）。
+                let skip_repeat = if config.repeat == RepeatMode::Single {
+                    RepeatMode::Off
+                } else {
+                    config.repeat
+                };
+                let outcome = app.playlist.next(skip_repeat);
+                if let playlist::NavOutcome::Switch(_) = outcome {
+                    app.handle_nav_outcome(outcome, config);
+                }
+            }
+        }
 
         // 系统媒体键事件：Linux 桌面媒体键经 MPRIS / Windows 经 rdev 钩子到达，
         // 映射为 keymap 动作并执行（与 TUI 按键同路径）。
@@ -242,7 +326,7 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>, config: &mut Config) ->
                     .as_ref()
                     .and_then(|m| m.title.clone())
                     .unwrap_or_default();
-                *title.lock().unwrap() = title_str;
+                *title.lock().unwrap_or_else(|e| e.into_inner()) = title_str;
             }
             while let Ok(ev) = handle.rx.try_recv() {
                 let action = ev.action().to_string();
@@ -252,13 +336,20 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>, config: &mut Config) ->
             }
         }
 
-        // 同步音量到配置（退出时持久化）
+        // 同步音量到配置（退出时持久化），并记录当前播放位置（接着听）。
+        // 仅在真实播放中且位置 > 0.5 秒时写：避免切曲间隙把上一曲旧位置写
+        // 到新曲路径，也避免 0 位置误删已有断点。CUE 分轨不写断点——断点表
+        // 以文件路径为键，整轨位置会覆盖该文件普通播放的续播点。
+        let current_is_cue = app.current_item_is_cue();
         if let Some(engine) = &app.engine {
             config.volume = engine.volume();
-            // 退出时存当前播放位置（"接着听"的关键数据）
-            if let Some(path) = &app.current_path {
-                let pos = engine.position();
-                app.playlist_state.save_position(path, pos);
+            if engine.is_playing() && !current_is_cue {
+                if let Some(path) = &app.current_path {
+                    let pos = engine.position();
+                    if pos > 0.5 {
+                        app.playlist_state.save_position(path, pos);
+                    }
+                }
             }
         }
 

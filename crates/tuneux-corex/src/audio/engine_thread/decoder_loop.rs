@@ -1,4 +1,4 @@
-//! 解码线程：常驻解码循环 + 文件加载（/ 状态机）。
+//! 解码线程：常驻解码循环 + 文件加载与状态机。
 //!
 //! 从 engine_thread.rs 拆分。解码线程独占 HeapProd（不可 Clone，必须固定线程），
 //! 持 current/resampler/analyzer/preloaded 跨迭代状态；SharedState 以 Arc 共享。
@@ -22,12 +22,24 @@ use crate::audio::resample::Resample;
 /// ReplayGain 目标响度（LUFS）：-14 为流媒体兼容标准（Spotify 等）。
 const RG_TARGET_LUFS: f64 = -14.0;
 
+/// ReplayGain 分析器用的有效采样率：优先取流的真实采样率（原生采样率直通
+/// 会在重建流时改变它），未设置（0）时回退 spawn 捕获值。与 try_load 的
+/// 重采样判定同口径，保证 K 加权滤波器/块长与推入样本的实际速率一致。
+fn analyzer_rate(state: &Arc<SharedState>, device_sample_rate: u32) -> u32 {
+    let s = state.stream_sample_rate();
+    if s > 0 {
+        s
+    } else {
+        device_sample_rate
+    }
+}
+
 pub(super) fn try_load(
     path: &std::path::Path,
     current: &mut Option<Box<dyn DecoderBackend>>,
     resampler: &mut Option<Resample>,
     state: &Arc<SharedState>,
-    finished_tx: &Sender<()>,
+    failed_tx: &Sender<()>,
     device_sample_rate: u32,
     device_channels: usize,
 ) -> bool {
@@ -57,12 +69,7 @@ pub(super) fn try_load(
                     1024,
                 ) {
                     Ok(r) => (Some(r), true),
-                    Err(e) => {
-                        eprintln!(
-                            "[解码] 重采样器初始化失败（{file_sample_rate}→{effective_device_sr} Hz）：{e}"
-                        );
-                        (None, false)
-                    }
+                    Err(_) => (None, false),
                 }
             } else {
                 (None, true)
@@ -72,6 +79,9 @@ pub(super) fn try_load(
                 // 推时长到 SharedState，让 UI 在播放前就能显示时长。
                 if let Some(dur) = dec.params().duration {
                     state.set_duration(dur);
+                } else {
+                    // 无时长元数据（如 Opus / FFmpeg 后端）：清零，避免残留上一曲时长。
+                    state.set_duration(0.0);
                 }
                 *current = Some(dec);
                 true
@@ -85,17 +95,16 @@ pub(super) fn try_load(
                 // 但保持显式清理更不易出错）。
                 *resampler = None;
                 // 错误信息用实际生效的设备采样率（直通后可能与初始值不同），
-                // 与上方 eprintln 保持一致。
+                // 与上方 effective_device_sr 的取值口径一致。
                 state.set_last_error(format!(
                     "重采样器初始化失败（{file_sample_rate}→{effective_device_sr} Hz）"
                 ));
                 state.signal_playback_finished();
-                let _ = finished_tx.send(());
+                let _ = failed_tx.send(());
                 false
             }
         }
         Err(e) => {
-            eprintln!("[解码] 打开文件失败：{e}");
             *current = None;
             *resampler = None; // 同上：失败即清空
                                // 把错误暴露给 UI：让用户知道"刚才那首被跳过了"，
@@ -106,7 +115,7 @@ pub(super) fn try_load(
                 .unwrap_or_else(|| path.display().to_string());
             state.set_last_error(format!("打开失败 [{fname}]：{e}"));
             state.signal_playback_finished(); // 通知音频线程暂停
-            let _ = finished_tx.send(()); // 通知主线程（无法播放）
+            let _ = failed_tx.send(()); // 通知主线程（无法播放）
             false
         }
     }
@@ -118,6 +127,7 @@ pub(super) fn decoder_loop(
     dec_cmd_rx: Receiver<DecoderCmd>,
     state: Arc<SharedState>,
     finished_tx: Sender<()>,
+    failed_tx: Sender<()>,
     track_switched_tx: Sender<()>,
     close: Arc<AtomicBool>,
     device_sample_rate: u32,
@@ -151,13 +161,8 @@ pub(super) fn decoder_loop(
                 // Gapless 预载：提前打开下一曲后端缓存（不启动解码）。
                 // 手动切曲会先发 Load 清空预载；此处仅 open 后端。
                 preloaded = match path {
-                    Some(p) => match open_backend(&p) {
-                        Ok(b) => Some(b),
-                        Err(e) => {
-                            eprintln!("[解码] 预载失败（{p:?}）：{e}");
-                            None
-                        }
-                    },
+                    // 预载失败静默：真正切到该曲时 try_load 会走"无法播放"通道报错。
+                    Some(p) => open_backend(&p).ok(),
                     None => None,
                 };
             }
@@ -171,7 +176,7 @@ pub(super) fn decoder_loop(
                     &mut current,
                     &mut resampler,
                     &state,
-                    &finished_tx,
+                    &failed_tx,
                     device_sample_rate,
                     device_channels,
                 );
@@ -179,11 +184,16 @@ pub(super) fn decoder_loop(
                 draining = false;
                 preloaded = None;
                 current_rate = current.as_ref().and_then(|b| b.params().sample_rate);
-                // ReplayGain：新曲目重置流式分析器（按设备率分析重采样后样本）
-                analyzer = Some(crate::rg::LoudnessAnalyzer::new(
-                    device_sample_rate,
-                    device_channels,
-                ));
+                // ReplayGain：新曲目重置流式分析器（按流采样率分析重采样后样本）。
+                // 开关关闭时不建分析器，省去每样本累计开销。
+                analyzer = if state.replay_gain_enabled() {
+                    Some(crate::rg::LoudnessAnalyzer::new(
+                        analyzer_rate(&state, device_sample_rate),
+                        device_channels,
+                    ))
+                } else {
+                    None
+                };
             }
             Ok(DecoderCmd::LoadAndSeek { path, secs }) => {
                 // 跟 Load 一样打开文件，加载完立刻 seek 到目标位置
@@ -192,7 +202,7 @@ pub(super) fn decoder_loop(
                     &mut current,
                     &mut resampler,
                     &state,
-                    &finished_tx,
+                    &failed_tx,
                     device_sample_rate,
                     device_channels,
                 ) {
@@ -200,15 +210,18 @@ pub(super) fn decoder_loop(
                     draining = false;
                     preloaded = None;
                     current_rate = current.as_ref().and_then(|b| b.params().sample_rate);
-                    analyzer = Some(crate::rg::LoudnessAnalyzer::new(
-                        device_sample_rate,
-                        device_channels,
-                    ));
+                    analyzer = if state.replay_gain_enabled() {
+                        Some(crate::rg::LoudnessAnalyzer::new(
+                            analyzer_rate(&state, device_sample_rate),
+                            device_channels,
+                        ))
+                    } else {
+                        None
+                    };
                     // 立刻 seek——此时文件已加载、current 已就绪，seek 不会丢失
                     if let Some(dec) = current.as_mut() {
-                        if let Err(e) = dec.seek(secs) {
-                            eprintln!("[解码] 接着上次听 seek 失败（{secs:.1}s）：{e}");
-                        }
+                        // 续播 seek 失败则从头播（低频；无需打扰 UI）。
+                        let _ = dec.seek(secs);
                     }
                 } else {
                     decoding = false;
@@ -283,26 +296,25 @@ pub(super) fn decoder_loop(
                         // chunk 的缓冲 + 滤波器延迟，否则这 20-30ms 也丢），
                         // 然后进入"排空等待"，等 ringbuf 播完再上报结束。
                         // 不能在这里立即 signal_playback_finished / finished_tx
-                        // ——见 `draining` 字段注释（：结尾 2 秒被吞）。
+                        // ——见 `draining` 字段注释（结尾 2 秒被吞）。
                         if let Some(rs) = resampler.as_mut() {
-                            match rs.flush() {
-                                Ok(tail) => {
-                                    if !tail.is_empty() {
-                                        push_all(&mut producer, &tail, device_channels);
-                                    }
+                            // flush 失败：20-30ms 尾部静默丢失，不打断结束流程。
+                            // （运行期 eprintln 会弄脏 raw-mode 屏幕，故静默。）
+                            if let Ok(tail) = rs.flush() {
+                                if !tail.is_empty() {
+                                    push_all(&mut producer, &tail, device_channels);
                                 }
-                                // flush 失败：20-30ms 尾部静默丢失，至少记录日志
-                                // 便于排查（不 panic、不阻塞结束流程）
-                                Err(e) => eprintln!("[解码] 重采样器 flush 失败：{e}"),
                             }
                         }
-                        // Gapless 无缝切换：预载就绪且采样率与当前文件一致时，
+                        // Gapless 无缝切换：预载就绪且采样率与声道数与当前文件一致时，
                         // 直接把 current 换成预载后端继续解码（ringbuf 不断流，
                         // 音频回调无空拍）；通知前端"曲目已无缝切换"（只更新 UI，
                         // 不重发 Play）。否则回退 draining 流程。
                         let can_switch = preloaded.is_some()
                             && preloaded.as_ref().and_then(|b| b.params().sample_rate)
-                                == current_rate;
+                                == current_rate
+                            && preloaded.as_ref().and_then(|b| b.params().channels)
+                                == current.as_ref().and_then(|c| c.params().channels);
                         if can_switch {
                             if let Some(next) = preloaded.take() {
                                 // ReplayGain：无缝切换不触发 draining/finished，
@@ -312,20 +324,35 @@ pub(super) fn decoder_loop(
                                     let g = a.gain_db(RG_TARGET_LUFS);
                                     state.set_measured_gain_db(g);
                                 }
+                                // 同步更新时长：gapless 绕过 try_load，不补这里 UI 会一直显示
+                                // 上一曲总时长（状态栏失真，且 toggle_play 的 at_end 判定错位）。
+                                if let Some(dur) = next.params().duration {
+                                    state.set_duration(dur);
+                                } else {
+                                    state.set_duration(0.0);
+                                }
                                 current = Some(next);
-                                analyzer = Some(crate::rg::LoudnessAnalyzer::new(
-                                    device_sample_rate,
-                                    device_channels,
-                                ));
-                                // 同采样率：resampler 配置不变，可直接复用；
+                                analyzer = if state.replay_gain_enabled() {
+                                    Some(crate::rg::LoudnessAnalyzer::new(
+                                        analyzer_rate(&state, device_sample_rate),
+                                        device_channels,
+                                    ))
+                                } else {
+                                    None
+                                };
+                                // 同采样率同声道：resampler 配置不变，可直接复用；
                                 // 重置解码状态继续推数据。
                                 decoding = true;
                                 draining = false;
-                                state.bump_flush(); // 让回调丢弃旧曲残余消费边界
-                                                    // 进度基准清零：无缝切换后播放的是新曲（从 0 起），
-                                                    // 不清零会让 UI 进度条/歌词高亮停留在上一曲位置
-                                                    //（用户报告：声音从头但进度显示旧位置）。
-                                state.reset_position(0.0);
+                                // 不 flush：保留 ringbuf 里旧曲尾巴（约 2 秒）自然播完，
+                                // 实现真正无缝。进度基准设为负的尾巴时长——旧曲尾巴
+                                // 播完前 position ≤ 0（UI 侧钳制显示为 0），播完后新曲从 0 起。
+                                let tail_frames = producer.occupied_len() / device_channels.max(1);
+                                // 尾巴样本按流的真实采样率换算：原生直通会重建流、改变采样率，
+                                // 不能用 spawn 捕获的 device_sample_rate，否则时长会偏约 8%。
+                                let tail_secs = tail_frames as f64
+                                    / analyzer_rate(&state, device_sample_rate).max(1) as f64;
+                                state.reset_position(-tail_secs);
                                 let _ = track_switched_tx.send(());
                             } else {
                                 decoding = false;
@@ -337,14 +364,13 @@ pub(super) fn decoder_loop(
                         }
                     }
                     Err(e) => {
-                        eprintln!("[解码] 解码错误：{e}");
                         decoding = false;
                         draining = false;
                         // 把错误暴露给 UI——用户能看到"刚才那首解码挂了"，
                         // 而不是默默切下一首
                         state.set_last_error(format!("解码错误：{e}"));
                         state.signal_playback_finished(); // 通知音频线程暂停
-                        let _ = finished_tx.send(());
+                        let _ = failed_tx.send(());
                     }
                 }
             }
@@ -405,7 +431,7 @@ mod tests {
         DrainingWait,
         /// draining 完成：occupied == 0 → signal_playback_finished + 通知主线程。
         DrainFinished,
-        /// 完全空闲：解码/draining 都不进行（ 暂停门控生效）。
+        /// 完全空闲：解码/draining 都不进行（暂停门控生效）。
         Idle,
     }
 
@@ -436,12 +462,12 @@ mod tests {
             }
         }
 
-        /// 单 tick 判定：严格对照 decoder_loop 的 / 规则。
+        /// 单 tick 判定：严格对照 decoder_loop 的规则。
         ///
         /// 对照规则（与 `decoder_loop` 同步）：
         /// 1. `if decoding && state.is_playing()` → 调 decode_next：
         ///    - Ok(Some(s))：累加 occupied（生产代码会 adapt/resample/push）
-        ///    - Ok(None)：decoding=false, draining=true（：不立即上报）
+        ///    - Ok(None)：decoding=false, draining=true（不立即上报）
         ///    - Err：decoding=false, draining=false, signal_playback_finished
         /// 2. `else if draining` → occupied==0 时上报结束并退出 draining
         /// 3. else → Idle（生产代码 sleep；测试不 sleep）
@@ -459,7 +485,7 @@ mod tests {
                         TickAction::Decoded
                     }
                     FakeOutcome::Eof => {
-                        //  关键：进入 draining，**不**立即 signal_playback_finished。
+                        // 关键：进入 draining，**不**立即 signal_playback_finished。
                         // 生产代码此处还会 resampler.flush() + push_all(tail)。
                         self.decoding = false;
                         self.draining = true;
@@ -496,7 +522,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // ：暂停时挂起解码
+    // 暂停时挂起解码
     // -----------------------------------------------------------------
 
     /// Pause 后下一 tick 不应进入解码分支 —— 即 is_playing=false 门控生效。
@@ -570,7 +596,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // ：EOF 后排空（不立即上报）
+    // EOF 后排空（不立即上报）
     // -----------------------------------------------------------------
 
     /// 正常 EOF 路径：解码器返回 None 后 decoding→false, draining→true；
@@ -593,7 +619,7 @@ mod tests {
         // 关键不变量：EOF 后**未**上报
         assert!(
             !state.take_playback_finished(),
-            " 关键：EOF 后**不能**立即 signal_playback_finished，否则尾巴被吞"
+            "关键：EOF 后**不能**立即 signal_playback_finished，否则尾巴被吞"
         );
         assert_eq!(sim.signal_finished_calls, 0);
     }
@@ -638,7 +664,7 @@ mod tests {
 
     /// 关键 UX：EOF 进入 draining 后**用户暂停**——occupied 冻结，draining
     /// 不上报（设计行为：保留尾巴等待 Resume，避免用户被动切歌）。Resume
-    /// 后回调继续消费、归零再上报。 +  联合路径。
+    /// 后回调继续消费、归零再上报。联合路径。
     #[test]
     fn drain_paused_holds_until_resume() {
         let state = SharedState::default();
@@ -671,7 +697,7 @@ mod tests {
         assert!(sim.draining, "draining 状态保留");
         assert!(
             !state.take_playback_finished(),
-            " +  联合：暂停期间不应上报（保留尾巴）"
+            "联合：暂停期间不应上报（保留尾巴）"
         );
         assert_eq!(sim.signal_finished_calls, 0);
 

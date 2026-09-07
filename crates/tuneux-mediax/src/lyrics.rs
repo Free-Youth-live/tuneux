@@ -80,7 +80,7 @@ impl Lyrics {
 
     /// 从内嵌歌词文本解析（来自文件标签，如 ID3v2 USLT / Vorbis LYRICS）。
     ///
-    /// 复用 [`Self::parse`] 的 LRC 解析。symphonia 提取的 USLT/LYRICS 常见是
+    /// 复用 [`Self::parse`] 的 LRC 解析。底层探测提取的 USLT/LYRICS 常见是
     /// 带时间戳的 LRC 文本（网易云音乐等打标签工具的内嵌格式），可直接解析。
     ///
     /// 返回 None 的情况（调用方据此视为“无歌词”而不是显示一片空白）：

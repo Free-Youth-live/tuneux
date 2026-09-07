@@ -1,5 +1,5 @@
 # =============================================================================
-# tuneux · 旗舰 TUI（bin）
+# tuneux · 基础版 TUI（bin）
 #
 # 版权所有 © 2026 不羁的青春（FreeYouth）
 # 本项目采用木兰宽松许可证，第 2 版（MulanPSL-2.0）开源。
@@ -8,11 +8,10 @@
 [package]
 # 包名 tuneux；可执行文件名 tuneux
 name = "tuneux"
-version = "0.4.4"
+version = "0.5.0"
 edition = "2021"
 # 木兰宽松许可证 v2
 license = "MulanPSL-2.0"
-# 对作者信息的描述
 authors = ["不羁的青春（FreeYouth）"]
 # 项目描述
 description = "跨平台命令行音乐播放器，界面、提示、元数据全中文"
@@ -27,13 +26,9 @@ path = "src/main.rs"
 [dependencies]
 # 共享音频内核（契约化一等 crate）
 tuneux-corex = { path = "../tuneux-corex" }
+tuneux-mediax = { path = "../tuneux-mediax" }
 # 依赖版本统一由 workspace 根 [workspace.dependencies] 管理
-cpal.workspace = true
-symphonia.workspace = true
-ringbuf.workspace = true
 crossbeam-channel.workspace = true
-rubato.workspace = true
-rustfft.workspace = true
 ratatui.workspace = true
 unicode-width.workspace = true
 crossterm.workspace = true
@@ -46,12 +41,12 @@ encoding_rs.workspace = true
 # 系统媒体键（仅 Linux）：MPRIS D-Bus 服务（zbus 纯 safe Rust，MIT 许可）
 # 通过 workspace target 专属依赖避免其他平台拉入 D-Bus 依赖树
 [target.'cfg(target_os = "linux")'.dependencies]
-zbus = "5"
+zbus.workspace = true
 
 # 系统媒体键（仅 Windows）：rdev 低层键盘钩子（MIT，unsafe 全在 crate 内部，
 # 我们只调 safe API；无窗口、无消息泵）
 [target.'cfg(target_os = "windows")'.dependencies]
-rdev = "0.5"
+rdev.workspace = true
 
 [dev-dependencies]
 # 测试辅助：corex 的 set_*_for_test 方法（仅测试构建生效，release 不含）

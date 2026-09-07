@@ -7,7 +7,7 @@
 //! ## 可插拔后端
 //!
 //! 解码职责抽象为 [DecoderBackend] trait，调用方（解码线程）只面向
-//! Box<dyn DecoderBackend>，不感知具体后端。当前有 symphonia / Opus /
+//! `Box<dyn DecoderBackend>`，不感知具体后端。当前有 symphonia / Opus /
 //! WavPack / FFmpeg 四个后端。FFmpeg 后端以子进程 IPC 方式
 //! 隔离 LGPL/GPL 许可传染，仅在桌面平台可选启用。所有后端经
 //! [open_backend] 工厂分发接入，无需改动调用方。
@@ -33,14 +33,24 @@ use super::ffmpeg::{is_ffmpeg_path, FfmpegBackend};
 use super::opus::{is_opus_path, OpusBackend};
 use super::wavpack::{is_wavpack_path, WavPackBackend};
 
-/// 把 symphonia 的 AudioCodecId 转成用户可读的编码名称。
+/// 内核认识的音频文件扩展名（小写，不含点）：原生进程内解码 + ffmpeg 桥接长尾。
 ///
-/// 优先匹配已知格式；未知的十六进制 ID 返回空字符串，
-/// 由调用方结合文件扩展名兜底。
+/// 供产品侧文件浏览器决定"显示哪些文件"——凡是认识的格式都列出；
+/// 能否真正播放由 [`open_backend`] 在解码时判定（不支持 / 缺 ffmpeg 时返回错误，
+/// 产品据此提示并跳过）。清单是"认识"而非"保证可播"。
+pub const KNOWN_AUDIO_EXTS: &[&str] = &[
+    // 原生进程内：symphonia / Opus / WavPack
+    "mp3", "flac", "wav", "ogg", "m4a", "aac", "alac", "opus", "wv",
+    // ffmpeg 桥接长尾：装了 ffmpeg 才能播
+    "ape", "wma", "flv", "tak", "ofr", "mpc", "shn", "ac3", "dts", "tta", "dsf", "dff",
+];
+
+/// 把解码器给出的编码名（字符串）映射为用户可读的编码名称。
+///
+/// 优先匹配已知格式；未知名称返回空字符串，由调用方结合文件扩展名兜底。
 /// pub(crate)：内部工具（外部经白名单 codec_name_or_ext 使用）。
-pub(crate) fn codec_display_name(codec: &symphonia::core::codecs::audio::AudioCodecId) -> String {
-    let s = format!("{codec}");
-    match s.as_str() {
+pub(crate) fn codec_display_name(codec_name: &str) -> String {
+    match codec_name {
         "flac" => return "FLAC".into(),
         "mp3" => return "MP3".into(),
         "aac" => return "AAC".into(),
@@ -50,18 +60,15 @@ pub(crate) fn codec_display_name(codec: &symphonia::core::codecs::audio::AudioCo
         _ => {}
     }
     // 十六进制未知 codec：返回空，让调用方用扩展名兜底
-    if s.starts_with("0x") {
+    if codec_name.starts_with("0x") {
         return String::new();
     }
-    s
+    codec_name.to_string()
 }
 
 /// 取编码名称，未知时用文件扩展名兜底（如 .flac → FLAC）。
-pub fn codec_name_or_ext(
-    codec: &symphonia::core::codecs::audio::AudioCodecId,
-    path: &std::path::Path,
-) -> String {
-    let name = codec_display_name(codec);
+pub fn codec_name_or_ext(codec_name: &str, path: &std::path::Path) -> String {
+    let name = codec_display_name(codec_name);
     if !name.is_empty() {
         return name;
     }
@@ -96,7 +103,7 @@ pub struct AudioParams {
 impl AudioParams {
     /// 构造完整技术参数。
     ///
-    /// #[non_exhaustive] 后外部无法字面量构造，此构造器为契约化唯一入口
+    /// `#[non_exhaustive]` 后外部无法字面量构造，此构造器为契约化唯一入口
     /// （字段冻结可演进，未来加字段不破坏外部构造）。
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -121,7 +128,7 @@ impl AudioParams {
 /// 解码后端抽象 trait：把"文件 → 交错 f32 样本"这一职责抽成可插拔接口。
 ///
 /// 未来 Opus/WavPack/ffmpeg 等后端只需实现本 trait 并经 [open_backend]
-/// 分发接入，调用方（解码线程）只面向 Box<dyn DecoderBackend>，
+/// 分发接入，调用方（解码线程）只面向 `Box<dyn DecoderBackend>`，
 /// 不感知具体后端。Send 超 trait 保证后端可跨线程移动（解码线程独占）。
 pub trait DecoderBackend: Send {
     /// 取技术参数只读引用（采样率/通道数/位深/编码名/音轨/时长）。
@@ -132,7 +139,7 @@ pub trait DecoderBackend: Send {
     /// 返回 Ok(Some(samples)) 成功；Ok(None) EOF；Err 解码错误。
     ///
     /// 用 copy_to_slice_interleaved 把解码缓冲（可能 planar）一次性转成
-    /// 交错 f32，目标格式由 Vec<f32> 的元素类型推断。
+    /// 交错 f32，目标格式由 `Vec<f32>` 的元素类型推断。
     fn decode_next(&mut self) -> Result<Option<Vec<f32>>, DecodeError>;
 
     /// Seek 到指定秒数。返回请求的秒数（实际落点由底层格式决定，
@@ -185,7 +192,7 @@ impl From<std::io::Error> for DecodeError {
 /// - DecodeError → [DecodeError::Decode]
 /// - Unsupported → [DecodeError::Unsupported]
 /// - SeekError → [DecodeError::Seek]（SeekErrorKind 仅 Debug，取 Debug 文本）
-/// - 其余（LimitError/ResetRequired 及未来新增，因 #[non_exhaustive]）
+/// - 其余（LimitError/ResetRequired 及未来新增，因 `#[non_exhaustive]`）
 ///   → [DecodeError::Decode] 兜底
 impl From<SymphoniaError> for DecodeError {
     fn from(e: SymphoniaError) -> Self {
@@ -203,7 +210,7 @@ impl From<SymphoniaError> for DecodeError {
 ///
 /// 当前有 symphonia / Opus / WavPack / FFmpeg 四个后端，在此按扩展名或
 /// 内容探测追加分支。FFmpeg 后端为进程外 IPC，仅桌面可选。
-/// 返回 Box<dyn DecoderBackend> 使调用方与具体后端解耦——
+/// 返回 `Box<dyn DecoderBackend>` 使调用方与具体后端解耦——
 /// 这是"可插拔"的关键接缝。
 pub fn open_backend(path: &Path) -> Result<Box<dyn DecoderBackend>, DecodeError> {
     // 分发点：.opus 扩展名或 Ogg 首包 OpusHead 魔数 → Opus 后端；
@@ -284,7 +291,7 @@ impl SymphoniaBackend {
             channels: audio_params.channels.as_ref().map(|c| c.count() as u16),
             bits_per_sample: audio_params.bits_per_sample,
             // AudioCodecId 的 Display 给出格式名（MP3/FLAC/AAC 等）
-            codec_name: codec_name_or_ext(&audio_params.codec, path),
+            codec_name: codec_name_or_ext(&audio_params.codec.to_string(), path),
             track_id,
             // 时长从 track.duration (time_base tick) + time_base 换算
             duration: track.duration.and_then(|dur| {
@@ -360,10 +367,18 @@ impl DecoderBackend for SymphoniaBackend {
 ///
 /// 失败（打不开、无音频轨、无采样率信息）返回 None，调用方据此回退到
 /// "用设备默认采样率 + 软件重采样"的降级路径。
+///
+/// 注意：本函数不覆盖 ffmpeg 长尾格式（ape/wma/tak 等）——这些格式恒返回
+/// None、恒走软件重采样（设计可接受：长尾格式本就走进程外解码，无原生直通）。
 pub fn probe_sample_rate(path: &Path) -> Option<u32> {
     // .wv 走 wavicle 首块头解析（symphonia 不识别 WavPack 容器）。
     if is_wavpack_path(path) {
         return super::wavpack::probe_sample_rate(path);
+    }
+    // .opus 输出率由 OpusHead 决定（8/12/16/24/48k 原生，其余按 48k）：
+    // symphonia 不识别 Ogg Opus 容器，读 OpusHead 映射，不硬编码 48k。
+    if is_opus_path(path) {
+        return super::opus::probe_sample_rate(path);
     }
     let file = std::fs::File::open(path).ok()?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());

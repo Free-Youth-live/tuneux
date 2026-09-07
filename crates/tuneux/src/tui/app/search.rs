@@ -19,6 +19,12 @@ pub enum SearchTarget {
 }
 
 impl App {
+    /// 当前是否处于「浏览器搜索」态（搜索框可见且作用于浏览器）。
+    /// 主循环判定异步导航结果是否需要连带退出搜索态用。
+    pub(crate) fn in_browser_search(&self) -> bool {
+        self.search_mode && self.search_target == SearchTarget::Browser
+    }
+
     /// 当前 search_query 下的过滤显示序。
     pub fn filter_playlist(&self) -> Vec<usize> {
         let order = self.playlist.display_order();
@@ -39,6 +45,19 @@ impl App {
                     .is_some_and(|a| a.to_lowercase().contains(&q))
                 {
                     return true;
+                }
+                // CUE 分轨：匹配 .cue 的标题/表演者（否则搜分轨名零命中）。
+                if let Some(cue) = &item.cue {
+                    if cue.title.to_lowercase().contains(&q) {
+                        return true;
+                    }
+                    if cue
+                        .performer
+                        .as_deref()
+                        .is_some_and(|p| p.to_lowercase().contains(&q))
+                    {
+                        return true;
+                    }
                 }
                 if let Some(md) = self.metadata_cache.get(&item.path) {
                     if md
@@ -79,10 +98,10 @@ impl App {
     /// 调整播放列表滚动，确保选中项可见（使用渲染实际使用的行）。
     ///
     /// 搜索时渲染行是过滤后的平铺行，与 visible_rows(view) 不同，
-    /// 故统一从 playlist_rows() 取行再调 ensure_visible_in_rows。
-    pub fn ensure_playlist_visible(&mut self, visible: usize) {
-        let rows = self.playlist_rows();
-        self.playlist.ensure_visible_in_rows(&rows, visible);
+    /// 故统一用主循环传入的 rows（与渲染同一份，每帧只构建一次，
+    /// 与 fx 同源）再调 ensure_visible_in_rows。
+    pub fn ensure_playlist_visible(&mut self, rows: &[playlist::PlaylistRow], visible: usize) {
+        self.playlist.ensure_visible_in_rows(rows, visible);
     }
 
     pub fn jump_selected_to_filter_first(&mut self) {

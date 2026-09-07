@@ -142,7 +142,12 @@ mod linux {
         fn playback_status(&self) -> String {
             if self.playing.load(Ordering::Relaxed) {
                 "Playing".to_string()
-            } else if self.title.lock().unwrap().is_empty() {
+            } else if self
+                .title
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+            {
                 // 无曲目（尚未播放过）：规范初始态为 Stopped
                 "Stopped".to_string()
             } else {
@@ -155,17 +160,17 @@ mod linux {
         /// 状态翻转由主循环回灌（本方法只发事件，不直接改状态——
         /// 避免与 TUI 内空格键的切换逻辑产生双份状态）。
         fn play_pause(&mut self) {
-            let _ = self.tx.send(MediaKeyEvent::PlayPause);
+            let _ = self.tx.try_send(MediaKeyEvent::PlayPause);
         }
 
         /// 下一曲。
         fn next(&mut self) {
-            let _ = self.tx.send(MediaKeyEvent::Next);
+            let _ = self.tx.try_send(MediaKeyEvent::Next);
         }
 
         /// 上一曲。
         fn previous(&mut self) {
-            let _ = self.tx.send(MediaKeyEvent::Prev);
+            let _ = self.tx.try_send(MediaKeyEvent::Prev);
         }
 
         /// 播放（MPRIS 契约：Play = 开始播放）。
@@ -173,7 +178,7 @@ mod linux {
         /// 已在播放时 no-op（修复：此前盲目发 PlayPause 会误暂停）。
         fn play(&mut self) {
             if !self.playing.load(Ordering::Relaxed) {
-                let _ = self.tx.send(MediaKeyEvent::PlayPause);
+                let _ = self.tx.try_send(MediaKeyEvent::PlayPause);
             }
         }
 
@@ -182,34 +187,33 @@ mod linux {
         /// 已暂停时 no-op（同上，避免反向切换）。
         fn pause(&mut self) {
             if self.playing.load(Ordering::Relaxed) {
-                let _ = self.tx.send(MediaKeyEvent::PlayPause);
+                let _ = self.tx.try_send(MediaKeyEvent::PlayPause);
             }
         }
 
         /// 元数据属性（最简：仅标题，供桌面媒体控制面板显示）。
         #[zbus(property)]
         fn metadata(&self) -> std::collections::HashMap<String, zbus::zvariant::OwnedValue> {
-            let title = self.title.lock().unwrap().clone();
+            let title = self.title.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let mut map = std::collections::HashMap::new();
             if !title.is_empty() {
-                map.insert(
-                    "xesam:title".to_string(),
-                    zbus::zvariant::Value::from(title)
-                        .try_to_owned()
-                        .unwrap_or_else(|_| {
-                            zbus::zvariant::Value::from(String::new())
-                                .try_to_owned()
-                                .expect("string owned")
-                        }),
-                );
+                // 转换失败（实际不会发生）就跳过标题，不 panic。
+                if let Ok(v) = zbus::zvariant::Value::from(title).try_to_owned() {
+                    map.insert("xesam:title".to_string(), v);
+                }
+            }
+            // mpris:trackid（对象路径）：部分桌面媒体面板要求该字段才显示条目。
+            if let Ok(tid) = zbus::zvariant::ObjectPath::try_from("/org/mpris/MediaPlayer2/Track/1")
+            {
+                if let Ok(v) = zbus::zvariant::Value::from(tid).try_to_owned() {
+                    map.insert("mpris:trackid".to_string(), v);
+                }
             }
             map
         }
     }
 
     /// MPRIS 根接口（org.mpris.MediaPlayer2）。
-    ///
-    /// MPRIS 根接口（org.mpris.MediaPlayer2）实现。
     ///
     /// 规范要求 /org/mpris/MediaPlayer2 同时提供根接口与 Player 接口；
     /// KDE Plasma 等桌面会因缺根接口而忽略该播放器。
@@ -273,15 +277,15 @@ mod linux {
         let playing = Arc::new(AtomicBool::new(false));
         let title = Arc::new(Mutex::new(String::new()));
         let (playing_clone, title_clone) = (Arc::clone(&playing), Arc::clone(&title));
-        let handle = std::thread::Builder::new()
+        let handle = match std::thread::Builder::new()
             .name("media-key-mpris".to_string())
             .spawn(move || {
                 // 尝试连接会话总线；失败（headless）则线程静默退出，
                 // 主线程已持有 rx，收不到事件即视为媒体键不可用。
                 let builder = match zbus::blocking::connection::Builder::session() {
                     Ok(b) => b,
-                    Err(e) => {
-                        eprintln!("[媒体键] D-Bus 会话不可用，媒体键已禁用：{e}");
+                    Err(_) => {
+                        // 会话总线不可用（headless）：静默退出，媒体键不可用。
                         return;
                     }
                 };
@@ -299,19 +303,25 @@ mod linux {
                     .and_then(|b| b.build())
                 {
                     Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("[媒体键] MPRIS 注册失败，媒体键已禁用：{e}");
+                    Err(_) => {
+                        // MPRIS 注册失败：静默退出，媒体键不可用。
                         return;
                     }
                 };
-                // blocking Connection 内部自动驱动消息；保持线程存活即可。
-                // 线程活到进程退出（D-Bus 会话退出时阻塞返回，线程自然结束）。
-                let _ = conn;
+                // blocking Connection 内部自动驱动消息；必须把它绑定存活到线程结束，
+                // 否则 Connection 立即 drop、well-known 名被释放，媒体键服务注册即注销。
+                // 注意是 `let _conn`（绑定）而非 `let _ =`（立即丢弃）。
+                let _conn = conn;
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(3600));
                 }
-            })
-            .expect("spawn media key thread");
+            }) {
+            Ok(h) => h,
+            Err(_) => {
+                // 监听线程启动失败：静默退出，媒体键不可用。
+                return None;
+            }
+        };
         // 线程句柄保持存活（不 join），事件经 channel 传递
         std::mem::forget(handle);
         Some(super::MediaKeyHandle {
@@ -339,23 +349,28 @@ mod windows {
     /// 钩子安装失败（罕见）时返回 None，调用方优雅忽略。
     pub(super) fn spawn_windows_listener() -> Option<Receiver<MediaKeyEvent>> {
         let (tx, rx) = bounded::<MediaKeyEvent>(32);
-        let handle = std::thread::Builder::new()
+        let handle = match std::thread::Builder::new()
             .name("media-key-rdev".to_string())
             .spawn(move || {
                 // rdev::listen 内部安装 WH_KEYBOARD_LL 并跑 GetMessageA 泵，
                 // 阻塞本线程直到进程退出；监听不拦截事件（pass-through），
                 // 不影响其他程序正常接收媒体键。
-                if let Err(e) = rdev::listen(move |event| {
+                if let Err(_) = rdev::listen(move |event| {
                     if let rdev::EventType::KeyPress(key) = event.event_type {
                         if let Some(ev) = map_key(key) {
-                            let _ = tx.send(ev);
+                            let _ = tx.try_send(ev);
                         }
                     }
                 }) {
-                    eprintln!("[媒体键] Windows 键盘钩子安装失败，媒体键已禁用：{e:?}");
+                    // 钩子安装失败（罕见）：静默忽略，媒体键不可用。
                 }
-            })
-            .expect("spawn media key thread");
+            }) {
+            Ok(h) => h,
+            Err(_) => {
+                // 钩子线程启动失败：静默退出，媒体键不可用。
+                return None;
+            }
+        };
         std::mem::forget(handle);
         Some(rx)
     }

@@ -1,0 +1,56 @@
+# =============================================================================
+# tuneux-fx · 插件化 TUI（bin）
+#
+# 版权所有 © 2026 不羁的青春（FreeYouth）
+# 本项目采用木兰宽松许可证，第 2 版（MulanPSL-2.0）开源。
+# =============================================================================
+
+[package]
+# 包名 tuneux-fx；可执行文件名 tuneux-fx
+name = "tuneux-fx"
+version = "0.5.0"
+edition = "2021"
+# 木兰宽松许可证 v2
+license = "MulanPSL-2.0"
+authors = ["不羁的青春（FreeYouth）"]
+description = "插件化命令行音乐播放器（TUI），界面参照 foobar2000 组织、快捷键与 tuneux 统一"
+# 最小支持 Rust 版本：与 tuneux 对齐（ratatui 0.30 要求 1.88+）
+rust-version = "1.88"
+
+[[bin]]
+name = "tuneux-fx"
+path = "src/main.rs"
+
+[dependencies]
+# 共享音频内核（契约化一等 crate）
+tuneux-corex = { path = "../tuneux-corex" }
+# 共享媒体数据层（m3u / 书签等非音频、非 UI 领域逻辑）
+tuneux-mediax = { path = "../tuneux-mediax" }
+# 插件宿主运行时（WASM 控制面 + 能力仲裁）；加载第一方均衡器插件
+tuneux-pinx = { path = "../tuneux-pinx" }
+# 依赖版本统一由 workspace 根 [workspace.dependencies] 管理
+ratatui.workspace = true
+unicode-width.workspace = true
+crossterm.workspace = true
+serde.workspace = true
+toml.workspace = true
+dirs.workspace = true
+# 歌词/标签编码检测（GBK / UTF-16 等）
+encoding_rs.workspace = true
+# 专辑封面向素解码（封面面板半块字符渲染）
+image.workspace = true
+# 系统媒体键事件通道
+crossbeam-channel.workspace = true
+
+# 系统媒体键（仅 Linux）：MPRIS D-Bus 服务（zbus 纯 safe Rust，MIT 许可）
+# 通过 target 专属依赖避免其他平台拉入 D-Bus 依赖树；版本由 workspace 统一管理
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus.workspace = true
+
+# 系统媒体键（仅 Windows）：rdev 低层键盘钩子（MIT，unsafe 全在 crate 内部，
+# 我们只调 safe API；无窗口、无消息泵）；版本由 workspace 统一管理
+[target.'cfg(target_os = "windows")'.dependencies]
+rdev.workspace = true
+
+[lints]
+workspace = true

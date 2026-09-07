@@ -11,8 +11,8 @@
 //! 2. [`gain_to_target`]: 根据测量值与目标响度差，计算需要补偿的 dB 数。
 //! 3. [`apply_gain_db`]: 把 dB 增益施加到单个 f32 样本上，**限幅保护**到 `[-1.0, 1.0]`。
 //!
-//! 播放器侧的"轨道扫描 -> 缓存增益 -> 播放时乘到 sample 上"集成层留到下游模块
-//! （暂未实现），本模块刻意不持有任何状态、不读文件、不分配 Vec。
+//! 播放器侧的"轨道扫描 → 缓存增益 → 播放时乘到 sample 上"集成层由
+//! [`LoudnessAnalyzer`] 流式分析器承担；本模块不读文件、不持有外部状态。
 //!
 //! ## 算法说明：EBU R128 简化版（K 加权 + 整体均值）
 //!
@@ -77,7 +77,7 @@
 //! | 输出       | Integrated Loudness            | 整体 K 加权 LUFS 标量（实数 dB）   |
 //!
 //! 这些取舍让模块保持"纯函数、单文件、零依赖、易测"，对绝大多数音乐素材
-//! 与标准实现偏差 < 0.5 LU；专业母带/电影场景如有需求，套用 [ebur128] crate 即可。
+//! 与标准实现偏差 < 0.5 LU；专业母带/电影场景如有需求，套用 `ebur128` crate 即可。
 //!
 //! ## 测试覆盖
 //!
@@ -405,8 +405,10 @@ pub fn gain_to_target(measured_lufs: f64, target_lufs: f64) -> f64 {
 ///
 /// # NaN / Inf 处理
 ///
-/// - `gain_db = NaN` 或极端大（> 200）-> linear 系数钳到 [`MAX_GAIN_LINEAR`]=1e6
-///   下 * 1.0 后再 clamp ——输出仍是 0.0 附近的有限数（或直接返回 sample clamp）。
+/// - `gain_db = NaN` / ±Inf：忽略增益，直接返回限幅后的 sample；
+/// - 极端大的 `gain_db`：先钳到 ±200 dB，线性系数再钳到
+///   `MAX_GAIN_LINEAR` = 1e6，输出最终仍限幅在 [-1, 1]，
+///   不会产生 NaN 或 Inf；
 /// - `sample = NaN` -> 输出 NaN（保留错误信号，调用方自行处理）。
 pub fn apply_gain_db(sample: f32, gain_db: f64) -> f32 {
     // 非有限 dB: 忽略增益、退化为纯 sample clamp
@@ -668,7 +670,7 @@ mod tests {
         assert!((gain_to_target(-20.0, -14.0) - 6.0).abs() < 1e-9);
         // 反向: -10 LUFS -> 目标 -23 LUFS -> -13 dB（衰减）
         assert!((gain_to_target(-10.0, -23.0) - (-13.0)).abs() < 1e-9);
-        // 任务硬性要求: -20 -> -3 -> +17 dB
+        // 测试数据: -20 -> -3 -> +17 dB
         assert!((gain_to_target(-20.0, -3.0) - 17.0).abs() < 1e-9);
     }
 

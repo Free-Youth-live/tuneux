@@ -2,7 +2,7 @@
 //!
 //! 职责：所有"文本状态信息"类组件——
 //! - `draw_now_playing`：顶部条左侧的当前曲信息面板（曲名/歌手/专辑/技术参数）；
-//! - `draw_status_bar`：底部状态条（播放状态/曲名/进度条/时间/音量/循环模式/错误）；
+//! - `draw_status_bar`：底部状态条（播放状态/进度条/时间/音量/循环模式/错误）；
 //! - `draw_progress_chars`：纯字符进度条（`━━━●━━━`），被状态条调用；
 //! - `draw_help_bar`：底部帮助栏，按焦点动态显示快捷键。
 
@@ -14,9 +14,9 @@ use ratatui::{
 };
 
 use crate::config;
-use crate::metadata;
 use crate::playlist;
 use tuneux_corex as audio;
+use tuneux_mediax::metadata;
 
 /// 当前曲信息面板。纯文字标签（无 emoji），缺失字段降级显示。
 ///
@@ -31,7 +31,7 @@ use tuneux_corex as audio;
 /// 而非"渲染出错"。这与播放列表里 title 降级为文件名的策略不同：
 /// 当前曲面板应明确告知信息缺失，列表则追求可读。
 ///
-/// # 状态标记用 [播]/[停] 而非 emoji
+/// # 状态标记用 `[播]`/`[停]` 而非 emoji
 /// 终端对 emoji 宽度（1 或 2）处理不一致，会导致后续文字错位。
 /// 中文字符宽度稳定（恒为 2），用 `[播]/[停]` 对齐可靠。
 pub(super) fn draw_now_playing(
@@ -117,23 +117,24 @@ pub(super) fn draw_now_playing(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// 状态条：单行紧凑展示播放状态、曲名、进度、时间、音量、循环/随机。
+/// 状态条：单行紧凑展示播放状态、进度、时间、音量、循环/随机。
 ///
-/// 区域高度 3 行（含边框），内容 1 行。所有信息挤在一行里是为了节省
-/// 纵向空间——把空间让给播放列表（主体）。
+/// 区域高度 4 行（含边框）：错误行（无错时为空）+ 状态行，纵向两段。
+/// 状态行横向三段（Layout 分割）：左图标 | 中进度条 | 右时间/音量/模式。
 ///
 /// # 格式
-/// `[播/停] 曲名  ━━━●━━━ 0:03/3:43  80%  列表+随机`
+/// `[播/停] ━━━●━━━ 0:03/3:43  80%  列表+随机`
 ///
 /// # 进度计算
 /// - `pos`：音频引擎报告的已播放秒数（基于 frames_played / sample_rate）；
 /// - `dur`：曲目总时长（来自元数据，可能为 None）；
 /// - `ratio = pos/dur`：进度比例，时长未知时 ratio=0（不画进度）。
 ///
-/// # 进度条宽度
-/// `bar_w = inner.width - 20`：预留 20 字符给状态标记、曲名、时间、音量等
-/// 文本，避免进度条把其他内容挤出可视区。`saturating_sub` 防止窄终端下
-/// 减出负数（下溢）。
+/// # 三段布局
+/// 横向三段用 Layout 分割，宽度按 unicode-width 计算；中段进度条用
+/// Min(0) 兜底，窄终端下可被压成 0（不画进度条也不报错）。
+// 参数较多（渲染上下文各取所需）；打包成结构体属后续清理项，先显式豁免。
+#[allow(clippy::too_many_arguments)]
 pub(super) fn draw_status_bar(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -142,6 +143,7 @@ pub(super) fn draw_status_bar(
     repeat: config::RepeatMode,
     shuffle: bool,
     last_error: Option<&str>,
+    cue: Option<&playlist::CueRef>,
 ) {
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         " 状态 ",
@@ -190,15 +192,8 @@ pub(super) fn draw_status_bar(
         Color::DarkGray
     };
 
-    let title = metadata
-        .as_ref()
-        .and_then(|m| m.title.clone())
-        .unwrap_or_else(|| "未播放".to_string());
-
-    let pos = eng.position();
-    // TrackMetadata.duration 是 Option<f64>，and_then 解包为 f64（未知为 0.0）
-    let dur = metadata.as_ref().and_then(|m| m.duration).unwrap_or(0.0);
-    // 进度比例：有时长按 pos/dur，否则 0（避免除零，不画进度）
+    // 分轨内进度（CUE 分轨按区间换算）。
+    let (pos, dur) = super::track_progress(eng, metadata.as_ref().and_then(|m| m.duration), cue);
     let ratio = if dur > 0.0 {
         (pos / dur).clamp(0.0, 1.0)
     } else {
@@ -231,7 +226,7 @@ pub(super) fn draw_status_bar(
         repeat.label(),
         if shuffle { "+随机" } else { "" },
     );
-    let left_text = format!("{status_icon} {title}");
+    let left_text = status_icon.to_string();
     let left_w = left_text.width() as u16 + 2; // +2 留分隔空格
     let right_w = right_text.width() as u16;
 
@@ -302,10 +297,10 @@ pub(super) fn draw_help_bar(frame: &mut ratatui::Frame, area: Rect, focus: playl
 
     let help = match focus {
         playlist::Panel::Browser => {
-            " ↑↓ 浏览 · Enter 进入/播放 · a 加入列表 · / 搜索(Esc退) · b 关闭浏览器 · Backspace 上级 · ←→ ±5s · 空格 暂停 · +/- 音量 · v 频谱 · c 封面 · ? 关于 · q 退出 "
+            " ↑↓ 浏览 · Enter 进入/播放 · a 加入列表 · / 搜索(Esc退) · b 关闭浏览器 · Backspace 上级 · ←→ ±5s · 空格 暂停 · +/- 音量 · v 频谱 · c 封面 · m 介质 · ? 关于 · q 退出 "
         }
         playlist::Panel::Playlist => {
-            " ↑↓ 选曲 · Enter 播放/折叠 · g 分组 · a 加入 · d 删除 · x 清空 · r 循环 · s 随机 · n/p 上下首 · ←→ ±5s · / 搜索(Esc退) · b 浏览器 · 空格 暂停 · v 频谱 · l 歌词 · c 封面 · ? 关于 · q 退出 "
+            " ↑↓ 选曲 · Enter 播放/折叠 · g 分组 · a 加入 · d 删除 · x 清空 · r 循环 · s 随机 · n/p 上下首 · ←→ ±5s · / 搜索(Esc退) · b 浏览器 · 空格 暂停 · v 频谱 · l 歌词 · c 封面 · m 介质 · ? 关于 · q 退出 "
         }
     };
     frame.render_widget(

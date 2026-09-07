@@ -20,10 +20,10 @@ use ratatui::{
 };
 
 use crate::fs_browser;
-use crate::lyrics;
-use crate::metadata;
 use crate::playlist;
 use tuneux_corex as audio;
+use tuneux_mediax::lyrics;
+use tuneux_mediax::metadata;
 
 /// 在左侧面板渲染专辑封面图。
 ///
@@ -32,14 +32,15 @@ use tuneux_corex as audio;
 /// **策略**：halfblock 字符（`▀` U+2580）配前景/背景色 = 1 字符显示 2 像素。
 /// 终端字符宽高比约 2:1（宽：高），所以这种"双高像素"近似正方形。
 ///
-/// 适配：先按目标宽高比缩放图（保留 aspect ratio），再逐行扫描：
-/// 每 2 个垂直像素 = 1 个字符（上半 = 前景色，下半 = 背景色）。
+/// 缩放由调用方按面板像素区准备（`ensure_cover_thumb` 缓存命中即跳过
+/// 逐帧 resize），本函数只做 halfblock 逐行扫描渲染：每 2 个垂直像素 =
+/// 1 个字符（上半 = 前景色，下半 = 背景色）。
 ///
 /// 无图（None）或解码失败：居中显示"（无封面）"，提示按 c 隐藏。
 pub(super) fn draw_cover_panel(
     frame: &mut ratatui::Frame,
     area: Rect,
-    cover: Option<&image::DynamicImage>,
+    thumb: Option<(u32, u32, &image::RgbaImage)>,
 ) {
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         " 专辑封面 · 按 c 隐藏 ",
@@ -55,12 +56,9 @@ pub(super) fn draw_cover_panel(
         return;
     }
 
-    // 像素宽度：halfblock 让 1 字符 = 2 垂直像素
-    // 所以"可绘制像素区"是 inner.width × (inner.height * 2)
-    let pixel_w = inner.width as u32;
-    let pixel_h = (inner.height as u32) * 2;
-
-    let Some(img) = cover else {
+    // 缩略图由调用方按本面板内框像素区备好（ensure_cover_thumb 缓存命中
+    // 不做逐帧 resize），这里只做 halfblock 逐行渲染。
+    let Some((dst_w, dst_h, rgba)) = thumb else {
         // 无封面：居中显示灰色提示
         let msg = Paragraph::new("（无封面）\n按 c 隐藏")
             .style(Style::default().fg(Color::DarkGray))
@@ -68,19 +66,6 @@ pub(super) fn draw_cover_panel(
         frame.render_widget(msg, inner);
         return;
     };
-
-    // 按目标像素区缩放，保留 aspect ratio
-    // 防止除零：source 至少 1×1（image 库保证）
-    let src = img;
-    let (sw, sh) = (src.width().max(1), src.height().max(1));
-    // 计算保持宽高比的缩放：选 (pixel_w/sw, pixel_h/sh) 较小的那个
-    let scale = (pixel_w as f32 / sw as f32).min(pixel_h as f32 / sh as f32);
-    let dst_w = ((sw as f32 * scale).round() as u32).max(1).min(pixel_w);
-    let dst_h = ((sh as f32 * scale).round() as u32).max(1).min(pixel_h);
-
-    // 缩放到目标像素区（不保留原图 aspect——上面已算好保持比例的尺寸）
-    let resized = src.resize_exact(dst_w, dst_h, image::imageops::FilterType::Triangle);
-    let rgba = resized.to_rgba8();
 
     // 把图像居中放进 inner（水平、垂直都居中：可用空间两侧均分）
     let x_offset = ((inner.width as u32).saturating_sub(dst_w)) / 2;
@@ -110,19 +95,9 @@ pub(super) fn draw_cover_panel(
                         // 透明像素：用背景色（黑色）
                         Color::Black
                     };
-                    let ch = if py_bot < dst_h {
-                        let [_r2, _g2, _b2, a2] = rgba.get_pixel(px, py_bot).0;
-                        if a2 > 128 {
-                            // 下半有像素：上半前景 + 下半背景
-                            "▀"
-                        } else {
-                            // 下半透明：只显示上半（前景=上半颜色，背景=黑）
-                            "▀"
-                        }
-                    } else {
-                        // 越界（下半不在图像内）：用空格
-                        " "
-                    };
+                    // 恒用 ▀（上半块）：图像奇数高时末行下半越界，仍画 ▀、
+                    // 下半 bot_color 取背景色（黑），不丢最后一像素行。
+                    let ch = "▀";
                     let bot_color = if py_bot < dst_h {
                         let [r2, g2, b2, a2] = rgba.get_pixel(px, py_bot).0;
                         if a2 > 128 {
@@ -341,13 +316,9 @@ pub(super) fn draw_playlist(
     let title_color = if focused { Color::Yellow } else { Color::Cyan };
     // 标题：搜索时显示 "匹配 N/M" 让用户知道过滤效果
     let title = if search_mode && !search_query.is_empty() {
-        format!(
-            " 播放列表 (匹配 {}/{}) ",
-            rows.len(),
-            playlist.items().len()
-        )
+        format!(" 播放列表 (匹配 {}/{}) ", rows.len(), playlist.len())
     } else {
-        format!(" 播放列表 ({}) ", playlist.items().len())
+        format!(" 播放列表 ({}) ", playlist.len())
     };
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         title,
@@ -592,4 +563,146 @@ pub(super) fn draw_lyrics_panel(
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// 按显示宽度截断字符串（CJK 字符算 2 单元），与封面网格单元格宽度对齐。
+fn truncate_to_width(s: &str, max_w: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = String::new();
+    let mut w = 0;
+    for ch in s.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if w + cw > max_w {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out
+}
+
+/// 封面网格浏览：按专辑去重，每格显示封面缩略图 + 专辑名，选中高亮。
+/// Enter 播放选中专辑第一首；↑↓/jk 移动；PageUp/PageDown 翻页。
+pub(super) fn draw_cover_browser(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    app: &mut crate::tui::app::App,
+) {
+    let block = Block::default().borders(Borders::ALL).title(Span::styled(
+        " 封面浏览 · ↑↓ 选择 · PgUp/PgDn 翻页 · Enter 播放 · c 隐藏 ",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let albums = app.cover_browser_albums();
+    if albums.is_empty() {
+        let msg = Paragraph::new("（播放列表为空）\n按 c 隐藏");
+        frame.render_widget(msg, inner);
+        return;
+    }
+
+    const CELL_W: u16 = 14;
+    const COVER_H: u16 = 3;
+    let cell_h = COVER_H + 1;
+    let cols = (inner.width / CELL_W).max(1) as usize;
+    let rows = (inner.height / cell_h).max(1) as usize;
+    let visible = cols * rows;
+    app.cover_browser_visible = visible;
+    let start = app.cover_browser_scroll.min(albums.len().saturating_sub(1));
+    let end = (start + visible).min(albums.len());
+
+    for (i, (album, path)) in albums[start..end].iter().enumerate() {
+        let idx = start + i;
+        let row = (i / cols) as u16;
+        let col = (i % cols) as u16;
+        let cell_x = inner.x + col * CELL_W;
+        let cell_y = inner.y + row * cell_h;
+        let selected = idx == app.cover_browser_sel;
+
+        let thumb = app.cover_grid_thumb(path, CELL_W as u32, (COVER_H as u32) * 2);
+        if let Some(rgba) = thumb {
+            let (dw, dh) = (rgba.width(), rgba.height());
+            let cover_x = (CELL_W as u32).saturating_sub(dw) / 2;
+            let cover_rows = dh.div_ceil(2);
+            let cover_y = (COVER_H as u32).saturating_sub(cover_rows) / 2;
+            for cy in 0..COVER_H {
+                let mut spans: Vec<Span> = Vec::new();
+                for _ in 0..cover_x {
+                    spans.push(Span::raw(" "));
+                }
+                if (cy as u32) < cover_y {
+                    // 顶部留白行：整行空白，不读图（原 saturating_sub 会饱和到 0，
+                    // 导致留白行误画封面首两行像素）。
+                    for _ in 0..dw {
+                        spans.push(Span::raw(" "));
+                    }
+                } else {
+                    let rel = (cy as u32) - cover_y;
+                    let py_top = rel * 2;
+                    let py_bot = py_top + 1;
+                    for px in 0..dw {
+                        let top = if py_top < dh {
+                            let [r, g, b, a] = rgba.get_pixel(px, py_top).0;
+                            if a > 128 {
+                                Some(Color::Rgb(r, g, b))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        let bot = if py_bot < dh {
+                            let [r, g, b, a] = rgba.get_pixel(px, py_bot).0;
+                            if a > 128 {
+                                Some(Color::Rgb(r, g, b))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        // 恒用 ▀（上半=顶像素，下半=底像素或背景）；奇数高封面末行
+                        // 底像素缺失时下半画背景色，不再丢失顶像素。
+                        let mut st = Style::default();
+                        if let Some(c) = top {
+                            st = st.fg(c);
+                        } else {
+                            st = st.fg(Color::Black);
+                        }
+                        if let Some(c) = bot {
+                            st = st.bg(c);
+                        } else {
+                            st = st.bg(Color::Black);
+                        }
+                        spans.push(Span::styled("▀".to_string(), st));
+                    }
+                }
+                let a = Rect {
+                    x: cell_x,
+                    y: cell_y + cy,
+                    width: CELL_W,
+                    height: 1,
+                };
+                frame.render_widget(Paragraph::new(Line::from(spans)), a);
+            }
+        }
+
+        // 专辑名（截断到 CELL_W，选中反色高亮）。
+        let name = truncate_to_width(album, CELL_W as usize);
+        let name_area = Rect {
+            x: cell_x,
+            y: cell_y + COVER_H,
+            width: CELL_W,
+            height: 1,
+        };
+        let name_style = if selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        frame.render_widget(Paragraph::new(Span::styled(name, name_style)), name_area);
+    }
 }

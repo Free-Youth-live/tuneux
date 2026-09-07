@@ -48,6 +48,10 @@ pub const FFT_SIZE: usize = 4096;
 /// 误以为是某个 FFT 计算结果。
 pub const FFT_SIZE_FOR_BUF: usize = FFT_SIZE;
 
+/// 示波器波形点数（每声道）。音频回调把窗口内样本按步长降采样到这个点数，
+/// 供 TUI 画时域波形。128 点对 80~300 列终端足够，渲染层再按实际宽度缩放。
+pub const WAVEFORM_LEN: usize = 128;
+
 /// 生成对数分布的频段边界（Hz）。
 ///
 /// 从 30Hz 到 min(Nyquist, 20kHz) 按对数均分 N_BANDS 段，
@@ -208,6 +212,84 @@ pub fn compute_spectrum_bands(
     result
 }
 
+/// 频谱峰值保持的默认下落速率：满格约 1.7 秒落到 0。
+///
+/// 以每秒为单位的线性衰减量（在 `[0,1]` 归一化刻度上），与调用方帧率无关。
+pub const DEFAULT_PEAK_FALL_PER_SEC: f32 = 0.6;
+
+/// 频段维度峰值保持状态机：能量高于历史峰值时立即上浮，低于峰值时按
+/// `fall_per_sec` 线性下落，且永不低于当前能量。衰减按秒计，与调用方帧率无关。
+///
+/// # 使用约定
+///
+/// - 属主须为单一渲染线程；初始化后零分配；不得在实时音频回调中调用。
+/// - 无内部同步原语，不实现跨线程共享；如需跨线程，由调用方自行包装。
+/// - 计时用单调时钟（`std::time::Instant`），禁用系统墙钟，避免时钟跳变造成异常步长。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpectrumPeakHold {
+    peaks: [f32; N_BANDS],
+    fall_per_sec: f32,
+}
+
+impl Default for SpectrumPeakHold {
+    fn default() -> Self {
+        Self::new(DEFAULT_PEAK_FALL_PER_SEC)
+    }
+}
+
+impl SpectrumPeakHold {
+    /// 以指定每秒下落速率构造，峰值初始为全 0。
+    ///
+    /// # Panics
+    ///
+    /// `fall_per_sec` 非有限（NaN/无穷）或为负时 panic。
+    pub fn new(fall_per_sec: f32) -> Self {
+        assert!(
+            fall_per_sec.is_finite() && fall_per_sec >= 0.0,
+            "fall_per_sec 必须为有限非负值，实际 {fall_per_sec}"
+        );
+        Self {
+            peaks: [0.0; N_BANDS],
+            fall_per_sec,
+        }
+    }
+
+    /// 吸收一帧频段能量并推进峰值状态，按值返回各频段当前峰值。
+    ///
+    /// 输入逐频段消毒：NaN 按 0 处理，其余钳制到 `[0,1]`。`dt` 为距上次调用
+    /// 的时间间隔；首帧或间隔未知时传 [`std::time::Duration::ZERO`]（只吸收
+    /// 新峰值、不衰减）。
+    pub fn update(&mut self, bands: &[f32; N_BANDS], dt: std::time::Duration) -> [f32; N_BANDS] {
+        let fall = self.fall_per_sec * dt.as_secs_f32();
+        for (p, &b) in self.peaks.iter_mut().zip(bands.iter()) {
+            let b = sanitize_band(b);
+            *p = (*p - fall).max(b);
+        }
+        self.peaks
+    }
+
+    /// 只读访问当前各频段峰值（不推进状态）。
+    pub fn peaks(&self) -> &[f32; N_BANDS] {
+        &self.peaks
+    }
+
+    /// 清零全部峰值；`fall_per_sec` 为配置，不受影响。
+    ///
+    /// 调用时机（切曲、加载新源、清空显示）由调用方决定，本类型不感知播放状态。
+    pub fn reset(&mut self) {
+        self.peaks = [0.0; N_BANDS];
+    }
+}
+
+/// 输入频段值消毒：NaN 按 0，其余钳制到 [0,1]。
+fn sanitize_band(v: f32) -> f32 {
+    if v.is_nan() {
+        0.0
+    } else {
+        v.clamp(0.0, 1.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,5 +399,163 @@ mod tests {
             "1000Hz 峰值应在 {expected_region:?} 段，实际 {}",
             max_idx,
         );
+    }
+}
+#[cfg(test)]
+mod peak_hold_tests {
+    use super::*;
+
+    /// splitmix64 单步（自写，避免为此引入测试依赖）。
+    fn splitmix64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+
+    /// 构造一个所有频段同为 `v` 的输入。
+    fn band(v: f32) -> [f32; N_BANDS] {
+        [v; N_BANDS]
+    }
+
+    #[test]
+    fn new_rejects_invalid_fall_rate() {
+        for bad in [f32::NAN, -0.1, f32::INFINITY, f32::NEG_INFINITY] {
+            let r = std::panic::catch_unwind(|| SpectrumPeakHold::new(bad));
+            assert!(r.is_err(), "new({bad}) 应 panic");
+        }
+        // 合法值不 panic
+        let _ = SpectrumPeakHold::new(0.0);
+        let _ = SpectrumPeakHold::new(1.2);
+    }
+
+    #[test]
+    fn rise_is_immediate_and_then_decays() {
+        let mut p = SpectrumPeakHold::default();
+        let out = p.update(&band(0.5), std::time::Duration::ZERO);
+        assert!((out[0] - 0.5).abs() < 1e-6, "能量上升应即时上浮");
+        // 能量降到 0.2，峰值应缓落但永不低于当前
+        let out = p.update(&band(0.2), std::time::Duration::from_secs_f32(0.1));
+        assert!(
+            out[0] < 0.5 && out[0] >= 0.2,
+            "峰值应缓落且 >= 当前：{}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn dt_zero_absorbs_without_decay() {
+        let mut p = SpectrumPeakHold::default();
+        p.update(&band(0.8), std::time::Duration::ZERO);
+        let out = p.update(&band(0.0), std::time::Duration::ZERO);
+        assert!((out[0] - 0.8).abs() < 1e-6, "dt=0 只吸收、不衰减");
+    }
+
+    #[test]
+    fn frame_rate_independence() {
+        // 相同总时长、不同帧间隔，终态峰值应一致（帧率无关）。
+        let total = 2.0f32;
+        let dts = [1.0 / 144.0, 1.0 / 60.0, 1.0 / 30.0, 1.0 / 10.0];
+        let mut finals = Vec::new();
+        for &dt in &dts {
+            let mut p = SpectrumPeakHold::default();
+            p.update(&band(1.0), std::time::Duration::ZERO);
+            let mut t = 0.0f32;
+            while t < total {
+                p.update(&band(0.0), std::time::Duration::from_secs_f32(dt));
+                t += dt;
+            }
+            finals.push(p.peaks()[0]);
+        }
+        let base = finals[0];
+        for &f in &finals[1..] {
+            assert!((f - base).abs() < 1e-4, "帧率无关终态不一致：{finals:?}");
+        }
+    }
+
+    #[test]
+    fn golden_equivalence_to_old_formula() {
+        // 旧实现：每帧 0.02、30fps、50 帧；新实现：0.6/s、dt=1/30、50 帧。
+        let mut old = 1.0f32;
+        for _ in 0..50 {
+            old = (old - 0.02).max(0.0);
+        }
+        let mut p = SpectrumPeakHold::default();
+        p.update(&band(1.0), std::time::Duration::ZERO);
+        for _ in 0..50 {
+            p.update(&band(0.0), std::time::Duration::from_secs_f32(1.0 / 30.0));
+        }
+        assert!(
+            (p.peaks()[0] - old).abs() < 1e-4,
+            "金标偏差：old={old} new={}",
+            p.peaks()[0]
+        );
+    }
+
+    #[test]
+    fn input_sanitization() {
+        let mut p = SpectrumPeakHold::default();
+        let mut b = [0.0f32; N_BANDS];
+        b[0] = f32::NAN;
+        b[1] = f32::INFINITY;
+        b[2] = 1.5;
+        b[3] = -0.5;
+        let out = p.update(&b, std::time::Duration::ZERO);
+        assert_eq!(out[0], 0.0, "NaN 应按 0");
+        assert_eq!(out[1], 1.0, "inf 应钳到 1");
+        assert_eq!(out[2], 1.0, "超界应钳到 1");
+        assert_eq!(out[3], 0.0, "负值应钳到 0");
+    }
+
+    #[test]
+    fn reset_clears_peaks_but_keeps_rate() {
+        let mut p = SpectrumPeakHold::default();
+        p.update(&band(0.9), std::time::Duration::ZERO);
+        assert!(p.peaks()[0] > 0.5);
+        p.reset();
+        assert!(p.peaks().iter().all(|&v| v == 0.0), "reset 后应全 0");
+        // 配置不变：reset 后再更新仍按 0.6/s 下落（0.8 - 0.6*0.5 = 0.5）
+        p.update(&band(0.8), std::time::Duration::ZERO);
+        let out = p.update(&band(0.0), std::time::Duration::from_secs_f32(0.5));
+        assert!((out[0] - 0.5).abs() < 1e-4, "下落速率应保持：{}", out[0]);
+    }
+
+    #[test]
+    fn huge_dt_soft_resets_to_current() {
+        let mut p = SpectrumPeakHold::default();
+        p.update(&band(1.0), std::time::Duration::ZERO);
+        // 极大间隔：峰值衰减到底后应钳回当前能量，而非变成负值或陈旧白帽。
+        let out = p.update(&band(0.3), std::time::Duration::from_secs_f32(1e6));
+        assert!(
+            (out[0] - 0.3).abs() < 1e-4,
+            "极大 dt 应软复位到当前：{}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn invariant_peaks_ge_current_and_in_range() {
+        // 随机序列性质测试：任意输入下，峰值恒 >= 当前能量且落在 [0,1]。
+        let mut p = SpectrumPeakHold::default();
+        let mut rng: u64 = 0x1234567890abcdef;
+        for _ in 0..2000 {
+            let mut b = [0.0f32; N_BANDS];
+            for v in b.iter_mut() {
+                let x = splitmix64(&mut rng);
+                *v = ((x & 0xffff) as f32) / 65535.0;
+            }
+            let dt_ms = splitmix64(&mut rng) % 200;
+            let dt = std::time::Duration::from_millis(dt_ms);
+            let out = p.update(&b, dt);
+            for i in 0..N_BANDS {
+                assert!(
+                    out[i] >= 0.0 && out[i] <= 1.0,
+                    "峰值越界 @ band {i}: {}",
+                    out[i]
+                );
+                assert!(out[i] >= b[i], "峰值应 >= 当前能量 @ band {i}");
+            }
+        }
     }
 }

@@ -4,6 +4,10 @@
 # 推送版本标签（v*）或手动触发时，为六个平台编译发布二进制并上传到发布页面。
 # 平台：Linux x86_64 / Linux arm64、macOS x86_64 / macOS arm64、
 #       Windows x86_64 / Windows arm64。
+#
+# 每个平台产出两个压缩包：
+# - tuneux-<ver>-<平台>    ：基础版二进制 + 使用手册-tuneux；
+# - tuneux-fx-<ver>-<平台> ：插件版二进制 + 使用手册-tuneux-fx + plugins/ 插件目录。
 # =============================================================================
 
 name: 发布构建
@@ -14,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 版本标签（如 v0.4.4）
+        description: 版本标签（如 v0.5.0）
         required: true
 
 permissions:
@@ -86,7 +90,7 @@ jobs:
 
       - name: 编译（Linux arm64 交叉）
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cargo build --release --locked --target ${{ matrix.target }} -p tuneux
+        run: cargo build --release --locked --target ${{ matrix.target }} -p tuneux -p tuneux-fx
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           PKG_CONFIG_ALLOW_CROSS: '1'
@@ -94,22 +98,57 @@ jobs:
 
       - name: 编译
         if: matrix.target != 'aarch64-unknown-linux-gnu'
-        run: cargo build --release --locked --target ${{ matrix.target }} -p tuneux
+        run: cargo build --release --locked --target ${{ matrix.target }} -p tuneux -p tuneux-fx
 
       - name: 打包（Linux / macOS）
         if: matrix.ext == 'tar.gz'
         shell: bash
         run: |
+          # 版本号剥 v 前缀：v0.5.0 → 0.5.0（文件名用纯版本号）
           VER="${TAG#v}"
-          cd "target/${{ matrix.target }}/release"
-          tar -czf "$OLDPWD/tuneux-${VER}-${{ matrix.name }}.tar.gz" tuneux
+          VER="${VER%%-*}"
+          BIN="target/${{ matrix.target }}/release"
+
+          # 基础版：二进制 + 使用手册
+          mkdir -p pkg/tuneux
+          cp "$BIN/tuneux" pkg/tuneux/
+          cp 使用手册-tuneux.txt pkg/tuneux/
+          # 手册首行注入版本号：__VERSION__ → 实际版本（来自 tag）
+          sed -i.bak "s/__VERSION__/${VER}/" "pkg/tuneux/使用手册-tuneux.txt" && rm -f "pkg/tuneux/使用手册-tuneux.txt.bak"
+          tar -czf "tuneux-${VER}-${{ matrix.name }}.tar.gz" -C pkg/tuneux .
+
+          # 插件版：二进制 + 使用手册 + plugins/ 插件目录
+          mkdir -p pkg/tuneux-fx
+          cp "$BIN/tuneux-fx" pkg/tuneux-fx/
+          cp 使用手册-tuneux-fx.txt pkg/tuneux-fx/
+          sed -i.bak "s/__VERSION__/${VER}/" "pkg/tuneux-fx/使用手册-tuneux-fx.txt" && rm -f "pkg/tuneux-fx/使用手册-tuneux-fx.txt.bak"
+          cp -R plugins pkg/tuneux-fx/plugins
+          tar -czf "tuneux-fx-${VER}-${{ matrix.name }}.tar.gz" -C pkg/tuneux-fx .
 
       - name: 打包（Windows）
         if: matrix.ext == 'zip'
         shell: pwsh
         run: |
-          $ver = $env:TAG -replace '^v', ''
-          Compress-Archive -Path "target/${{ matrix.target }}/release/tuneux.exe" -DestinationPath "tuneux-$ver-${{ matrix.name }}.zip"
+          # 版本号剥 v 前缀：v0.5.0 → 0.5.0（文件名用纯版本号）
+          $ver = $env:TAG -replace '^v', '' -replace '-.*$', ''
+          $bin = "target/${{ matrix.target }}/release"
+
+          # 基础版：二进制 + 使用手册
+          New-Item -ItemType Directory -Force -Path pkg/tuneux | Out-Null
+          Copy-Item "$bin/tuneux.exe" pkg/tuneux/
+          Copy-Item 使用手册-tuneux.txt pkg/tuneux/
+          $m = Get-Content "pkg/tuneux/使用手册-tuneux.txt" -Raw
+          Set-Content "pkg/tuneux/使用手册-tuneux.txt" -Value ($m -replace '__VERSION__', $ver) -NoNewline -Encoding UTF8
+          Compress-Archive -Path pkg/tuneux/* -DestinationPath "tuneux-$ver-${{ matrix.name }}.zip"
+
+          # 插件版：二进制 + 使用手册 + plugins/ 插件目录
+          New-Item -ItemType Directory -Force -Path pkg/tuneux-fx | Out-Null
+          Copy-Item "$bin/tuneux-fx.exe" pkg/tuneux-fx/
+          Copy-Item 使用手册-tuneux-fx.txt pkg/tuneux-fx/
+          $m = Get-Content "pkg/tuneux-fx/使用手册-tuneux-fx.txt" -Raw
+          Set-Content "pkg/tuneux-fx/使用手册-tuneux-fx.txt" -Value ($m -replace '__VERSION__', $ver) -NoNewline -Encoding UTF8
+          Copy-Item -Recurse plugins pkg/tuneux-fx/plugins
+          Compress-Archive -Path pkg/tuneux-fx/* -DestinationPath "tuneux-fx-$ver-${{ matrix.name }}.zip"
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
@@ -117,7 +156,9 @@ jobs:
           name: ${{ matrix.name }}
           path: |
             tuneux-*.tar.gz
+            tuneux-fx-*.tar.gz
             tuneux-*.zip
+            tuneux-fx-*.zip
           if-no-files-found: error
 
   release:

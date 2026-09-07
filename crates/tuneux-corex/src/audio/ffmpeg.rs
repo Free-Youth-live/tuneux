@@ -63,6 +63,24 @@ const FFMPEG_EXTENSIONS: &[&str] = &[
     "dff", // DSDIFF（DSD 的另一种容器，SACD 1-bit 音频）
 ];
 
+/// ffmpeg 可用性缓存：首次 `ffmpeg -version` 探测后复用，
+/// 避免每次打开长尾格式都 fork 一次子进程探测。
+/// 注意：负结果（不可用）同样缓存至进程结束——中途安装 ffmpeg 需重启播放器后重探。
+static FFMPEG_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// 探测（并缓存）ffmpeg 命令是否可用。
+fn ffmpeg_available() -> bool {
+    *FFMPEG_AVAILABLE.get_or_init(|| {
+        std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|st| st.success())
+            .unwrap_or(false)
+    })
+}
+
 /// 判断路径是否应交给 FFmpeg 后端处理（按扩展名，大小写不敏感）。
 pub(crate) fn is_ffmpeg_path(path: &Path) -> bool {
     path.extension()
@@ -97,30 +115,11 @@ impl FfmpegBackend {
     /// 先探测 `ffmpeg` 二进制可用性；不可用返回 `Unsupported`（优雅降级）。
     /// 可用则 spawn 子进程开始输出 PCM。
     pub(crate) fn open(path: &Path) -> Result<Self, DecodeError> {
-        // —— 降级检查：ffmpeg 二进制是否存在 ——
-        let probe = std::process::Command::new("ffmpeg")
-            .arg("-version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-
-        match probe {
-            Ok(status) if status.success() => { /* ffmpeg 可用，继续 */ }
-            Ok(_) => {
-                return Err(DecodeError::Unsupported(
-                    "ffmpeg 命令执行失败（返回非零退出码）".to_string(),
-                ));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(DecodeError::Unsupported(
-                    "ffmpeg 未安装或不在 PATH 中；请安装 FFmpeg 后重试".to_string(),
-                ));
-            }
-            Err(e) => {
-                return Err(DecodeError::Io(format!(
-                    "检测 ffmpeg 可用性时 IO 错误：{e}"
-                )));
-            }
+        // —— 降级检查：ffmpeg 二进制是否可用（结果缓存，只探测一次） ——
+        if !ffmpeg_available() {
+            return Err(DecodeError::Unsupported(
+                "ffmpeg 未安装或不可用；请安装 FFmpeg 后重试".to_string(),
+            ));
         }
 
         let ext_display = path
@@ -186,7 +185,9 @@ impl FfmpegBackend {
                 let mut reader = stderr;
                 let mut buf = String::new();
                 let _ = reader.read_to_string(&mut buf);
-                *cache2.lock().unwrap() = buf;
+                if let Ok(mut guard) = cache2.lock() {
+                    *guard = buf;
+                }
             });
             self.stderr_cache = Some(cache);
         }
@@ -251,7 +252,7 @@ impl DecoderBackend for FfmpegBackend {
                     let stderr = self
                         .stderr_cache
                         .as_ref()
-                        .map(|c| c.lock().unwrap().clone())
+                        .and_then(|c| c.lock().ok().map(|g| g.clone()))
                         .unwrap_or_default();
                     let detail = if stderr.trim().is_empty() {
                         format!("退出码 {:?}", status.code())
@@ -300,7 +301,7 @@ mod tests {
     ///
     /// 返回 true 才继续集成测试；本机未装 ffmpeg 时整个模块跳过
     /// （CI 上由 workflow 安装 ffmpeg 后执行 `cargo test -- --ignored`）。
-    fn ffmpeg_available() -> bool {
+    fn probe_ffmpeg_for_test() -> bool {
         std::process::Command::new("ffmpeg")
             .arg("-version")
             .stdout(std::process::Stdio::null())
@@ -341,7 +342,7 @@ mod tests {
     #[test]
     #[ignore = "需要系统安装 ffmpeg；运行：cargo test -p tuneux-corex -- --ignored"]
     fn ffmpeg_backend_decodes_generated_ac3() {
-        if !ffmpeg_available() {
+        if !probe_ffmpeg_for_test() {
             eprintln!("跳过：系统未安装 ffmpeg");
             return;
         }
@@ -376,7 +377,7 @@ mod tests {
     #[test]
     #[ignore = "需要系统安装 ffmpeg；运行：cargo test -p tuneux-corex -- --ignored"]
     fn ffmpeg_backend_seek_then_decode() {
-        if !ffmpeg_available() {
+        if !probe_ffmpeg_for_test() {
             eprintln!("跳过：系统未安装 ffmpeg");
             return;
         }

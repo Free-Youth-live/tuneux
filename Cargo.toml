@@ -4,7 +4,7 @@
 # 版权所有 © 2026 不羁的青春（FreeYouth）
 # 本项目采用木兰宽松许可证，第 2 版（MulanPSL-2.0）开源。
 #
-# 架构：mono repo + Cargo workspace 四 crate 同仓。
+# 架构：mono repo + Cargo workspace 五 crate 同仓（corex / mediax / pinx / tuneux / tuneux-fx）。
 # 单一 Cargo.lock 保证跨 crate 依赖类型一致。
 # =============================================================================
 
@@ -27,6 +27,10 @@ crossbeam-channel = "0.5"
 # 重采样与频谱
 rubato = "0.15"
 rustfft = "6"
+# 插件运行时（pinx）：WASM 解释器（控制面沙箱，纯 safe Rust）
+wasmi = "2.0.0"
+# 插件验签（pinx）：Ed25519 数字签名（纯 safe，BSD-3-Clause）
+ed25519-dalek = "2"
 # 终端 UI
 ratatui = "0.30.2"
 unicode-width = "0.1"
@@ -38,6 +42,9 @@ toml = "0.8"
 dirs = "5"
 # 歌词编码检测
 encoding_rs = "0.8"
+# 系统媒体键（平台专属：zbus 仅 Linux / rdev 仅 Windows），版本同样统一于此防漂移
+zbus = "5"
+rdev = "0.5"
 
 # -----------------------------------------------------------------------------
 # workspace 级统一 lint（规范：生产路径零 unsafe）

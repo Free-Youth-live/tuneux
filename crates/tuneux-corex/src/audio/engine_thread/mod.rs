@@ -17,12 +17,13 @@
 //!
 //! - 主线程 → audio_cmd → 音频线程
 //! - 音频线程 → decoder_cmd → 解码线程
-//! - 解码线程 → finished → 主线程（EOF 通知）
+//! - 解码线程 → 主线程：finished（EOF）/ failed（打开解码失败）/
+//!   track_switched（无缝切换）
 //!
 //! ## 子模块（文件过大拆分）
 //!
 //! - [`audio_loop`]：音频线程主循环 + AudioCmd 命令分发
-//! - [`decoder_loop`]：解码线程主循环 + 文件加载 + / 状态机测试
+//! - [`decoder_loop`]：解码线程主循环 + 文件加载 + 状态机测试
 //! - [`stream_builder`]：cpal 流构建/重建/直通（含实时回调）
 //! - [`sample_utils`]：纯函数（通道适配、缓冲写入、频谱累加）
 
@@ -56,6 +57,7 @@ pub(super) fn spawn_threads(
     cmd_rx: Receiver<AudioCmd>,
     state: Arc<SharedState>,
     finished_tx: Sender<()>,
+    failed_tx: Sender<()>,
     track_switched_tx: Sender<()>,
     close: Arc<AtomicBool>,
 ) -> Result<u32, Box<dyn std::error::Error>> {
@@ -85,6 +87,7 @@ pub(super) fn spawn_threads(
     {
         let state = Arc::clone(&state);
         let finished_tx = finished_tx.clone();
+        let failed_tx = failed_tx.clone();
         let track_switched_tx = track_switched_tx.clone();
         let close = Arc::clone(&close);
         std::thread::Builder::new()
@@ -95,6 +98,7 @@ pub(super) fn spawn_threads(
                     dec_cmd_rx,
                     state,
                     finished_tx,
+                    failed_tx,
                     track_switched_tx,
                     close,
                     device_sample_rate,
@@ -118,6 +122,7 @@ pub(super) fn spawn_threads(
                 dec_cmd_tx,
                 state,
                 finished_tx,
+                failed_tx,
                 close,
                 init_tx,
             );

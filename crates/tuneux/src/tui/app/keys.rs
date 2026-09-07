@@ -63,6 +63,22 @@ fn key_to_desc(key: &KeyEvent) -> Option<String> {
     Some(desc)
 }
 
+/// 介质档位中文名（状态栏提示用；与 fx 介质菜单同源措辞）。
+fn medium_display_name(m: audio::PlaybackMedium) -> &'static str {
+    match m {
+        audio::PlaybackMedium::None => "关闭",
+        audio::PlaybackMedium::TapeClear => "磁带·透明（高保真）",
+        audio::PlaybackMedium::TapeWhite => "磁带·白色（清新）",
+        audio::PlaybackMedium::TapeClassic => "磁带·深棕（经典）",
+        audio::PlaybackMedium::TapeAged => "磁带·红色（老化）",
+        audio::PlaybackMedium::VinylClean => "黑胶·蓝色（低噪声）",
+        audio::PlaybackMedium::VinylDynamic => "黑胶·红色（高动态）",
+        audio::PlaybackMedium::VinylStandard => "黑胶·黑色（标准）",
+        audio::PlaybackMedium::VinylAged => "黑胶·彩胶（老化）",
+        _ => "未知",
+    }
+}
+
 impl App {
     /// 把按键事件翻译成自定义动作名：`KeyEvent → 键描述 → 反查 keymap`。
     ///
@@ -116,6 +132,60 @@ impl App {
         }
     }
 
+    /// 封面浏览模式按键：Up/Down/j/k 移动、Enter 播放、PageUp/PageDown 翻页；
+    /// 其余键（含 c 切换、n/p 切曲、Left/Right seek、l 歌词）返回 false 走全局，避免冲突。
+    fn handle_cover_browser_key(&mut self, key: KeyEvent, config: &mut Config) -> bool {
+        let albums = self.cover_browser_albums();
+        let count = albums.len();
+        if count == 0 {
+            // 空列表无可导航：不吞键，让 c 仍能关闭封面面板。
+            return false;
+        }
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.cover_browser_sel = self.cover_browser_sel.saturating_sub(1);
+                self.cover_browser_scroll_into_view(count);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.cover_browser_sel = (self.cover_browser_sel + 1).min(count - 1);
+                self.cover_browser_scroll_into_view(count);
+            }
+            KeyCode::Enter => {
+                if let Some((_, path)) = albums.get(self.cover_browser_sel) {
+                    let path = path.clone();
+                    if let Some(idx) = self.playlist.items().iter().position(|it| it.path == path) {
+                        self.playlist.jump_to(idx);
+                        self.play_and_update_current(idx, config);
+                    }
+                }
+            }
+            KeyCode::PageDown => {
+                let step = self.cover_browser_visible.max(1);
+                self.cover_browser_scroll = (self.cover_browser_scroll + step).min(count - 1);
+                self.cover_browser_sel = self.cover_browser_scroll;
+            }
+            KeyCode::PageUp => {
+                let step = self.cover_browser_visible.max(1);
+                self.cover_browser_scroll = self.cover_browser_scroll.saturating_sub(step);
+                self.cover_browser_sel = self.cover_browser_scroll;
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// 让选中项滚入可视窗：选中在 scroll 之前则回退 scroll，超出窗口末尾则前推 scroll。
+    fn cover_browser_scroll_into_view(&mut self, count: usize) {
+        let visible = self.cover_browser_visible.max(1);
+        if self.cover_browser_sel < self.cover_browser_scroll {
+            self.cover_browser_scroll = self.cover_browser_sel;
+        }
+        if self.cover_browser_sel >= self.cover_browser_scroll + visible {
+            self.cover_browser_scroll = self.cover_browser_sel + 1 - visible;
+        }
+        self.cover_browser_scroll = self.cover_browser_scroll.min(count - 1);
+    }
+
     /// 处理一个按键事件。返回 false 表示请求退出。
     pub fn handle_key(&mut self, key: KeyEvent, config: &mut Config) -> bool {
         // —— 关于弹窗（最优先：任意键关闭并吃掉，避免误触发其它操作）——
@@ -124,9 +194,15 @@ impl App {
             return true;
         }
 
-        // 清空确认：按非 x 键时取消待确认状态。
-        if self.pending_clear && !matches!(key.code, KeyCode::Char('x')) {
-            self.pending_clear = false;
+        // 清空确认：5 秒过期（与提示同寿命），或按非 x 键取消。
+        if self.pending_clear {
+            let expired = self
+                .pending_clear_at
+                .is_some_and(|t| t.elapsed() >= std::time::Duration::from_secs(5));
+            if expired || !matches!(key.code, KeyCode::Char('x')) {
+                self.pending_clear = false;
+                self.pending_clear_at = None;
+            }
         }
 
         // —— 搜索模式（吃掉所有按键，按目标面板分派）——
@@ -146,11 +222,12 @@ impl App {
                     self.apply_search_query();
                     return true;
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                // 搜索态导航只用 ↑/↓：j/k 让位给输入（否则含 j/k 的歌名敲不出来）。
+                KeyCode::Up => {
                     self.search_nav(-1);
                     return true;
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down => {
                     self.search_nav(1);
                     return true;
                 }
@@ -180,6 +257,13 @@ impl App {
             }
         }
 
+        // —— 封面浏览模式：Up/Down/j/k 移动、Enter 播放、PageUp/PageDown 翻页 ——
+        // 置于搜索模式之后：搜索态优先吃键，封面浏览不与搜索输入抢键。
+        if self.left_panel == LeftPanel::CoverBrowser && self.handle_cover_browser_key(key, config)
+        {
+            return true;
+        }
+
         // —— 自定义键映射层（配置驱动，优先于下方硬编码默认键）——
         // KeyEvent → 键描述 → 反查 keymap：命中且为已知动作则执行并返回；
         // 未命中或动作未知则回退到原有硬编码默认键逻辑。
@@ -207,11 +291,16 @@ impl App {
             }
             KeyCode::Char('r') => {
                 config.repeat = config.repeat.next();
+                // 循环模式变了，刷新预载目标：顺序模式预载下一曲，
+                // 单曲/随机清掉旧预载（否则旧预载曲会在切曲时抢先播放，声音与界面错位）。
+                self.refresh_preload(config);
                 return true;
             }
             KeyCode::Char('s') => {
                 config.shuffle = !config.shuffle;
                 self.playlist.set_shuffle(config.shuffle);
+                // 随机开关变了，同样刷新预载目标。
+                self.refresh_preload(config);
                 return true;
             }
             KeyCode::Char('n') => {
@@ -283,15 +372,39 @@ impl App {
                 config.lyrics_mode = self.lyrics_mode;
                 return true;
             }
+            KeyCode::Char('m') => {
+                // m：循环播放介质风格（无 → 4 磁带 → 4 黑胶 → 无），只改声音，
+                // 用 corex 的 ALL 单一真源，新增介质无需改此处。
+                let all = audio::PlaybackMedium::ALL;
+                let idx = all
+                    .iter()
+                    .position(|&m| m == self.playback_medium)
+                    .unwrap_or(0);
+                self.playback_medium = all[(idx + 1) % all.len()];
+                // 介质只改声音（corex DSP），不占界面、不动左面板。
+                if let Some(engine) = &self.engine {
+                    engine.set_medium(self.playback_medium);
+                }
+                config.playback_medium = self.playback_medium.as_str().to_string();
+                // 界面不再显示介质，状态栏提示当前档位（声音变化不易一眼看出）。
+                self.last_error = Some(format!(
+                    "介质：{}",
+                    medium_display_name(self.playback_medium)
+                ));
+                self.last_error_at = Some(std::time::Instant::now());
+                return true;
+            }
             KeyCode::Char('x') => {
                 // x：清空播放列表（两次确认，防误触）。
                 if self.pending_clear {
                     self.clear_playlist();
                     self.pending_clear = false;
+                    self.pending_clear_at = None;
                     self.last_error = Some("播放列表已清空".to_string());
                     self.last_error_at = Some(std::time::Instant::now());
                 } else if !self.playlist.is_empty() {
                     self.pending_clear = true;
+                    self.pending_clear_at = Some(std::time::Instant::now());
                     self.last_error = Some("再按一次 x 确认清空播放列表".to_string());
                     self.last_error_at = Some(std::time::Instant::now());
                 }
@@ -309,12 +422,14 @@ impl App {
                 return true;
             }
             KeyCode::Char('c') => {
-                // c：Hidden ↔ Cover（互斥：开封面会关掉浏览器）。
-                // 封面不是可聚焦面板，显示时焦点归回播放列表。
-                if self.left_panel == LeftPanel::Cover {
-                    self.left_panel = LeftPanel::Hidden;
-                } else {
-                    self.left_panel = LeftPanel::Cover;
+                // c：Hidden → Cover → CoverBrowser → Hidden（互斥：开封面会关掉浏览器）。
+                // 封面/封面浏览不是可聚焦面板，显示时焦点归回播放列表。
+                self.left_panel = match self.left_panel {
+                    LeftPanel::Cover => LeftPanel::CoverBrowser,
+                    LeftPanel::CoverBrowser => LeftPanel::Hidden,
+                    _ => LeftPanel::Cover,
+                };
+                if self.left_panel != LeftPanel::Hidden {
                     self.focus = playlist::Panel::Playlist;
                 }
                 config.left_panel = self.left_panel;
@@ -338,13 +453,20 @@ impl App {
                     self.search_mode = true;
                     self.search_target = SearchTarget::Browser;
                     self.search_query.clear();
+                    // 进入搜索态后异步收集目录树（大目录按 `/` 不卡 UI），
+                    // 收集期间维持一级列表，结果到达后关键字立即生效。
                     self.browser.begin_search();
+                    self.search_async();
                 }
                 KeyCode::Enter => {
                     self.handle_browser_enter(config);
                 }
                 KeyCode::Backspace => {
-                    self.browser.go_up();
+                    // 异步返回上级目录（后台线程读，不卡 UI）。
+                    if let Some(parent) = self.browser.cwd().parent() {
+                        let parent = parent.to_path_buf();
+                        self.navigate_async(&parent);
+                    }
                 }
                 _ => {}
             },

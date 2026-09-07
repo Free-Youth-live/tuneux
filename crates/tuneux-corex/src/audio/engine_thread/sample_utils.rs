@@ -111,7 +111,7 @@ pub(super) fn push_all(producer: &mut HeapProd<f32>, samples: &[f32], channels: 
 /// - from < to：上混，复制通道填充。
 ///   **复制的通道衰减 -3dB**（×0.7071）保持响度一致：mono → stereo 时
 ///   `[L] → [L, L×0.7071]`，原始左声道不动，复制的右声道减半功率，
-///   避免单声道文件在立体声设备上整体响度翻倍（指出的问题）。
+///   避免单声道文件在立体声设备上整体响度翻倍。
 /// - from > to：下混，取前 to 个通道（简化，不做加权）；
 /// - 相等：直接返回。
 pub(super) fn adapt_channels(samples: &[f32], from_ch: usize, to_ch: usize) -> Vec<f32> {
@@ -287,12 +287,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    //  关联：push_all 的帧对齐 + 重试上限（独立单元测试）
+    // push_all 的帧对齐 + 重试上限（独立单元测试）
     // -----------------------------------------------------------------
 
     /// push_all 必须只推**整帧**样本（剩余不足一帧的尾部丢弃）。
     /// 验证：输入 5 个 stereo 样本（2 帧 + 1 个孤立 L），应只推 4 个（2 帧）。
-    /// 修" 帧错位"前的代码会用 to_push=5 全推 —— 导致回调把 [L,R,L,R,L]
+    /// 旧实现会用 to_push=5 全推 —— 导致回调把 [L,R,L,R,L]
     /// 当作 2.5 帧解释，左/右相位错乱（静默错位到下次 flush）。
     #[test]
     fn push_all_aligns_to_frame_boundary() {
@@ -327,7 +327,7 @@ mod tests {
         let start = std::time::Instant::now();
         push_all(&mut producer, &input, 2);
         let elapsed = start.elapsed();
-        // 验证：调用在 < 1.5s 返回 —— 重试上限生效（500 × 2ms ≈ 1s）
+        // 验证：调用在 < 1.5s 返回 —— 重试上限生效（100 × 2ms = 200ms）
         assert!(
             elapsed < std::time::Duration::from_millis(1500),
             "push_all 重试超时返回（实测 {elapsed:?}），避免流重建期死锁"

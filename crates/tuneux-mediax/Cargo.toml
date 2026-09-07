@@ -1,0 +1,23 @@
+# =============================================================================
+# tuneux-mediax · 共享媒体数据层（lib）
+#
+# 版权所有 © 2026 不羁的青春（FreeYouth）
+# 本项目采用木兰宽松许可证，第 2 版（MulanPSL-2.0）开源。
+# =============================================================================
+
+[package]
+name = "tuneux-mediax"
+version = "0.1.0"
+edition = "2021"
+license = "MulanPSL-2.0"
+authors = ["不羁的青春（FreeYouth）"]
+description = "tuneux 系列共享媒体数据层：m3u 播放列表、书签、歌词数据、元数据提取等（非 UI 的领域逻辑）"
+rust-version = "1.88"
+
+[dependencies]
+serde.workspace = true
+encoding_rs.workspace = true
+tuneux-corex = { path = "../tuneux-corex" }
+
+[lints]
+workspace = true
