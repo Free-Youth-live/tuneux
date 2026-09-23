@@ -2194,9 +2194,9 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "ringbuf"
-version = "0.4.8"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe47b720588c8702e34b5979cb3271a8b1842c7cb6f57408efa70c779363488c"
+checksum = "0b123165531e325df9079f56c036f2da4103a5d5abfef9e2fda4b9c34d1ef7aa"
 dependencies = [
  "crossbeam-utils",
  "portable-atomic",
@@ -2994,7 +2994,7 @@ dependencies = [
 
 [[package]]
 name = "tuneux"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "crossbeam-channel",
  "crossterm 0.28.1",
@@ -3013,10 +3013,11 @@ dependencies = [
 
 [[package]]
 name = "tuneux-corex"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "cpal",
  "crossbeam-channel",
+ "encoding_rs",
  "opus-decoder",
  "ringbuf",
  "rubato",
@@ -3027,7 +3028,7 @@ dependencies = [
 
 [[package]]
 name = "tuneux-fx"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "crossbeam-channel",
  "crossterm 0.28.1",
@@ -3051,7 +3052,9 @@ version = "0.1.0"
 dependencies = [
  "encoding_rs",
  "serde",
+ "toml",
  "tuneux-corex",
+ "unicode-width 0.1.14",
 ]
 
 [[package]]
@@ -3060,6 +3063,7 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
+ "rustfft",
  "tuneux-corex",
  "wasmi",
  "wat",

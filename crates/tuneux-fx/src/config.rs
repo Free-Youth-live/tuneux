@@ -20,9 +20,7 @@
 //! 一律回退到默认值，保证程序始终可启动。
 //! 保存失败仅打印警告，不阻塞退出。
 
-// 本模块与基础版 config 同源，本产品线已分化出主题/首启继承/歌词偏移/书签等；
-// 尚未接入或不启用的公开接口，临时豁免 dead_code 警告。
-#![allow(dead_code)]
+// 本模块与基础版 config 同源，本产品线已分化出皮肤/首启继承/歌词偏移/书签等。
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -36,43 +34,20 @@ use crate::playlist::PlaylistItem;
 /// 简化代码。配置模块的错误对用户均不致命，调用方据此回退默认值。
 pub type ConfigResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-/// 循环播放模式。
-///
-/// 三态循环：关闭 → 单曲 → 列表，循环切换。
-/// 用枚举而非魔法数字，配合 serde 以可读字符串存入 TOML（如 `repeat = "single"`），
-/// 配置文件对人友好。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum RepeatMode {
-    /// 不循环：播放到列表末尾即停止。
-    #[default]
-    Off,
-    /// 单曲循环：当前曲目无限重复。
-    Single,
-    /// 列表循环：整列表循环播放。
-    List,
-}
-
-impl RepeatMode {
-    /// 循环切换到下一个模式：Off → Single → List → Off。
-    /// 用于按键 `r` 的行为。
-    pub fn next(self) -> Self {
-        match self {
-            RepeatMode::Off => RepeatMode::Single,
-            RepeatMode::Single => RepeatMode::List,
-            RepeatMode::List => RepeatMode::Off,
-        }
-    }
-
-    /// 中文字幕，用于 TUI 状态条显示。
-    pub fn label(self) -> &'static str {
-        match self {
-            RepeatMode::Off => "顺序",
-            RepeatMode::Single => "单曲",
-            RepeatMode::List => "循环",
-        }
+/// 循环播放模式的中文短名（状态条显示）。
+/// 呈现归发行版：枚举本体在数据层（tuneux-mediax），文案不随之下沉。
+pub fn repeat_label(mode: RepeatMode) -> &'static str {
+    match mode {
+        RepeatMode::Off => "顺序",
+        RepeatMode::Single => "单曲",
+        RepeatMode::List => "循环",
     }
 }
+
+// 循环播放模式（三态：Off / Single / List）下沉在数据层共享，
+// serde 表示（"off"/"single"/"list"）已冻结；此处重导出保持
+// `crate::config::RepeatMode` 既有引用路径不变。
+pub use tuneux_mediax::RepeatMode;
 
 /// 播放列表的显示模式。
 ///
@@ -87,7 +62,7 @@ pub enum PlaylistView {
     Flat,
 }
 
-/// 可视化面板的显示模式（`v` 键切换：关 → 频谱半屏 → 频谱全屏 → 示波器 → 关）。
+/// 可视化面板的显示模式（`v` 键切换：关 → 频谱半屏 → 频谱全屏 → 示波器 → 插件面板 → 关）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SpectrumMode {
@@ -100,16 +75,19 @@ pub enum SpectrumMode {
     Full,
     /// 示波器（左右声道时域波形）占满整个主区。
     Oscilloscope,
+    /// 插件可视化面板（「可视化-*」插件输出的字符画）占满整个主区。
+    Plugin,
 }
 
 impl SpectrumMode {
-    /// 循环到下一模式：Hidden → Half → Full → Oscilloscope → Hidden。
+    /// 循环到下一模式：Hidden → Half → Full → Oscilloscope → Plugin → Hidden。
     pub fn next(self) -> Self {
         match self {
             SpectrumMode::Hidden => SpectrumMode::Half,
             SpectrumMode::Half => SpectrumMode::Full,
             SpectrumMode::Full => SpectrumMode::Oscilloscope,
-            SpectrumMode::Oscilloscope => SpectrumMode::Hidden,
+            SpectrumMode::Oscilloscope => SpectrumMode::Plugin,
+            SpectrumMode::Plugin => SpectrumMode::Hidden,
         }
     }
 }
@@ -175,6 +153,10 @@ pub struct Config {
     #[serde(default)]
     pub repeat: RepeatMode,
 
+    /// 皮肤名（plugins/ 下「皮肤-*」清单内按名匹配；空 = 内置默认 DOS 风配色）。
+    #[serde(default)]
+    pub skin: String,
+
     /// 是否随机播放。
     #[serde(default)]
     pub shuffle: bool,
@@ -183,7 +165,7 @@ pub struct Config {
     #[serde(default)]
     pub playlist_view: PlaylistView,
 
-    /// 频谱显示模式（关 / 半屏 / 全屏），退出时保留。
+    /// 频谱显示模式（关 / 半屏 / 全屏 / 示波器 / 插件面板），退出时保留。
     #[serde(default)]
     pub spectrum_mode: SpectrumMode,
 
@@ -204,10 +186,6 @@ pub struct Config {
     /// 退出时保留，下次启动沿用。
     #[serde(default = "default_playback_medium")]
     pub playback_medium: String,
-
-    /// 配色主题（Dos / Clean），退出时保留。
-    #[serde(default)]
-    pub theme: crate::tui::theme::Theme,
 
     /// 文件浏览器占终端宽度的比例（0.1 ~ 0.9）。
     /// 例如 0.4 表示左侧浏览器占 40%，右侧元数据/播放列表占 60%。
@@ -242,8 +220,8 @@ pub struct Config {
     /// 默认空 map：全部沿用内置默认键（空格/n/p/+/-），旧配置无需迁移。
     /// 未知动作名或无法解析的键描述会被忽略并回退默认键，绝不 panic。
     ///
-    /// 注意：当前键处理尚未读取此映射（配置了也暂不生效），字段保留供后续
-    /// 接入自定义键位；在此之前请使用内置默认键。
+    /// 已接入按键处理（优先于内置默认键）；合法动作名见 KEYMAP_ACTIONS
+    ///（toggle_play / next / prev / volume_up / volume_down）。
     #[serde(default)]
     pub keymap: HashMap<String, String>,
     /// 系统媒体键开关（默认开启）。
@@ -405,6 +383,7 @@ impl Default for Config {
             volume: default_volume(),
             replay_gain: false,
             repeat: RepeatMode::default(),
+            skin: String::new(),
             shuffle: false,
             playlist_view: PlaylistView::Flat,
             spectrum_mode: SpectrumMode::Hidden,
@@ -413,7 +392,6 @@ impl Default for Config {
             // -fx 默认浏览器常显；tuneux 默认隐藏，按 b 唤出。
             left_panel: LeftPanel::Browser,
             playback_medium: "none".to_string(),
-            theme: crate::tui::theme::Theme::default(),
             browser_ratio: default_browser_ratio(),
             last_dir: None,
             dedup_on_add: default_dedup_on_add(),
@@ -439,7 +417,7 @@ impl Config {
     }
 }
 
-/// 播放状态（保存到独立文件 `playlist.toml`）。
+/// 播放状态（保存到独立文件 `tuneux-fx-playlist.toml`）。
 ///
 /// 与 `tuneux.toml`（配置偏好）分离：这里存播放列表与每首曲目的
 /// 播放进度（断点续播），体积可能较大且频繁变化。
@@ -454,15 +432,17 @@ pub struct PlaylistState {
     #[serde(default)]
     pub current_cue: Option<u32>,
     /// 播放列表条目（按插入序）。
+    #[serde(default)]
     pub items: Vec<PlaylistItem>,
     /// 每首曲目的播放进度（路径 → 秒）。
+    #[serde(default)]
     pub positions: BTreeMap<PathBuf, f64>,
     /// ReplayGain 测量结果缓存（路径 → 增益 dB）。
     ///
-    /// 与断点续播进度一同持久化到 `playlist.toml`：同一首歌曲
+    /// 与断点续播进度一同持久化到 `tuneux-fx-playlist.toml`：同一首歌曲
     /// 首次播放时流式分析测得整曲响度，之后每次播放直接套用缓存
     /// 的增益，免去重复分析（跨会话有效）。`#[serde(default)]`
-    /// 保证旧版 `playlist.toml`（无此字段）仍可正常加载。
+    /// 保证旧版 `tuneux-fx-playlist.toml`（无此字段）仍可正常加载。
     #[serde(default)]
     pub replay_gain: BTreeMap<PathBuf, f64>,
     /// 书签列表（路径 + 位置 + 标签），随 playlist.toml 持久化。
@@ -591,14 +571,31 @@ const KEYMAP_ACTIONS: &[&str] = &["toggle_play", "next", "prev", "volume_up", "v
 /// 避免用户误配导致快捷键静默失效或与退出键（q/Ctrl+C）冲突。
 ///
 /// 非法映射打警告并剔除；保留键冲突由文档警示。
+/// 保留键（规范化后的键描述）：不可作为自定义映射的目标。
+/// 退出路径是安全底线——q / Ctrl+C 被映射走后，用户配置失误将无法退出
+/// 程序（手册「q / Ctrl+C 不可重映射」的承诺由本清单兑现）。
+const RESERVED_KEYS: &[&str] = &["q", "ctrl+c"];
+
 pub(crate) fn validate_keymap(keymap: &mut HashMap<String, String>) {
     keymap.retain(|action, desc| {
         let action_ok = KEYMAP_ACTIONS.contains(&action.as_str());
-        let desc_ok = !desc.trim().is_empty();
-        if !action_ok || !desc_ok {
+        // 键描述必须可解析：加载期即拒绝，而非运行期静默不生效。
+        let parsed = parse_key_desc(desc);
+        if !action_ok || parsed.is_none() {
             eprintln!(
                 "[配置] 忽略非法快捷键映射：动作 {action}（描述 {desc}）——合法动作：{}",
                 KEYMAP_ACTIONS.join(" / ")
+            );
+            return false;
+        }
+        // 保留键拒绝（q / Ctrl+C 退出底线，不可重映射；大小写不敏感——
+        // 规范化对 ctrl+字母保留原大小写，"Ctrl+C" 规范为 "ctrl+C"）。
+        if parsed
+            .as_deref()
+            .is_some_and(|d| RESERVED_KEYS.iter().any(|r| r.eq_ignore_ascii_case(d)))
+        {
+            eprintln!(
+                "[配置] 忽略保留键映射：动作 {action}（描述 {desc}）——q / Ctrl+C 为退出键，不可重映射"
             );
             return false;
         }
@@ -606,8 +603,6 @@ pub(crate) fn validate_keymap(keymap: &mut HashMap<String, String>) {
     });
 }
 
-/// 始终返回有效 Config：加载失败时打印警告并回退默认值，
-/// 保证程序在任何情况下都能启动。
 /// 前代同名产品（tuneux）同名文件的候选路径：exe 同目录 → 系统配置目录。
 /// 仅供首次启动继承使用（本产品自身配置文件不存在时）。
 fn legacy_tuneux_candidates(filename: &str) -> Vec<PathBuf> {
@@ -640,6 +635,8 @@ fn load_first_existing<T: serde::de::DeserializeOwned>(candidates: &[PathBuf]) -
     None
 }
 
+/// 加载配置：始终返回有效 Config——加载失败时打印警告并回退默认值，
+/// 保证程序在任何情况下都能启动。首次启动时尝试继承 tuneux 的配置。
 pub fn load() -> Config {
     let path = config_path();
     let mut cfg = if path.exists() {
@@ -707,7 +704,7 @@ fn save_to(path: &Path, cfg: &Config) -> ConfigResult<()> {
         std::fs::create_dir_all(parent)?;
     }
     let text = toml::to_string_pretty(cfg)?;
-    std::fs::write(path, text)?;
+    atomic_write(path, &text)?;
     Ok(())
 }
 
@@ -727,7 +724,7 @@ pub fn load_playlist_state() -> PlaylistState {
         .unwrap_or_default()
 }
 
-/// 保存播放状态到独立文件 `playlist.toml`。
+/// 保存播放状态到独立文件 `tuneux-fx-playlist.toml`。
 ///
 /// 保存失败静默吞掉、不阻塞退出（理由同 [`save`]：运行期打印会弄脏屏幕）。
 pub fn save_playlist_state(state: &PlaylistState) {
@@ -741,13 +738,25 @@ fn save_playlist_state_to(path: &Path, state: &PlaylistState) -> ConfigResult<()
         std::fs::create_dir_all(parent)?;
     }
     let text = toml::to_string_pretty(state)?;
-    std::fs::write(path, text)?;
+    atomic_write(path, &text)?;
     Ok(())
 }
 
 // =============================================================================
 // 单元测试
 // =============================================================================
+/// 原子写文件：先写同目录临时文件再 rename 替换。
+///
+/// 直接 `fs::write` 是「原地截断再写」，写入过程中断电/强杀会产生半截文件，
+/// 下次启动解析失败 → 回退默认值 → 播放列表/断点/键位静默丢失。
+/// rename(2) 在同一文件系统上是原子操作，要么旧文件完整、要么新文件完整。
+fn atomic_write(path: &Path, content: &str) -> ConfigResult<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,6 +767,17 @@ mod tests {
         assert_eq!(RepeatMode::Off.next(), RepeatMode::Single);
         assert_eq!(RepeatMode::Single.next(), RepeatMode::List);
         assert_eq!(RepeatMode::List.next(), RepeatMode::Off);
+    }
+
+    /// 旧配置兼容：repeat 字段沿用冻结表示（"off"/"single"/"list"）解析。
+    /// 枚举本体下沉数据层（tuneux-mediax）后表示不变，旧 toml 无需迁移。
+    #[test]
+    fn old_toml_repeat_field_still_parses() {
+        let cfg: Config = toml::from_str("repeat = \"single\"\n").unwrap();
+        assert_eq!(cfg.repeat, RepeatMode::Single);
+        // 旧文件常见无引号单引号写法同样解析。
+        let cfg: Config = toml::from_str("repeat = 'list'\n").unwrap();
+        assert_eq!(cfg.repeat, RepeatMode::List);
     }
 
     /// TOML 往返：保存后再加载，字段应完全一致。
@@ -772,6 +792,7 @@ mod tests {
             volume: 0.42,
             replay_gain: true,
             repeat: RepeatMode::Single,
+            skin: "午夜蓝".to_string(),
             shuffle: true,
             playlist_view: PlaylistView::Flat,
             spectrum_mode: SpectrumMode::Half,
@@ -779,7 +800,6 @@ mod tests {
             lyrics_offset: 0.5,
             left_panel: LeftPanel::Browser,
             playback_medium: "tape".to_string(),
-            theme: crate::tui::theme::Theme::Dos,
             browser_ratio: 0.55,
             last_dir: Some(PathBuf::from("/tmp/music")),
             dedup_on_add: false,
@@ -1194,6 +1214,32 @@ mod tests {
         assert!(
             (h - 9_999_999.999_999).abs() < 1e-6,
             "极大进度往返后应一致：{h}"
+        );
+    }
+
+    /// 保留键校验：q / Ctrl+C（含大小写变体）不可作为映射目标——退出底线；
+    /// 无法解析的描述同样在加载期拒绝（与字段文档承诺一致）。
+    #[test]
+    fn validate_keymap_rejects_reserved_and_unparsable() {
+        let mut map = HashMap::from([
+            ("toggle_play".to_string(), "q".to_string()), // 保留：q
+            ("next".to_string(), "Ctrl+C".to_string()),   // 保留：ctrl+c（大小写变体）
+            ("prev".to_string(), "shift+q".to_string()),  // 合法：shift+q 非保留键
+            ("volume_up".to_string(), "f5".to_string()),  // 非法：F 键不可自定义
+            ("volume_down".to_string(), "bogus key".to_string()), // 非法：无法解析
+        ]);
+        validate_keymap(&mut map);
+        assert!(!map.contains_key("toggle_play"), "q 映射应被拒绝");
+        assert!(
+            !map.contains_key("next"),
+            "ctrl+c 映射应被拒绝（大小写不敏感）"
+        );
+        assert!(!map.contains_key("volume_up"), "F 键描述应被解析层拒绝");
+        assert!(!map.contains_key("volume_down"), "无法解析的描述应被拒绝");
+        assert_eq!(
+            map.get("prev").map(|s| s.as_str()),
+            Some("shift+q"),
+            "合法映射应保留"
         );
     }
 }

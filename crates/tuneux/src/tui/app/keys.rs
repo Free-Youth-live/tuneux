@@ -188,6 +188,12 @@ impl App {
 
     /// 处理一个按键事件。返回 false 表示请求退出。
     pub fn handle_key(&mut self, key: KeyEvent, config: &mut Config) -> bool {
+        // Ctrl+C 退出（最优先，恒可退出；弹窗 / 搜索态同样可用）。
+        // 其余带修饰字符键不进默认键分派（下方守卫），keymap 显式绑定除外。
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return false;
+        }
+
         // —— 关于弹窗（最优先：任意键关闭并吃掉，避免误触发其它操作）——
         if self.about_visible {
             self.about_visible = false;
@@ -276,16 +282,33 @@ impl App {
             // 未知动作名：忽略该映射，继续走默认键
         }
 
+        // 默认键只响应无 CTRL/ALT 修饰的字符：避免 Ctrl+D / Ctrl+Q 等组合键
+        // 误触删除、退出等单键功能。keymap 层在上方先行匹配，用户显式配置的
+        // 组合键（如 ctrl+p）不受影响。
+        if matches!(key.code, KeyCode::Char(_))
+            && key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return true;
+        }
+
         // —— 全局键（不受焦点影响）——
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => return false,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return false;
-            }
             KeyCode::Tab => {
+                // Tab 在已开启的可导航面板间切换：浏览器仅在左侧面板为
+                // Browser 时可聚焦；封面等展示面板不可聚焦（防焦点落入
+                // 不可见面板后 Enter 播放来历不明曲目）。与 fx 口径一致。
                 self.focus = match self.focus {
                     playlist::Panel::Browser => playlist::Panel::Playlist,
-                    playlist::Panel::Playlist => playlist::Panel::Browser,
+                    playlist::Panel::Playlist => {
+                        if self.left_panel == LeftPanel::Browser {
+                            playlist::Panel::Browser
+                        } else {
+                            playlist::Panel::Playlist
+                        }
+                    }
                 };
                 return true;
             }
@@ -400,13 +423,11 @@ impl App {
                     self.clear_playlist();
                     self.pending_clear = false;
                     self.pending_clear_at = None;
-                    self.last_error = Some("播放列表已清空".to_string());
-                    self.last_error_at = Some(std::time::Instant::now());
+                    self.flash_message("播放列表已清空");
                 } else if !self.playlist.is_empty() {
                     self.pending_clear = true;
                     self.pending_clear_at = Some(std::time::Instant::now());
-                    self.last_error = Some("再按一次 x 确认清空播放列表".to_string());
-                    self.last_error_at = Some(std::time::Instant::now());
+                    self.flash_message("再按一次 x 确认清空播放列表");
                 }
                 return true;
             }
@@ -502,7 +523,10 @@ impl App {
                         }
                     }
                 }
-                KeyCode::Backspace => {
+                // 仅浏览器可见时返回浏览器（与 Tab 同款守卫）：左面板
+                // 隐藏/封面时不响应，避免焦点落进不可见面板（j/k 盲导航、
+                // Enter 播不可见条目）。
+                KeyCode::Backspace if self.left_panel == LeftPanel::Browser => {
                     self.focus = playlist::Panel::Browser;
                 }
                 _ => {}

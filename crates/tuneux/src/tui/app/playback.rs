@@ -8,9 +8,18 @@ use tuneux_corex as audio;
 
 use super::App;
 
-/// 切曲生效守卫帧数：Play/PlayResume/Seek 经通道异步生效，期间 `position()`
-/// 仍是旧值。守卫期内主循环不做 CUE 终点判定（防点选更早分轨被误判连跳）。
-pub(crate) const SWITCH_GUARD_FRAMES: u32 = 15;
+/// 由条目构造预载目标：CUE 分轨按区间预载（起点/终点毫秒换算秒），
+/// 普通曲目整文件预载。
+pub(crate) fn preload_target_of(item: &playlist::PlaylistItem) -> audio::PreloadTarget {
+    match &item.cue {
+        Some(cue) => audio::PreloadTarget::range(
+            item.path.clone(),
+            cue.start_ms as f64 / 1000.0,
+            cue.end_ms.map(|e| e as f64 / 1000.0),
+        ),
+        None => audio::PreloadTarget::whole(item.path.clone()),
+    }
+}
 
 impl App {
     /// 当前条目的 CUE 引用（克隆；普通曲目为 None）。
@@ -33,8 +42,7 @@ impl App {
     pub fn refresh_last_error(&mut self) {
         if let Some(engine) = &self.engine {
             if let Some(err) = engine.take_last_error() {
-                self.last_error = Some(err);
-                self.last_error_at = Some(std::time::Instant::now());
+                self.flash_message(&err);
             }
         }
         if let Some(at) = self.last_error_at {
@@ -120,18 +128,14 @@ impl App {
             while engine.poll_failed().is_some() {}
 
             if let Some(cue) = cue_override.as_ref() {
-                // CUE 分轨：从 CUE 起点起播（整轨内片段，不参与断点续播）。
+                // CUE 分轨：按区间播放（引擎侧终点判定 + 尾巴播完；相邻分轨
+                // 经区间预载无缝衔接，不再依赖前端轮询 position）。
                 let start_secs = cue.start_ms as f64 / 1000.0;
-                if same_file && engine.is_playing() {
-                    // 同一整轨文件正在播：仅文件内 Seek——不重开文件（免卡顿）、
-                    // 不重置响度分析器（测量跨分轨连续，不被切分清零）。
-                    engine.send(audio::AudioCmd::Seek(start_secs));
-                } else {
-                    engine.send(audio::AudioCmd::PlayResume {
-                        path: path.clone(),
-                        secs: start_secs,
-                    });
-                }
+                engine.send(audio::AudioCmd::PlayRange {
+                    path: path.clone(),
+                    start_secs,
+                    end_secs: cue.end_ms.map(|e| e as f64 / 1000.0),
+                });
             } else {
                 // 断点续播：距结尾 5 秒内视为已听完，从头播；否则接着上次。
                 let saved_secs = self.playlist_state.get_position(&path);
@@ -160,16 +164,15 @@ impl App {
                 .map(|db| 10f64.powf(db / 20.0) as f32)
                 .unwrap_or(1.0);
             engine.set_replay_gain(rg_gain);
-            // Gapless：预载下一曲（顺序播放预测；shuffle/单曲循环返回 None 不预载）。
-            let next_path = self.playlist.peek_next(config.repeat);
-            engine.send(audio::AudioCmd::PreloadNext(next_path));
+            // Gapless：预载下一曲（顺序播放预测；shuffle/单曲循环返回 None 不预载；
+            // CUE 分轨按区间预载——同文件相邻分轨无缝衔接）。
+            let next = self.playlist.peek_next_item(config.repeat);
+            engine.send(audio::AudioCmd::PreloadNext(next.map(preload_target_of)));
         }
         // 旧曲滞留的测量增益归档（下次播放旧曲时直接复用，免重测）。
         if let (Some(db), Some(old)) = (stale_gain, prev_path) {
             self.replay_gain_cache.insert(old, db);
         }
-        // 切曲生效守卫：Play/Seek 异步生效，守卫期内主循环不做 CUE 终点判定。
-        self.switch_guard = SWITCH_GUARD_FRAMES;
     }
 
     /// Gapless 无缝切曲后的前端状态同步。
@@ -235,8 +238,8 @@ impl App {
         }
         // 无缝切曲后，继续预载再下一曲。
         if let Some(engine) = &self.engine {
-            let next_path = self.playlist.peek_next(config.repeat);
-            engine.send(audio::AudioCmd::PreloadNext(next_path));
+            let next = self.playlist.peek_next_item(config.repeat);
+            engine.send(audio::AudioCmd::PreloadNext(next.map(preload_target_of)));
         }
     }
 
@@ -281,9 +284,12 @@ impl App {
                                 // 不重开文件（免周期性卡顿），响度分析器连续。
                                 engine.send(audio::AudioCmd::Seek(c.start_ms as f64 / 1000.0));
                             } else {
-                                engine.send(audio::AudioCmd::PlayResume {
+                                // 非播放态的 CUE 单曲循环：用 PlayRange 带回终点（fx 同口径），
+                                // 否则丢分轨 end_secs、循环时可能越界到整轨其它分轨。
+                                engine.send(audio::AudioCmd::PlayRange {
                                     path: path.clone(),
-                                    secs: c.start_ms as f64 / 1000.0,
+                                    start_secs: c.start_ms as f64 / 1000.0,
+                                    end_secs: c.end_ms.map(|e| e as f64 / 1000.0),
                                 });
                             }
                         } else {
@@ -303,7 +309,6 @@ impl App {
                     if let Some(db) = stale_gain {
                         self.replay_gain_cache.insert(path, db);
                     }
-                    self.switch_guard = SWITCH_GUARD_FRAMES;
                 }
             }
             playlist::NavOutcome::End => {}
@@ -311,8 +316,7 @@ impl App {
     }
 
     /// CUE 分轨曲目：把 seek 目标钳制在本曲区间 [start, end] 内，
-    /// 防止快进/快退越界到整轨的其他曲目。
-    /// 普通曲目（cue 为 None）原样返回；end_ms 为 None（末曲）只钳下限。
+    /// 防止快进/快退越界到整轨的其他曲目（钳制逻辑归 mediax）。
     pub(crate) fn clamp_cue_seek(&self, pos: f64) -> f64 {
         let Some(cue) = self
             .playlist
@@ -322,12 +326,7 @@ impl App {
         else {
             return pos;
         };
-        let start = cue.start_ms as f64 / 1000.0;
-        let p = pos.max(start);
-        match cue.end_ms {
-            Some(e) => p.min(e as f64 / 1000.0),
-            None => p,
-        }
+        playlist::clamp_seek_to_cue(pos, Some(cue))
     }
 
     /// 刷新预载目标：循环/随机模式变化后调用，重发 PreloadNext。
@@ -335,8 +334,8 @@ impl App {
     /// 旧预载曲会在切曲时抢先播放，声音与界面错位）。
     pub(crate) fn refresh_preload(&mut self, config: &Config) {
         if let Some(engine) = &self.engine {
-            let next_path = self.playlist.peek_next(config.repeat);
-            engine.send(audio::AudioCmd::PreloadNext(next_path));
+            let next = self.playlist.peek_next_item(config.repeat);
+            engine.send(audio::AudioCmd::PreloadNext(next.map(preload_target_of)));
         }
     }
 
@@ -367,7 +366,11 @@ impl App {
                     Some(ms) => ms as f64 / 1000.0,
                     None => engine.duration(),
                 };
-                let at_end = end_secs > 0.0 && engine.position() >= end_secs - 0.1;
+                // 末尾态双判据：进度判定（有时长曲目）∪ 引擎末尾标志——
+                // 无时长曲目（Opus / FFmpeg 后端 duration=0）进度判定永假，
+                // EOF 后靠标志重播，而非无效 Resume（只解暂停、不出声）。
+                let at_end =
+                    engine.at_eof() || (end_secs > 0.0 && engine.position() >= end_secs - 0.1);
                 if at_end {
                     let mut stale_gain = None;
                     if self.current_path.is_some() {
@@ -378,9 +381,10 @@ impl App {
                         while engine.poll_failed().is_some() {}
                         if let Some(path) = &self.current_path {
                             match cue.as_ref() {
-                                Some(c) => engine.send(audio::AudioCmd::PlayResume {
+                                Some(c) => engine.send(audio::AudioCmd::PlayRange {
                                     path: path.clone(),
-                                    secs: c.start_ms as f64 / 1000.0,
+                                    start_secs: c.start_ms as f64 / 1000.0,
+                                    end_secs: c.end_ms.map(|e| e as f64 / 1000.0),
                                 }),
                                 None => engine.send(audio::AudioCmd::Play(path.clone())),
                             }
@@ -389,8 +393,6 @@ impl App {
                     if let (Some(db), Some(path)) = (stale_gain, self.current_path.clone()) {
                         self.replay_gain_cache.insert(path, db);
                     }
-                    // 重播是切曲：守卫防滞后 position 误判 CUE 终点。
-                    self.switch_guard = SWITCH_GUARD_FRAMES;
                 } else {
                     engine.send(audio::AudioCmd::Resume);
                 }

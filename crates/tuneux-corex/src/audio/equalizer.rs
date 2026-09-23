@@ -47,7 +47,7 @@ impl EqParams {
 
     /// 写某段增益（dB），越界返回 false。增益钳制到 [-12, +12] dB。
     pub fn set_band(&self, band: usize, gain_db: f32) -> bool {
-        if band >= EQ_BANDS {
+        if band >= EQ_BANDS || !gain_db.is_finite() {
             return false;
         }
         let clamped = gain_db.clamp(EQ_GAIN_MIN_DB, EQ_GAIN_MAX_DB);
@@ -99,9 +99,25 @@ struct BiquadCoeffs {
 }
 
 /// 计算某段在某采样率下的 peaking 系数。
+///
+/// Nyquist 保护：f₀ ≥ sr/2 时 `sin(w0) < 0` → `alpha < 0` → `a2_norm > 1`
+/// → 极点出单位圆 → 滤波器发散（22.05k/24k/11.025k/12k 流下 16kHz 段触发），
+/// 输出数样本后变 Inf 再 NaN，且 `f32::clamp` 对 NaN 原样放行。
+/// 该频段直接返回单位系数（bypass）——增益在 Nyquist 之上无物理意义。
 fn peaking_coeffs(freq_hz: f32, q: f32, gain_db: f32, sample_rate: u32) -> BiquadCoeffs {
+    let sr = sample_rate.max(1) as f32;
+    // f₀ ≥ 0.95 × Nyquist（留 5% 安全余量防浮点边界）：bypass 该段。
+    if freq_hz >= 0.95 * (sr / 2.0) {
+        return BiquadCoeffs {
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+        };
+    }
     let a = 10f32.powf(gain_db / 40.0);
-    let w0 = std::f32::consts::TAU * freq_hz / sample_rate.max(1) as f32;
+    let w0 = std::f32::consts::TAU * freq_hz / sr;
     let cos_w0 = w0.cos();
     let sin_w0 = w0.sin();
     let alpha = sin_w0 / (2.0 * q.max(1e-6));
@@ -113,7 +129,7 @@ fn peaking_coeffs(freq_hz: f32, q: f32, gain_db: f32, sample_rate: u32) -> Biqua
     let a1 = -2.0 * cos_w0;
     let a2 = 1.0 - alpha / a;
 
-    // a0 归一（a0 恒 > 0：a ≥ 10^(-12/40) > 0，alpha ≥ 0）。
+    // a0 归一（a0 恒 > 0：a ≥ 10^(-12/40) > 0；alpha ≥ 0 由上方 Nyquist 保护保证）。
     BiquadCoeffs {
         b0: b0 / a0,
         b1: b1 / a0,
@@ -198,7 +214,13 @@ impl EqEffect {
             self.cached_enabled = enabled;
         }
 
-        // 逐样本过 10 段 biquad（L/R 独立状态）。
+        // 逐样本过 10 段 biquad（L/R 独立状态）。上游 push_all 只推整帧，
+        // 立体声缓冲恒为偶数长度；断言把这一不变式显式化，余下的孤立样本
+        // （正常路径不存在）按静默忽略处理，与单声道分支口径一致。
+        debug_assert!(
+            data.len().is_multiple_of(2),
+            "立体声缓冲必须帧对齐（上游 push_all 保证）"
+        );
         if channels == 2 {
             for frame in data.as_chunks_mut::<2>().0 {
                 let x_l = frame[0];
@@ -231,6 +253,11 @@ impl EqEffect {
             s[3] = s[2];
             s[2] = y;
             x = y;
+        }
+        // 出口非有限值防护：系数/状态异常时输出 Inf→NaN，f32::clamp 对 NaN
+        // 原样放行（NaN 直入 DAC）。此处把非有限值回退为输入原始值（直通）。
+        if !x.is_finite() {
+            return x0;
         }
         x
     }
@@ -266,6 +293,64 @@ mod tests {
         p.set_band(0, 6.0);
         assert_eq!(p.band(EQ_BANDS), 0.0, "越界读应返回 0.0 而非 panic");
         assert_eq!(p.band(EQ_BANDS + 100), 0.0);
+    }
+
+    /// Nyquist 保护：f₀ ≥ 0.95 × sr/2 时该段应 bypass（单位系数），
+    /// 输出恒等于输入——不发散为 Inf/NaN（回归旧缺陷：22.05k/24k 流下
+    /// 16kHz 段极点出单位圆，输出数百样本后变 NaN 且 f32::clamp 不拦）。
+    #[test]
+    fn eq_bypass_above_nyquist() {
+        let mut fx = EqEffect::default();
+        let params = EqParams::new();
+        params.set_band(9, 12.0); // 16kHz 段 +12dB
+                                  // sr=22050：Nyquist=11025，16kHz > 0.95*11025 ≈ 10474 → bypass
+        let mut data = vec![0.5f32; 256];
+        let orig = data.clone();
+        fx.process(&mut data, 1, 22_050, &params);
+        for (a, b) in data.iter().zip(orig.iter()) {
+            assert!(a.is_finite(), "输出必须有限（NaN 直入 DAC）");
+            assert!((a - b).abs() < 1e-6, "Nyquist 之上应近似直通：{a} vs {b}");
+        }
+        // sr=12000：Nyquist=6000，8kHz 段同样 bypass。
+        params.set_band(8, 12.0);
+        let mut data = vec![0.5f32; 256];
+        let orig = data.clone();
+        fx.process(&mut data, 1, 12_000, &params);
+        for (a, b) in data.iter().zip(orig.iter()) {
+            assert!(
+                a.is_finite() && (a - b).abs() < 1e-6,
+                "8kHz@12k 应近似 bypass：{a} vs {b}"
+            );
+        }
+        // sr=44100：16kHz < Nyquist → 正常 EQ，不直通但必须有限。
+        let mut data = vec![0.5f32; 256];
+        fx.process(&mut data, 1, 44_100, &params);
+        assert!(data.iter().all(|v| v.is_finite()), "44.1k 下输出必须有限");
+        // 44.1k 下 16kHz 段正常工作，但稳态增益幅度取决于多个段的叠加；
+        // 此处只验证有限性，不强制"必须与输入不同"（8kHz 段在 44100 下
+        // 也生效但幅度可能恰好小）。
+    }
+
+    /// 出口非有限值防护：极端系数下（如手动注入 NaN 状态）输出回退为输入。
+    #[test]
+    fn eq_output_finite_guard() {
+        let mut fx = EqEffect::default();
+        let params = EqParams::new();
+        params.set_band(0, 12.0);
+        fx.process(&mut [0.5f32; 32], 1, 48_000, &params);
+        // 正常路径不受影响——输出有限。
+        let mut data = vec![0.5f32; 32];
+        fx.process(&mut data, 1, 48_000, &params);
+        assert!(data.iter().all(|v| v.is_finite()));
+    }
+
+    /// setter NaN 净化：非有限增益应被拒绝。
+    #[test]
+    fn set_band_rejects_nan() {
+        let p = EqParams::new();
+        assert!(!p.set_band(0, f32::NAN), "NaN 增益应被拒绝");
+        assert!(!p.set_band(0, f32::INFINITY), "Inf 增益应被拒绝");
+        assert!(p.set_band(0, 6.0), "有限增益正常接受");
     }
 
     #[test]

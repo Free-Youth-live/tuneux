@@ -6,8 +6,8 @@
 //!   含内嵌搜索输入框）；
 //! - `draw_lyrics_panel`：歌词面板（当前行居中高亮，随播放滚动）；
 //! - `draw_cover_panel`：专辑封面面板（halfblock 半块字符渲染）；
-//! - 私有辅助：`album_artists` / `album_total_duration` /
-//!   `fmt_duration_hms`（播放列表分组视图的组头信息）。
+//! - 私有辅助：`album_artists` / `album_total_duration`（播放列表分组
+//!   视图的组头信息）；时长格式化用父模块共享的 `fmt_time`。
 //!
 //! 说明：浏览器/播放列表的搜索输入框不是独立弹窗，而是内嵌在
 //! 各面板顶部的 1 行，因此跟随所属面板放在本模块（而非 popup.rs）。
@@ -165,13 +165,9 @@ pub(super) fn draw_browser(
         frame.render_widget(msg, inner);
         return;
     }
-    if browser.entries().is_empty() {
-        let msg = Paragraph::new("（空目录）")
-            .style(Style::default().fg(Color::DarkGray))
-            .alignment(Alignment::Center);
-        frame.render_widget(msg, inner);
-        return;
-    }
+    // 空目录 / 搜索零匹配的提示移到搜索框渲染**之后**（见下方）：搜索态下
+    // entries 是过滤结果，零匹配时同样为空；若在此提前 return，搜索输入框与
+    // 「Esc 退出」提示会被一起顶掉，而按键仍被 handle_key 的搜索分支全量吞掉。
 
     // 搜索模式下：顶部 1 行给搜索输入框，剩余给列表
     let list_area = if search_mode {
@@ -196,6 +192,21 @@ pub(super) fn draw_browser(
     } else {
         inner
     };
+
+    if browser.entries().is_empty() {
+        // 空目录（未搜索）或搜索零匹配：提示画在 list_area 内——搜索框已在
+        // 上方渲染，不会再被这条提示遮住。
+        let msg = if search_mode {
+            "（无匹配）Esc 退出搜索"
+        } else {
+            "（空目录）"
+        };
+        let msg = Paragraph::new(msg)
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Center);
+        frame.render_widget(msg, list_area);
+        return;
+    }
 
     // 正常列表：entries 本身就是当前显示列表（搜索时为递归过滤结果），
     // 从 scroll 偏移开始渲染，最多画可视行数。
@@ -269,19 +280,6 @@ fn album_total_duration(
     total
 }
 
-/// 时长格式：mm:ss（不足 1 小时）或 h:mm:ss（超 1 小时）。
-fn fmt_duration_hms(secs: f64) -> String {
-    let total = secs.max(0.0) as u64;
-    let h = total / 3600;
-    let m = (total % 3600) / 60;
-    let s = total % 60;
-    if h > 0 {
-        format!("{h}:{m:02}:{s:02}")
-    } else {
-        format!("{m}:{s:02}")
-    }
-}
-
 /// 播放列表面板。
 ///
 /// # 两种视图
@@ -329,14 +327,9 @@ pub(super) fn draw_playlist(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if playlist.is_empty() {
-        // 空列表提示用户如何操作（b 唤出浏览器，a 加入）
-        let msg = Paragraph::new("（空）按 b 打开浏览器，a 加入列表")
-            .style(Style::default().fg(Color::DarkGray))
-            .alignment(Alignment::Center);
-        frame.render_widget(msg, inner);
-        return;
-    }
+    // 空列表 / 搜索零匹配的提示移到搜索框渲染**之后**（见下方）：若在此提前
+    // return，空列表下按 `/` 进入搜索态时输入框与「Esc 退出」提示不可见，而
+    // handle_key 的搜索分支仍会吞掉全部按键（隐形模态态，连 q 都出不去）。
 
     // 搜索模式下：顶部 1 行给搜索输入框，剩余给列表
     let list_area = if search_mode {
@@ -356,6 +349,21 @@ pub(super) fn draw_playlist(
     } else {
         inner
     };
+
+    // 无可渲染行 = 列表为空（未搜索）或搜索零匹配——两者都是 rows 为空，
+    // 提示画在 list_area 内，搜索框已在上面占掉 1 行，不会被遮住。
+    if rows.is_empty() {
+        let msg = if search_mode {
+            "（无匹配）Esc 退出搜索"
+        } else {
+            "（空）按 b 打开浏览器，a 加入列表"
+        };
+        let msg = Paragraph::new(msg)
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Center);
+        frame.render_widget(msg, list_area);
+        return;
+    }
 
     let current = playlist.current_index();
     let selected = playlist.selected();
@@ -397,7 +405,7 @@ pub(super) fn draw_playlist(
                 let text = format!(
                     "{arrow} {album} - {artist_label} ({}首) ({})",
                     track_indices.len(),
-                    fmt_duration_hms(total),
+                    super::fmt_time(total),
                 );
                 let is_selected =
                     matches!(selected, Some(playlist::Selection::Album(a)) if a == album);
@@ -607,10 +615,26 @@ pub(super) fn draw_cover_browser(
     const CELL_W: u16 = 14;
     const COVER_H: u16 = 3;
     let cell_h = COVER_H + 1;
-    let cols = (inner.width / CELL_W).max(1) as usize;
-    let rows = (inner.height / cell_h).max(1) as usize;
+    // 面板放不下一个整格（终端过窄 / 过矮）时直接不画：`.max(1)` 会让
+    // cell_x + CELL_W 越过 inner 右边界，而 ratatui 只按整块 buffer 裁剪，
+    // 于是封面像素覆盖到面板边框甚至状态条上。
+    if inner.width < CELL_W || inner.height < cell_h {
+        app.cover_browser_visible = 0;
+        return;
+    }
+    let cols = (inner.width / CELL_W) as usize;
+    let rows = (inner.height / cell_h) as usize;
     let visible = cols * rows;
     app.cover_browser_visible = visible;
+    // 列表变短（删曲/清空）后 sel/scroll 可能越界——渲染时钳到有效范围，
+    // 否则没有格子被高亮、Enter 走 albums.get(sel) 得 None 无反应。
+    let count = albums.len();
+    if app.cover_browser_sel >= count {
+        app.cover_browser_sel = count.saturating_sub(1);
+    }
+    if app.cover_browser_scroll >= count {
+        app.cover_browser_scroll = count.saturating_sub(1);
+    }
     let start = app.cover_browser_scroll.min(albums.len().saturating_sub(1));
     let end = (start + visible).min(albums.len());
 

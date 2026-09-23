@@ -31,21 +31,21 @@ use self::panels::{
     draw_browser, draw_cover_browser, draw_cover_panel, draw_lyrics_panel, draw_playlist,
 };
 use self::popup::draw_about;
-use self::spectrum::{draw_audio_panel, draw_level_meter, draw_oscilloscope};
+use self::spectrum::{draw_audio_panel, draw_band_column, draw_level_meter, draw_oscilloscope};
 use self::status::{draw_help_bar, draw_now_playing, draw_status_bar};
 
 // 布局（4 段，浏览器默认隐藏，b 键唤出左侧；频谱通过 v 键在半屏/全屏间切换）：
-//   ┌ 当前曲目 ────────────┐ ┌ 电平 ─────────┐
-//   │ 曲名 / 歌手 / 专辑 … │ │ 随机乱码字符   │   ← 顶部条（左信息|右电平）
-//   ├─────────────────────┤ ├───────────────┤
+//   ┌ 当前曲目 ──────────┐ ┌ 三桶 ──┐ ┌ 电平 ────┐
+//   │ 曲名 / 歌手 / 专辑 … │ │ 低/中/高 │ │ L/R 两行 │   ← 顶部条（信息 60% | 三桶 15% | 电平 25%）
+//   ├───────────────────┴─────────┴───────────┤
 //   │ [浏览器 |] 播放列表  │   [频谱（半/全屏）]              ← 主区
-//   ├─────────────────────┴───────────────────────────────────┤
+//   ├──────────────────────────────────────────────────────┤
 //   │ [播] 曲名  0:03 ━━●━━ 3:43  100% 列表循环+随机           │  ← 状态条
 //   ├─────────────────────────────────────────────────────────┤
 //   │ ↑↓选曲 · Enter播放 · ←→±5s · v频谱 · q退出              │  ← 帮助
 //   └─────────────────────────────────────────────────────────┘
 
-// - 顶部条 6 行：当前曲信息（左 70%）+ 电平柱图（右 30%）；
+// - 顶部条 6 行：当前曲信息（60%）+ 三桶能量（15%）+ 电平柱图（25%）；
 // - 主区填满：浏览器可见时左（config.browser_ratio 比例）+ 右列表/频谱；
 //   频谱模式通过 v 键循环：关 → 半屏（与列表分屏）→ 全屏（占满列表区）；
 // - 状态条 4 行：进度/时间/音量/循环/错误信息；
@@ -53,6 +53,20 @@ use self::status::{draw_help_bar, draw_now_playing, draw_status_bar};
 //
 // 各段高度用 Length(n)（含边框）固定，主区用 Fill(1) 吃掉剩余空间，
 // 保证终端高度变化时只有列表区伸缩，其他区稳定。
+
+/// 秒数 → "m:ss"（超过 1 小时 "h:mm:ss"）。
+///
+/// 四舍五入到秒（避免 3.999 显示为 0:03 的观感问题）；分解用共享数据层
+/// （[`tuneux_mediax::time::hms_parts`]）。状态栏与播放列表时长列共用，
+/// 与 fx 同口径（基础版原两份本地实现收敛为此一处）。
+pub(crate) fn fmt_time(secs: f64) -> String {
+    let (h, m, s) = tuneux_mediax::time::hms_parts((secs.max(0.0) + 0.5) as u64);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
 
 pub fn draw(
     frame: &mut ratatui::Frame,
@@ -99,6 +113,7 @@ pub fn draw(
         &app.current_metadata,
         &app.engine,
         frame_tick,
+        app.bar_style,
     );
     // 帧计数 +1，供电平/频谱的乱码字符用。
     app.frame_tick = app.frame_tick.wrapping_add(1);
@@ -225,9 +240,10 @@ fn draw_playlist_or_spectrum(
                     app.frame_tick,
                     &app.spectrum_peaks,
                     dt,
+                    app.bar_style,
                 );
             } else if app.spectrum_mode == SpectrumMode::Oscilloscope {
-                draw_oscilloscope(frame, area, &app.engine, app.frame_tick);
+                draw_oscilloscope(frame, area, &app.engine, app.frame_tick, app.bar_style);
             } else {
                 // 列表与歌词横向分屏比例取自 metrics（单一真相源）
                 let split = Layout::horizontal([
@@ -246,7 +262,7 @@ fn draw_playlist_or_spectrum(
                             &app.engine,
                             app.focus,
                             rows,
-                            app.search_mode,
+                            metrics.playlist_searching,
                             &app.search_query,
                         );
                     }
@@ -265,7 +281,7 @@ fn draw_playlist_or_spectrum(
                             &app.engine,
                             app.focus,
                             rows,
-                            app.search_mode,
+                            metrics.playlist_searching,
                             &app.search_query,
                         );
                         draw_audio_panel(
@@ -275,6 +291,7 @@ fn draw_playlist_or_spectrum(
                             app.frame_tick,
                             &app.spectrum_peaks,
                             dt,
+                            app.bar_style,
                         );
                     }
                     // Full / Oscilloscope 已在上方分支处理
@@ -294,7 +311,7 @@ fn draw_playlist_or_spectrum(
                     &app.engine,
                     app.focus,
                     rows,
-                    app.search_mode,
+                    metrics.playlist_searching,
                     &app.search_query,
                 );
             }
@@ -310,7 +327,7 @@ fn draw_playlist_or_spectrum(
                     &app.engine,
                     app.focus,
                     rows,
-                    app.search_mode,
+                    metrics.playlist_searching,
                     &app.search_query,
                 );
                 draw_audio_panel(
@@ -320,6 +337,7 @@ fn draw_playlist_or_spectrum(
                     app.frame_tick,
                     &app.spectrum_peaks,
                     dt,
+                    app.bar_style,
                 );
             }
             SpectrumMode::Full => {
@@ -330,16 +348,17 @@ fn draw_playlist_or_spectrum(
                     app.frame_tick,
                     &app.spectrum_peaks,
                     dt,
+                    app.bar_style,
                 );
             }
             SpectrumMode::Oscilloscope => {
-                draw_oscilloscope(frame, area, &app.engine, app.frame_tick);
+                draw_oscilloscope(frame, area, &app.engine, app.frame_tick, app.bar_style);
             }
         },
     }
 }
 
-/// 顶部条：左侧当前曲信息（约 70%）+ 右侧电平（约 30%）。
+/// 顶部条：当前曲信息（60%）+ 三桶能量（15%）+ 电平（25%）。
 ///
 /// 参数全部按值传入（不是 &App），让调用方先算好 cover 再传入，
 /// 避免本函数和后续 `app.frame_tick += 1` 之间的可变借用冲突。
@@ -349,9 +368,15 @@ fn draw_top_bar(
     metadata: &Option<tuneux_mediax::metadata::TrackMetadata>,
     engine: &Option<audio::Engine>,
     frame_tick: u64,
+    bar_style: tuneux_mediax::BarStyle,
 ) {
-    let cols =
-        Layout::horizontal([Constraint::Percentage(70), Constraint::Percentage(30)]).split(area);
+    let cols = Layout::horizontal([
+        Constraint::Percentage(60),
+        Constraint::Percentage(15),
+        Constraint::Percentage(25),
+    ])
+    .split(area);
     draw_now_playing(frame, cols[0], metadata, engine);
-    draw_level_meter(frame, cols[1], engine, frame_tick);
+    draw_band_column(frame, cols[1], engine, frame_tick, bar_style);
+    draw_level_meter(frame, cols[2], engine, frame_tick, bar_style);
 }

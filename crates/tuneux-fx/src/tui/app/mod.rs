@@ -9,9 +9,11 @@
 //! （x x）、菜单栏与命令模式。
 //!
 //! 本目录按领域拆分子模块（每个子模块一个 `impl App` 扩展块）：
+//! - [`cue`]：CUE 分轨的列表展开与起播偏移
 //! - [`media`]：元数据缓存、歌词加载、封面解码
-//! - [`search`]：搜索与过滤（含 SearchTarget 枚举）
+//! - [`menu`]：菜单栏静态表与介质档标签
 //! - [`playback`]：播放控制（engine 交互）
+//! - [`search`]：搜索与过滤（含 SearchTarget 枚举）
 
 pub mod cue;
 pub mod media;
@@ -35,7 +37,7 @@ use crate::playlist::{self, Playlist};
 use tuneux_mediax::lyrics;
 use tuneux_mediax::metadata::TrackMetadata;
 
-use super::theme::{Palette, Theme};
+use super::theme::Palette;
 
 // 搜索目标重导出：render/layout.rs 依赖 `crate::tui::app::SearchTarget` 路径。
 pub use self::search::SearchTarget;
@@ -49,14 +51,28 @@ pub type DirAddResult = (
     PathBuf,
     Vec<playlist::PlaylistItem>,
     Vec<(PathBuf, TrackMetadata)>,
+    // 本批跳过的数据轨总数（cue 中的 MODE1/MODE2 等不可播轨；供 UI 提示）。
+    usize,
 );
 
 /// 应用运行时状态。
 pub struct App {
-    /// 当前配色主题（F2 切换）。主题 = 调色板数据，见 [`super::theme`]。
-    pub theme: Theme,
-    /// 插件注册的皮肤（优先于内置主题；None = 用内置主题）。
+    /// 当前生效的调色板（来自皮肤清单选中项；None = 内置默认 DOS 风配色）。
     pub skin: Option<Palette>,
+    /// 已加载的第一方皮肤清单（验签 Trusted；名称 + 调色板）。
+    pub skins: Vec<LoadedSkin>,
+    /// 当前皮肤序号：0 = 终端原生，1..=skins.len() = 清单内皮肤。
+    pub skin_sel: usize,
+    /// 皮肤选择器弹窗开关。
+    pub skin_picker: bool,
+    /// 选择器内高亮序号（0 = 终端原生）。
+    pub skin_picker_sel: usize,
+    /// 打开选择器前的生效皮肤（Esc 取消时恢复）。
+    skin_prev: Option<Palette>,
+    /// 已装载的可视化面板插件清单（「可视化-*」前缀扫描，验签 Trusted）。
+    pub visual_plugins: Vec<tuneux_pinx::LoadedPlugin>,
+    /// 插件面板当前画面（每帧由插件 tick 产出；无插件 / 无画面时为空）。
+    pub visual_text: String,
     /// 音频引擎（后台解码 + 播放线程）。初始化失败为 None（播放不可用）。
     pub engine: Option<audio::Engine>,
     /// 文件浏览器（左侧面板）。
@@ -91,7 +107,7 @@ pub struct App {
     pub focus: playlist::Panel,
     /// 左侧面板状态（`b` 浏览器 / `c` 封面，二者互斥；隐藏时列表占满）。
     pub left_panel: LeftPanel,
-    /// 频谱显示模式（`v` 键切换：关 → 半屏 → 全屏 → 示波器 → 关）。
+    /// 频谱显示模式（`v` 键切换：关 → 半屏 → 全屏 → 示波器 → 插件面板 → 关）。
     pub spectrum_mode: SpectrumMode,
     /// 播放介质风格（`m` 键循环 / 菜单选择：无 → 4 磁带 → 4 黑胶 → 无）。
     /// 只作用于声音（corex DSP 修饰），不改变界面布局。
@@ -142,7 +158,7 @@ pub struct App {
     pub command_query: String,
     /// 菜单栏是否激活（数字 1-8 / F10 唤起，方向键/Enter 导航）。
     pub menu_active: bool,
-    /// 激活的顶级菜单下标（0-6）。
+    /// 激活的顶级菜单下标（0-7）。
     pub menu_top: usize,
     /// 当前顶级菜单的下拉是否展开。
     pub menu_dropdown: bool,
@@ -183,10 +199,6 @@ pub struct App {
     /// 书签跳转 CUE 分轨的瞬时偏移（秒，相对分轨头）：`jump_bookmark` 设置，
     /// `play_and_update_current` 的 CUE 分支消费（用后即清）；平时为 `None`。
     pub pending_cue_offset: Option<f64>,
-    /// 切曲生效守卫（剩余帧数）：发出 Play/PlayResume/Seek 后异步生效，期间
-    /// `engine.position()` 仍是旧值；守卫 >0 时主循环不做 CUE 终点判定，
-    /// 防止"点选更早分轨"被滞后 position 误判成连跳。
-    pub switch_guard: u32,
 }
 
 /// 官方（第一方）插件签名公钥（Ed25519，32 字节）：宿主内置的信任根。
@@ -199,10 +211,80 @@ const OFFICIAL_PUBKEY: [u8; 32] = [
     0x46, 0x56, 0x55, 0xda, 0x84, 0x58, 0xd9, 0xec, 0x3f, 0x4d, 0xa3, 0xb8, 0x4e, 0xb8, 0xcb, 0x29,
 ];
 
-/// 追加一条插件加载核查记录（首见判定：日志里是否已出现过该插件 id）。
+/// 把 KeyEvent 翻译为规范化键描述（与基础版 keys.rs 同源）。
+///
+/// 空值 = 不可自定义的键（F 键 / 方向外的功能键 / 修饰键本体）。
+/// 两侧（事件侧与配置侧）都经同一规范化再比较，容忍大小写、别名、
+/// 修饰符顺序等写法差异。
+fn key_to_desc(key: &KeyEvent) -> Option<String> {
+    // 先解出基础键名；空值 = 不可自定义的键
+    let base = match key.code {
+        KeyCode::Char(' ') => "space".to_string(),
+        KeyCode::Char(c) => {
+            // 字母 + SHIFT：统一小写，交给下方 shift+ 前缀（屏蔽终端大小写差异）
+            if key.modifiers.contains(KeyModifiers::SHIFT) && c.is_ascii_alphabetic() {
+                c.to_ascii_lowercase().to_string()
+            } else {
+                c.to_string()
+            }
+        }
+        KeyCode::Tab => "tab".to_string(),
+        KeyCode::Enter => "enter".to_string(),
+        KeyCode::Esc => "esc".to_string(),
+        KeyCode::Backspace => "backspace".to_string(),
+        KeyCode::Up => "up".to_string(),
+        KeyCode::Down => "down".to_string(),
+        KeyCode::Left => "left".to_string(),
+        KeyCode::Right => "right".to_string(),
+        KeyCode::Home => "home".to_string(),
+        KeyCode::End => "end".to_string(),
+        _ => return None,
+    };
+
+    // 前缀修饰符；符号键的 SHIFT 是"打出符号"本身，不计入前缀
+    let is_alpha = matches!(key.code, KeyCode::Char(c) if c.is_ascii_alphabetic());
+    let mut desc = String::new();
+    if is_alpha && key.modifiers.contains(KeyModifiers::SHIFT) {
+        desc.push_str("shift+");
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        desc.push_str("ctrl+");
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        desc.push_str("alt+");
+    }
+    desc.push_str(&base);
+    Some(desc)
+}
+/// 把按键事件翻译成自定义动作名：`KeyEvent → 键描述 → 反查 keymap`。
+///
+/// 两侧（事件侧与配置侧）都经 `parse_key_desc` 规范化后再比较，
+/// 容忍大小写、别名、修饰符顺序等写法差异。找不到返回 None。
+fn keycode_to_action<'a>(
+    key: &KeyEvent,
+    keymap: &'a std::collections::HashMap<String, String>,
+) -> Option<&'a str> {
+    let desc = key_to_desc(key)?;
+    keymap.iter().find_map(|(action, configured)| {
+        if crate::config::parse_key_desc(configured).as_deref() == Some(desc.as_str()) {
+            Some(action.as_str())
+        } else {
+            None
+        }
+    })
+}
+
+/// 追加一条插件加载核查记录（首见判定：日志里是否已出现过该 **log_id**）。
 /// 日志失败不阻断插件加载（核查日志是卫生措施，非功能门槛）。
+///
+/// `log_id` 必须**逐插件唯一**，且与插件的**签名 id 无关**：
+/// - 签名 id 参与 `id ‖ wasm 字节` 的验签消息，改动会让既有 `.sig` 全部失配，
+///   所以皮肤 / 可视化这类"一个 id 带多个插件"的族不能靠改签名 id 来区分；
+/// - 而核查日志是按 id 做子串匹配判首见的（`plugin={id} `），同一 id 下的
+///   第 2 个及以后的插件恒被判"已见过"，first_seen 语义失真。
+///   故此处传日志键（如 `tuneux-vis:可视化-能量条`），签名侧仍用族 id。
 fn record_plugin_load(
-    id: &str,
+    log_id: &str,
     tristate: tuneux_pinx::Tristate,
     granted: Vec<tuneux_pinx::Capability>,
 ) {
@@ -211,10 +293,11 @@ fn record_plugin_load(
         .map(|content| {
             content
                 .lines()
-                .any(|line| line.contains(&format!("plugin={id} ")))
+                .any(|line| line.contains(&format!("plugin={log_id} ")))
         })
         .unwrap_or(false);
-    let record = tuneux_pinx::journal::LoadRecord::now(id.to_string(), tristate, granted, !seen);
+    let record =
+        tuneux_pinx::journal::LoadRecord::now(log_id.to_string(), tristate, granted, !seen);
     let _ = journal.append(&record);
 }
 
@@ -305,23 +388,106 @@ fn load_comp_plugin(
     })
 }
 
-/// 加载第一方皮肤插件（能力 `theme`）：验签装载后执行 init，插件经
-/// theme_register 注册的皮肤文本解析为调色板（插件只供色）。
+/// 一份已加载的皮肤（名称 + 调色板）。
+pub struct LoadedSkin {
+    /// 皮肤名（皮肤文本 `name=` 键；缺省用文件名去前缀）。
+    pub name: String,
+    /// 解析出的调色板。
+    pub palette: Palette,
+}
+
+/// 加载全部第一方可视化面板插件（能力 `meter_read`）：扫描 plugins/ 下
+///「可视化-*」前缀的全部 .wasm，逐份验签（仅 Trusted 入清单）、init。
+/// 与皮肤同口径：文件缺失 / 验签非 Trusted / 解析失败 → 跳过（记核查日志）。
+/// 可视化插件不占效果器槽位（init 传 0）；tick 为可选导出。
+fn load_visual_plugins(engine: &audio::Engine) -> Vec<tuneux_pinx::LoadedPlugin> {
+    let allowed = [tuneux_pinx::Capability::MeterRead];
+    let dir = config::plugins_dir();
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| {
+                    let p = e.path();
+                    let stem = p.file_stem()?.to_str()?.to_owned();
+                    (p.extension()?.to_str()? == "wasm" && stem.starts_with("可视化-"))
+                        .then_some(stem)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    let mut out = Vec::new();
+    for file_stem in names {
+        let Some((mut plugin, granted)) =
+            load_first_party_core(engine, &file_stem, "tuneux-vis", Some(&allowed))
+        else {
+            continue;
+        };
+        if plugin.call_init(0).is_err() {
+            continue;
+        }
+        // 日志键带文件名（签名 id 仍是 "tuneux-vis"，见 record_plugin_load 说明）。
+        record_plugin_load(&format!("tuneux-vis:{file_stem}"), plugin.tristate, granted);
+        out.push(plugin);
+    }
+    out
+}
+
+/// 加载全部第一方皮肤插件（能力 `theme`）：扫描 plugins/ 下「皮肤-*」
+/// 前缀的全部 .wasm，逐份验签（仅 Trusted 入清单）、init 后经
+/// theme_register 取皮肤文本解析为调色板（插件只供色）。
 ///
 /// 能力面固定收紧为 `[theme]`——manifest 多声明的能力一律不授予（纵深
 /// 防御，与效果器插件的「清单声明即授予」口径不同）。任一文件缺失 /
-/// 验签非 Trusted / 解析失败 → None（回落内置主题，不阻断启动）。
-/// 加载成功即记核查日志（与均衡器 / 压缩器同口径）。
-/// 注意：第一方皮肤当前不随包分发（plugins/ 下无 skin.wasm）；此加载器
-/// 保留供将来接入，届时新增皮肤须用官方私钥签名（gen_signing_key 示例）。
-fn load_skin_palette(engine: &audio::Engine) -> Option<Palette> {
+/// 验签非 Trusted / 解析失败 → 跳过该份（记核查日志），不阻断启动。
+/// 清单按皮肤名排序；无皮肤文件时返回空清单（终端原生配色）。
+fn load_skin_palettes(engine: &audio::Engine) -> Vec<LoadedSkin> {
     let allowed = [tuneux_pinx::Capability::Theme];
-    let (mut plugin, granted) =
-        load_first_party_core(engine, "skin", "tuneux-skin", Some(&allowed))?;
-    plugin.call_init(0).ok()?;
-    record_plugin_load("tuneux-skin", plugin.tristate, granted);
-    let text = std::str::from_utf8(plugin.theme()?).ok()?;
-    Palette::from_skin(text)
+    let dir = config::plugins_dir();
+    // 收集「皮肤-*.wasm」文件名（排序保证清单顺序稳定）。
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| {
+                    let p = e.path();
+                    let stem = p.file_stem()?.to_str()?.to_owned();
+                    (p.extension()?.to_str()? == "wasm" && stem.starts_with("皮肤-"))
+                        .then_some(stem)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+
+    let mut out: Vec<LoadedSkin> = Vec::new();
+    for file_stem in names {
+        let Some((mut plugin, granted)) =
+            load_first_party_core(engine, &file_stem, "tuneux-skin", Some(&allowed))
+        else {
+            continue;
+        };
+        if plugin.call_init(0).is_err() {
+            continue;
+        }
+        // 同可视化插件：日志键带文件名，签名 id 保持 "tuneux-skin"。
+        record_plugin_load(
+            &format!("tuneux-skin:{file_stem}"),
+            plugin.tristate,
+            granted,
+        );
+        let Some(text) = plugin.theme().and_then(|b| std::str::from_utf8(b).ok()) else {
+            continue;
+        };
+        let Some(palette) = Palette::from_skin(text) else {
+            continue;
+        };
+        // 皮肤名：文本 name= 键优先，文件名去「皮肤-」前缀兜底。
+        let fallback = file_stem.trim_start_matches("皮肤-").to_string();
+        let name = crate::tui::theme::skin_name(text).unwrap_or(fallback);
+        out.push(LoadedSkin { name, palette });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
 }
 
 impl App {
@@ -367,9 +533,25 @@ impl App {
                 (Some(s), Some(p))
             })
             .unwrap_or((None, None));
-        // 加载第一方皮肤插件（能力 theme）：成功则覆盖内置主题。
-        // 皮肤文件缺失 / 验签失败时静默回落内置主题，不阻断启动。
-        let skin = engine.as_ref().and_then(load_skin_palette);
+        // 加载全部第一方皮肤插件（能力 theme）：plugins/ 下「皮肤-*」前缀扫描。
+        // 加载全部第一方可视化面板插件（能力 meter_read）：「可视化-*」前缀扫描。
+        let visual_plugins = engine.as_ref().map(load_visual_plugins).unwrap_or_default();
+        let skins = engine.as_ref().map(load_skin_palettes).unwrap_or_default();
+        // 皮肤选择：0 = 内置默认（DOS 风），1 = 终端原生，2.. = 皮肤清单。
+        let skin_sel = match config.skin.as_str() {
+            "" => 0,
+            "终端原生" => 1,
+            name => skins
+                .iter()
+                .position(|s| s.name == name)
+                .map(|i| i + 2)
+                .unwrap_or(0),
+        };
+        let skin = match skin_sel {
+            0 => None,
+            1 => Some(Palette::terminal()),
+            i => skins.get(i - 2).map(|s| s.palette),
+        };
         // 恢复播放列表持久化状态（独立文件）。
         let playlist_state = config::load_playlist_state();
 
@@ -386,7 +568,11 @@ impl App {
             }
             playlist.add(item.clone());
             if !metadata_cache.contains_key(&item.path) {
-                let md = TrackMetadata::from_file(&item.path);
+                let mut md = TrackMetadata::from_file(&item.path);
+                // 剥离封面原始字节（与热路径 media.rs 同口径）：from_file 会
+                // 填入内嵌封面或同目录约定图片——不剥离则同专辑每首各持一份
+                // 相同封面副本（2000 首 × 1MB cover.jpg ≈ 2 GB 重复字节）。
+                md.cover = None;
                 metadata_cache.insert(item.path.clone(), md);
             }
         }
@@ -417,8 +603,14 @@ impl App {
         let (add_load_tx, add_load_rx) = crossbeam_channel::unbounded();
 
         Self {
-            theme: config.theme,
             skin,
+            skins,
+            skin_sel,
+            skin_picker: false,
+            skin_picker_sel: 0,
+            skin_prev: None,
+            visual_plugins,
+            visual_text: String::new(),
             engine,
             browser: FsBrowser::open(&initial),
             dir_load_tx,
@@ -432,7 +624,13 @@ impl App {
             playlist,
             playlist_state,
             replay_gain_cache,
-            focus: playlist::Panel::Playlist,
+            // 浏览器可见时启动焦点落在浏览器（与 toggle_browser_panel 打开时
+            // 置焦点的口径一致）；隐藏/封面时焦点在播放列表。
+            focus: if config.left_panel == LeftPanel::Browser {
+                playlist::Panel::Browser
+            } else {
+                playlist::Panel::Playlist
+            },
             left_panel: config.left_panel,
             spectrum_mode: config.spectrum_mode,
             playback_medium: medium,
@@ -476,7 +674,6 @@ impl App {
             pending_clear: false,
             pending_clear_at: None,
             pending_cue_offset: None,
-            switch_guard: 0,
         }
     }
 
@@ -510,6 +707,39 @@ impl App {
             .retain(|k, _| keep.contains(k.as_path()));
     }
 
+    /// 执行一个自定义动作，返回 true 表示按键已被消费。
+    ///
+    /// 未知动作名返回 false，调用方据此回退到硬编码默认键。
+    pub(crate) fn execute_action(&mut self, action: &str, config: &mut Config) -> bool {
+        match action {
+            // toggle_play：与硬编码空格键分支等价
+            "toggle_play" => {
+                self.toggle_play();
+                true
+            }
+            // next / prev：复用既有切曲函数（与硬编码 n / p 同路径）
+            "next" => {
+                self.advance_to_next_track(config);
+                true
+            }
+            "prev" => {
+                self.advance_to_prev_track(config);
+                true
+            }
+            // volume_up / volume_down：与硬编码 + / - 分支等价
+            "volume_up" => {
+                self.volume_up();
+                true
+            }
+            "volume_down" => {
+                self.volume_down();
+                true
+            }
+            // 未知动作名：忽略，回退默认键
+            _ => false,
+        }
+    }
+
     /// 处理一个按键事件；返回 false 表示请求退出。
     ///
     /// 基础层键位与 tuneux 一致；面板开合（b/c/v/l）、搜索（/）、
@@ -523,6 +753,46 @@ impl App {
         // —— 关于弹窗（最优先：任意键关闭并吃掉，避免误触发其它操作）——
         if self.about_visible {
             self.about_visible = false;
+            return true;
+        }
+
+        // —— 皮肤选择器（↑/↓ 即时预览、Enter 确认并持久化、Esc 取消恢复）——
+        if self.skin_picker {
+            let count = self.skins.len() + 2; // +2 = 内置默认 / 终端原生
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.skin_picker_sel = self.skin_picker_sel.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.skin_picker_sel + 1 < count {
+                        self.skin_picker_sel += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    self.skin_sel = self.skin_picker_sel;
+                    config.skin = match self.skin_sel {
+                        0 => String::new(),
+                        1 => "终端原生".to_string(),
+                        i => self.skins[i - 2].name.clone(),
+                    };
+                    config::save(config);
+                    self.skin_prev = None;
+                    self.skin_picker = false;
+                }
+                KeyCode::Esc => {
+                    self.skin = self.skin_prev.take();
+                    self.skin_picker = false;
+                }
+                _ => {}
+            }
+            // 即时预览：弹窗仍开时，高亮项即为生效调色板。
+            if self.skin_picker {
+                self.skin = match self.skin_picker_sel {
+                    0 => None,
+                    1 => Some(Palette::terminal()),
+                    i => self.skins.get(i - 2).map(|s| s.palette),
+                };
+            }
             return true;
         }
 
@@ -568,17 +838,39 @@ impl App {
             return true;
         }
 
-        // —— 菜单唤起：数字 1-8 直接打开对应栏下拉；F10 打开第一栏 ——
-        // （macOS 的 F 键被系统占用需按 Fn，数字键三平台直接可用）
+        // —— 菜单唤起：F10 打开第一栏（F10 不在 keymap 可配置键内，恒保留）——
         if key.code == KeyCode::F(10) {
             self.menu_active = true;
             self.menu_top = 0;
             self.menu_dropdown = false;
             return true;
         }
+
+        // —— 自定义键映射层（配置驱动，优先于下方硬编码默认键与数字菜单）——
+        // KeyEvent → 键描述 → 反查 keymap：命中且为已知动作则执行并返回；
+        // 未命中或动作未知则回退到下方默认键逻辑。
+        // 置于数字菜单唤起之前：用户把数字键映射为动作时，配置必须生效
+        //（修复：此前数字 1-8 被菜单拦截先于本层，数字键映射永不生效且无警告）。
+        if let Some(action) = keycode_to_action(&key, &config.keymap) {
+            // 先复制出动作名，断开对 config 的不可变借用，便于下方可变借用
+            let action = action.to_string();
+            if self.execute_action(&action, config) {
+                return true;
+            }
+            // 未知动作名：忽略该映射，继续走默认键
+        }
+
+        // —— 菜单唤起：数字 1-8 直接打开对应栏下拉 ——
+        // （macOS 的 F 键被系统占用需按 Fn，数字键三平台直接可用）
+        // 与其他字符键同规则：带 CTRL/ALT 修饰不响应（Alt+数字在部分终端
+        // 是 ESC 序列；Ctrl+数字不应触发界面动作）。
         if let KeyCode::Char(c) = key.code {
-            // 数字 1-N 直接打开对应栏下拉（按菜单栏数字一一对应；越界数字忽略）。
-            if c.is_ascii_digit() && c != '0' {
+            if c.is_ascii_digit()
+                && c != '0'
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
                 let idx = (c as u8 - b'1') as usize;
                 if idx < menus().len() {
                     self.menu_active = true;
@@ -590,8 +882,8 @@ impl App {
             }
         }
 
-        // 其余字符键要求无 CTRL/ALT 修饰：避免 Ctrl+Q / Alt+N 等误触，
-        // 也为扩展层组合键留出空间。
+        // 其余字符键要求无 CTRL/ALT 修饰：避免 Ctrl+Q / Alt+N 等误触
+        //（显式配置的映射已在上方反查层放行）。
         if matches!(key.code, KeyCode::Char(_))
             && key
                 .modifiers
@@ -603,11 +895,6 @@ impl App {
         // —— 全局键（不受焦点影响）——
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => return false,
-            // 扩展层：F2 配色切换
-            KeyCode::F(2) => {
-                self.cycle_theme(config);
-                return true;
-            }
             KeyCode::Tab => {
                 // Tab 在已开启的可导航面板间切换：浏览器仅在左侧面板为
                 // Browser 时可聚焦；歌词/频谱/封面为展示面板不可聚焦。
@@ -739,12 +1026,7 @@ impl App {
                 self.command_query.clear();
                 return true;
             }
-            // F1 帮助（= 关于弹窗）。
-            KeyCode::F(1) => {
-                self.about_visible = true;
-                return true;
-            }
-            // F5-F8：面板开合兜底（对应 b/c/l/v）。F2 配色已在上方；F10 菜单后续。
+            // F5-F8：面板开合兜底（对应 b/c/l/v）。F10 菜单见菜单分支。
             KeyCode::F(5) => {
                 self.toggle_browser_panel(config);
                 return true;
@@ -759,17 +1041,6 @@ impl App {
             }
             KeyCode::F(8) => {
                 self.toggle_spectrum_panel(config);
-                return true;
-            }
-            // F3/F4：进入命令模式并预填 open-file / open-dir，用户补全路径回车执行。
-            KeyCode::F(3) => {
-                self.command_mode = true;
-                self.command_query = "open-file ".to_string();
-                return true;
-            }
-            KeyCode::F(4) => {
-                self.command_mode = true;
-                self.command_query = "open-dir ".to_string();
                 return true;
             }
             KeyCode::F(9) => {
@@ -816,6 +1087,11 @@ impl App {
                     self.search_query.clear();
                     self.jump_selected_to_filter_first();
                 }
+                // 返回浏览器——仅浏览器可见时（与 Tab / 基础版同款守卫）：
+                // 左面板隐藏/封面时不响应，避免焦点落进不可见面板。
+                KeyCode::Backspace if self.left_panel == LeftPanel::Browser => {
+                    self.focus = playlist::Panel::Browser;
+                }
                 KeyCode::Enter => match self.playlist.selected().cloned() {
                     // 选中专辑组头：折叠/展开该专辑（ByAlbum 视图）。
                     Some(playlist::Selection::Album(album)) => {
@@ -825,7 +1101,14 @@ impl App {
                         self.playlist.jump_to(sel);
                         self.play_and_update_current(sel, config);
                     }
-                    None => {}
+                    None => {
+                        // 无选中但列表非空：播第一首（与基础版同口径——
+                        // 无选中按 Enter 的用户意图就是开始播，不留死键）。
+                        if !self.playlist.is_empty() {
+                            self.playlist.jump_to(0);
+                            self.play_and_update_current(0, config);
+                        }
+                    }
                 },
                 _ => {}
             },
@@ -878,15 +1161,6 @@ impl App {
     pub(crate) fn flash_message(&mut self, msg: &str) {
         self.last_error = Some(msg.to_string());
         self.last_error_at = Some(Instant::now());
-    }
-
-    /// 切换配色主题并持久化到配置。
-    fn cycle_theme(&mut self, config: &mut Config) {
-        self.theme = match self.theme {
-            Theme::Dos => Theme::Clean,
-            Theme::Clean => Theme::Dos,
-        };
-        config.theme = self.theme;
     }
 
     /// b / F5：Hidden ↔ Browser（互斥：开浏览器会关掉封面）。
@@ -975,7 +1249,7 @@ impl App {
         config.lyrics_mode = self.lyrics_mode;
     }
 
-    /// v / F8：循环频谱模式（关 → 半屏 → 全屏 → 示波器 → 关）。
+    /// v / F8：循环频谱模式（关 → 半屏 → 全屏 → 示波器 → 插件面板 → 关）。
     fn toggle_spectrum_panel(&mut self, config: &mut Config) {
         self.spectrum_mode = self.spectrum_mode.next();
         config.spectrum_mode = self.spectrum_mode;
@@ -1006,7 +1280,7 @@ impl App {
 
     /// 执行一条命令（首版内置少量命令，框架供后续插件注册扩展）。
     ///
-    /// 支持：`quit` 退出；`volume <0-100>` 设音量；`theme` 切配色；
+    /// 支持：`quit` 退出；`volume <0-100>` 设音量；
     /// `repeat <off|list|single>` 循环模式；`save-m3u`/`load-m3u [path]` 保存/载入
     /// m3u 播放列表；`help` 打开关于/帮助。
     /// 未知命令走 last_error 提示。
@@ -1038,10 +1312,6 @@ impl App {
                 } else {
                     self.flash_message("用法：volume <0-100>");
                 }
-            }
-            "theme" => {
-                self.cycle_theme(config);
-                self.flash_message("配色已切换");
             }
             "repeat" => match parts.next().map(|s| s.to_lowercase()).as_deref() {
                 Some("off") => {
@@ -1077,31 +1347,6 @@ impl App {
                 match self.load_m3u(&path, config) {
                     Ok(n) => self.flash_message(&format!("已载入 {n} 首")),
                     Err(e) => self.flash_message(&format!("载入失败：{e}")),
-                }
-            }
-            "open-file" | "open" => {
-                // 路径允许空格：取命令名之后的所有内容作为路径。
-                let path_str = line
-                    .split_once(char::is_whitespace)
-                    .map(|(_, rest)| rest)
-                    .unwrap_or("")
-                    .trim();
-                if path_str.is_empty() {
-                    self.flash_message("用法：open-file <文件路径>");
-                } else {
-                    self.open_file(&PathBuf::from(path_str), config);
-                }
-            }
-            "open-dir" => {
-                let path_str = line
-                    .split_once(char::is_whitespace)
-                    .map(|(_, rest)| rest)
-                    .unwrap_or("")
-                    .trim();
-                if path_str.is_empty() {
-                    self.flash_message("用法：open-dir <目录路径>");
-                } else {
-                    self.open_dir(&PathBuf::from(path_str));
                 }
             }
             "bookmark" | "bm" => self.add_bookmark(),
@@ -1152,8 +1397,15 @@ impl App {
                     self.menu_active = false; // 退出菜单栏
                 }
             }
-            // 数字 1-N 直接跳到对应栏并展开下拉（与菜单栏数字一一对应）。
-            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+            // 数字 1-N 直接跳到对应栏并展开下拉（与菜单栏数字一一对应）；
+            // 与主分派同规则：带 CTRL/ALT 修饰不响应。
+            KeyCode::Char(c)
+                if c.is_ascii_digit()
+                    && c != '0'
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
                 let idx = (c as u8 - b'1') as usize;
                 if idx < ms.len() {
                     self.menu_top = idx;
@@ -1193,6 +1445,14 @@ impl App {
                 }
             }
             KeyCode::Enter => {
+                // F10 唤起菜单栏但未展开下拉时，Enter 不应执行任何动作
+                //（menu_item 初始为 0 且 F10/←→ 不复位——旧缺陷：F10 → Enter
+                // 直接盲执行第 0 项，而文件菜单第 0 项就是「退出」）。
+                if !self.menu_dropdown {
+                    self.menu_dropdown = true;
+                    self.menu_item = 0;
+                    return true;
+                }
                 let item = ms[self.menu_top].items.get(self.menu_item).cloned();
                 self.menu_active = false;
                 self.menu_dropdown = false;
@@ -1237,10 +1497,7 @@ impl App {
                 self.playlist.toggle_view();
                 config.playlist_view = self.playlist.view();
             }
-            MenuAction::Theme => {
-                self.cycle_theme(config);
-            }
-            MenuAction::Help | MenuAction::About => {
+            MenuAction::About => {
                 self.about_visible = true;
             }
             // 输出设备：corex 已自动跟随系统默认输出（无需手动），这里给出说明。
@@ -1257,6 +1514,12 @@ impl App {
                 let state = if config.replay_gain { "已开启" } else { "已关闭" };
                 self.flash_message(&format!("ReplayGain 响度归一：{state}"));
             }
+            // 皮肤配色：打开选择器（↑/↓ 即时预览、Enter 确认并持久化、Esc 取消恢复）。
+            MenuAction::SkinSelect => {
+                self.skin_prev = self.skin;
+                self.skin_picker_sel = self.skin_sel;
+                self.skin_picker = true;
+            }
             // 均衡器：切换面板（Esc 关闭）。插件加载失败时面板内提示。
             MenuAction::Equalizer => self.eq_visible = !self.eq_visible,
             // 压缩器：切换面板（Esc 关闭）。
@@ -1264,13 +1527,14 @@ impl App {
             // 插件菜单的清单项：同样打开对应面板（√ 已表示加载态）。
             MenuAction::PluginEq => self.eq_visible = !self.eq_visible,
             MenuAction::PluginComp => self.comp_visible = !self.comp_visible,
-            MenuAction::OpenFile => {
-                self.command_mode = true;
-                self.command_query = "open-file ".to_string();
-            }
-            MenuAction::OpenDir => {
-                self.command_mode = true;
-                self.command_query = "open-dir ".to_string();
+            // 可视化面板：直接切到频谱 v 循环的「插件」态；无可视化插件时提示。
+            MenuAction::PluginVisual => {
+                if self.visual_plugins.is_empty() {
+                    self.flash_message("无可视化插件（plugins/ 下放「可视化-*」插件并重启）");
+                } else {
+                    self.spectrum_mode = crate::config::SpectrumMode::Plugin;
+                    config.spectrum_mode = self.spectrum_mode;
+                }
             }
             // 介质：菜单显式选择（与 m 键循环同一落地函数）。
             MenuAction::SetMedium(m) => self.apply_medium(m, config),
@@ -1392,13 +1656,17 @@ impl App {
             _ => 1.0,  // 补偿 dB
         };
         let sign = if up { 1.0 } else { -1.0 };
+        // setter 返回"是否接受"：只有非有限值（NaN/Inf）会被拒返回 false，
+        // 有限值一律接受返回 true（越界只是钳到边界，仍算接受）。此处步进的
+        // 基准值取自既有参数（恒有限），加减一个有限步长后仍有限，
+        // 故返回值必然为 true，无需检查。
         match self.comp_param_sel {
             0 => p.set_threshold(p.threshold() + sign * step),
             1 => p.set_ratio(p.ratio() + sign * step),
             2 => p.set_attack_ms(p.attack_ms() + sign * step),
             3 => p.set_release_ms(p.release_ms() + sign * step),
             _ => p.set_makeup(p.makeup() + sign * step),
-        }
+        };
     }
 
     /// 切换压缩器旁路。
@@ -1437,8 +1705,33 @@ impl App {
             fs_browser::Entry::File { path, .. } => {
                 let was_empty = self.playlist.is_empty();
                 let path = path.clone();
+                // .cue 文件：按 FILE 引用展开分轨（cue+bin / cue+flac 镜像场景）。
+                if fs_browser::is_cue_file(&path) {
+                    match cue::cue_items_from_cue_file(&path) {
+                        Some((items, skipped, _)) => {
+                            if skipped > 0 {
+                                self.flash_message(&format!(
+                                    "已跳过 {skipped} 条数据轨（不可播放）"
+                                ));
+                            }
+                            if config.dedup_on_add {
+                                self.playlist.add_many_dedup(items);
+                            } else {
+                                self.playlist.add_many(items);
+                            }
+                        }
+                        None => {
+                            self.flash_message("cue 解析失败或 FILE 引用的音频文件不存在");
+                            return;
+                        }
+                    }
+                    return;
+                }
                 // 整轨 + 同名 .cue → 展开为多首 CUE 曲目；否则按普通文件加入。
-                let expanded = self.cue_items_for(&path);
+                let (expanded, skipped) = self.cue_items_for(&path);
+                if skipped > 0 {
+                    self.flash_message(&format!("已跳过 {skipped} 条数据轨（不可播放）"));
+                }
                 if !expanded.is_empty() {
                     // CUE 分轨按 (path, cue.index) 判定唯一性。
                     if config.dedup_on_add {
@@ -1477,7 +1770,7 @@ impl App {
         }
     }
 
-    /// 异步递归收集目录并构建播放列表条目（`a` 键加目录 / open-dir 用）：
+    /// 异步递归收集目录并构建播放列表条目（`a` 键加目录用）：
     /// 后台线程完成目录遍历、CUE 展开与逐文件元数据探测（重活全在后台，
     /// 元数据缓存优先——与同步路径同口径），结果由主循环轮询后经
     /// [`App::apply_dir_add`] 批量合入。大目录加入不再卡 UI。
@@ -1492,11 +1785,11 @@ impl App {
             .spawn(move || {
                 let mut paths = Vec::new();
                 FsBrowser::collect_music_recursive(&dir, &mut paths);
-                let (mut items, mds) = cue::build_items_for_paths(&paths, &cache);
+                let (mut items, mds, skipped) = cue::build_items_for_paths(&paths, &cache);
                 // 按"专辑-曲序"预排序：让新增批次的插入序 = 显示序，
                 // 添加目录后自动播放/选中的第一首就是专辑-曲序的第一首。
                 Playlist::sort_items(&mut items);
-                let _ = tx.send((dir, items, mds));
+                let _ = tx.send((dir, items, mds, skipped));
             })
             .is_err()
         {
@@ -1512,8 +1805,14 @@ impl App {
         dir: PathBuf,
         items: Vec<playlist::PlaylistItem>,
         mds: Vec<(PathBuf, TrackMetadata)>,
+        skipped_data_tracks: usize,
         config: &Config,
     ) {
+        if skipped_data_tracks > 0 {
+            self.flash_message(&format!(
+                "已跳过 {skipped_data_tracks} 条数据轨（不可播放）"
+            ));
+        }
         let was_empty = self.playlist.is_empty();
         let before = self.playlist.len();
         let empty_dir = items.is_empty();
@@ -1568,8 +1867,10 @@ impl App {
     /// 把一批文件路径加入播放列表（整轨 + 同名 .cue 展开分轨，其余按普通文件）。
     fn add_files_to_playlist(&mut self, paths: &[std::path::PathBuf], config: &mut Config) {
         let mut items: Vec<playlist::PlaylistItem> = Vec::new();
+        let mut skipped_total = 0usize;
         for p in paths {
-            let expanded = self.cue_items_for(p);
+            let (expanded, skipped) = self.cue_items_for(p);
+            skipped_total += skipped;
             if !expanded.is_empty() {
                 items.extend(expanded);
             } else {
@@ -1582,51 +1883,14 @@ impl App {
                 });
             }
         }
+        if skipped_total > 0 {
+            self.flash_message(&format!("已跳过 {skipped_total} 条数据轨（不可播放）"));
+        }
         if config.dedup_on_add {
             self.playlist.add_many_dedup(items);
         } else {
             self.playlist.add_many(items);
         }
-    }
-
-    /// 打开单个文件：加入播放列表并立即播放（整轨 + 同名 .cue 自动分轨）。
-    fn open_file(&mut self, path: &std::path::Path, config: &mut Config) {
-        if !path.is_file() {
-            self.flash_message(&format!("不是文件：{}", path.display()));
-            return;
-        }
-        // 去重命中（dedup_on_add 且文件已在列表）：定位并立即播放，而非提示"未能加入"。
-        if config.dedup_on_add {
-            if let Some(idx) = self
-                .playlist
-                .items()
-                .iter()
-                .position(|it| it.path.as_path() == path)
-            {
-                self.playlist.jump_to(idx);
-                self.play_and_update_current(idx, config);
-                return;
-            }
-        }
-        let before = self.playlist.items().len();
-        self.add_files_to_playlist(std::slice::from_ref(&path.to_path_buf()), config);
-        if self.playlist.items().len() == before {
-            self.flash_message(&format!("未能加入：{}", path.display()));
-            return;
-        }
-        // 手动点选播放：压入 history，使 p 键能回到打开前的曲目。
-        self.playlist.jump_to(before);
-        self.play_and_update_current(before, config);
-    }
-
-    /// 打开目录：后台递归收集并加入播放列表（结果经主循环合入，
-    /// 完成时提示加入数量；扫描期间提示「正在扫描」）。
-    fn open_dir(&mut self, path: &std::path::Path) {
-        if !path.is_dir() {
-            self.flash_message(&format!("不是目录：{}", path.display()));
-            return;
-        }
-        self.add_dir_async(path.to_path_buf());
     }
 
     /// 收集封面浏览的专辑列表：去重的 (专辑名, 代表曲目路径)。
@@ -1661,7 +1925,8 @@ impl App {
         Ok(paths.len())
     }
 
-    /// 从 m3u 加载路径加入播放列表。返回载入的路径数。
+    /// 从 m3u 加载路径加入播放列表。返回实际加入的条目数
+    ///（去重开启时可能小于路径数——提示按实际加入数显示）。
     fn load_m3u(&mut self, path: &std::path::Path, config: &mut Config) -> Result<usize, String> {
         let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         let paths = tuneux_mediax::m3u::parse(&content);
@@ -1680,8 +1945,10 @@ impl App {
                 }
             })
             .collect();
+        let before = self.playlist.len();
         self.add_files_to_playlist(&resolved, config);
-        Ok(resolved.len())
+        let added = self.playlist.len() - before;
+        Ok(added)
     }
     /// 给当前曲目加书签（记录路径 + 位置 + 标签）。同曲重复加则更新位置。
     /// 在播 CUE 分轨时记分轨书签（cue 起点 + 分轨内偏移）：跳转才能定位到
@@ -1697,6 +1964,13 @@ impl App {
             .and_then(|i| self.playlist.items().get(i))
             .and_then(|it| it.cue.as_ref().map(|c| c.start_ms));
         let pos = self.engine.as_ref().map(|e| e.position()).unwrap_or(0.0);
+        // CUE 分轨书签存分轨内相对偏移（书签契约：position_secs 相对分轨开头）；
+        // 引擎 position() 返回整轨绝对位置，须减去分轨起点，否则跳转会双重
+        // 计入起点而落到错误位置。
+        let pos = match cue_start_ms {
+            Some(cs) => (pos - cs as f64 / 1000.0).max(0.0),
+            None => pos,
+        };
         let label = self
             .current_metadata
             .as_ref()
@@ -1753,12 +2027,15 @@ impl App {
             i
         } else {
             self.add_files_to_playlist(std::slice::from_ref(&b.path), config);
-            match self
-                .playlist
-                .items()
-                .iter()
-                .position(|it| it.path == b.path)
-            {
+            // 兼容路径也要按 cue 起点匹配（CUE 文件展开为多条分轨，仅按 path
+            // 搜会命中第一条分轨而非书签所在分轨）。
+            match self.playlist.items().iter().position(|it| {
+                it.path == b.path
+                    && match b.cue_start_ms {
+                        Some(cs) => it.cue.as_ref().is_some_and(|c| c.start_ms == cs),
+                        None => true,
+                    }
+            }) {
                 Some(i) => i,
                 None => {
                     self.flash_message("书签文件不存在");
@@ -1825,23 +2102,80 @@ impl App {
             }
         } else if let Some(fs_browser::Entry::File { path, .. }) = self.browser.current() {
             let path = path.clone();
+            // .cue 文件：按 FILE 引用展开分轨并播放第一轨（镜像场景入口）。
+            if fs_browser::is_cue_file(&path) {
+                match cue::cue_items_from_cue_file(&path) {
+                    Some((items, skipped, audio_path)) => {
+                        if skipped > 0 {
+                            self.flash_message(&format!("已跳过 {skipped} 条数据轨（不可播放）"));
+                        }
+                        // 记下第一轨起点：去重全命中时据此定位「第一曲」
+                        //（CUE 同 path，不能只按 path 定位，否则命中任意分轨）。
+                        let first_start_ms = items
+                            .first()
+                            .and_then(|it| it.cue.as_ref().map(|c| c.start_ms));
+                        let start_idx = self.playlist.items().len();
+                        if config.dedup_on_add {
+                            self.playlist.add_many_dedup(items);
+                        } else {
+                            self.playlist.add_many(items);
+                        }
+                        // 播放首个加入的分轨；全部去重命中时按「path + 第一轨起点」定位。
+                        let play_idx = if start_idx < self.playlist.items().len() {
+                            start_idx
+                        } else {
+                            self.playlist
+                                .items()
+                                .iter()
+                                .position(|it| {
+                                    it.path == audio_path
+                                        && first_start_ms.is_some_and(|ms| {
+                                            it.cue.as_ref().map(|c| c.start_ms) == Some(ms)
+                                        })
+                                })
+                                .unwrap_or(0)
+                        };
+                        self.playlist.jump_to(play_idx);
+                        self.play_and_update_current(play_idx, config);
+                    }
+                    None => {
+                        self.flash_message("cue 解析失败或 FILE 引用的音频文件不存在");
+                    }
+                }
+                if was_searching {
+                    self.exit_browser_search();
+                }
+                return;
+            }
             // 整轨 + 同名 .cue → 展开为多首 CUE 曲目，加入并播放本整轨第一曲。
-            let expanded = self.cue_items_for(&path);
+            let (expanded, skipped) = self.cue_items_for(&path);
+            if skipped > 0 {
+                self.flash_message(&format!("已跳过 {skipped} 条数据轨（不可播放）"));
+            }
             if !expanded.is_empty() {
+                // 记下第一轨起点：去重全命中时据此定位「第一曲」（同 path 多分轨）。
+                let first_start_ms = expanded
+                    .first()
+                    .and_then(|it| it.cue.as_ref().map(|c| c.start_ms));
                 let start_idx = self.playlist.items().len();
                 if config.dedup_on_add {
                     self.playlist.add_many_dedup(expanded);
                 } else {
                     self.playlist.add_many(expanded);
                 }
-                // 播放首个加入的分轨；若全部去重命中，则按 path 定位第一曲。
+                // 播放首个加入的分轨；若全部去重命中，则按「path + 第一轨起点」定位。
                 let play_idx = if start_idx < self.playlist.items().len() {
                     start_idx
                 } else {
                     self.playlist
                         .items()
                         .iter()
-                        .position(|it| it.path == path)
+                        .position(|it| {
+                            it.path == path
+                                && first_start_ms.is_some_and(|ms| {
+                                    it.cue.as_ref().map(|c| c.start_ms) == Some(ms)
+                                })
+                        })
                         .unwrap_or(0)
                 };
                 self.playlist.jump_to(play_idx);
@@ -1937,7 +2271,43 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::OFFICIAL_PUBKEY;
+    use super::{keycode_to_action, OFFICIAL_PUBKEY};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// 自定义键映射：命中返回动作名、未命中 None、不可自定义键 None
+    ///（回退默认键）。配置写法差异（大小写 / 修饰符顺序）经规范化对齐。
+    #[test]
+    fn keymap_custom_binding_hit_and_miss() {
+        let mut km = std::collections::HashMap::new();
+        km.insert("toggle_play".to_string(), "ctrl+p".to_string());
+        let hit = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        assert_eq!(keycode_to_action(&hit, &km), Some("toggle_play"));
+        let miss = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(keycode_to_action(&miss, &km), None);
+        // F 键不可自定义（不在 key_to_desc 白名单）→ None
+        let f5 = KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE);
+        assert_eq!(keycode_to_action(&f5, &km), None);
+    }
+
+    /// 分轨书签存取往返：存储时从引擎绝对位置减去分轨起点（相对偏移），
+    /// 跳转时再由 cue 起点 + 偏移起播——往返必须落回原位（防双重计入起点）。
+    #[test]
+    fn cue_bookmark_position_roundtrip() {
+        // 分轨 2：整轨起点 60s；播放到整轨 75s 处打书签。
+        let cue_start_ms = 60_000u64;
+        let engine_pos = 75.0; // 引擎返回整轨绝对位置
+                               // 存储换算（add_bookmark 口径）：相对偏移 15s。
+        let stored = (engine_pos - cue_start_ms as f64 / 1000.0).max(0.0);
+        assert_eq!(stored, 15.0);
+        // 书签层往返（契约：分轨书签 position_secs 相对分轨开头）。
+        let mut list = tuneux_mediax::bookmark::BookmarkList::default();
+        let path = std::path::Path::new("/music/album.cue");
+        assert!(list.add(path, Some(cue_start_ms), stored, "分轨2"));
+        let b = &list.items[0];
+        // 消费换算（jump_bookmark → 播放分支口径）：cue 起点 + 偏移起播。
+        let jump_secs = b.cue_start_ms.unwrap() as f64 / 1000.0 + b.position_secs;
+        assert_eq!(jump_secs, 75.0, "往返必须落回整轨 75s（双重计入会得 135s）");
+    }
 
     /// 校验某个第一方插件：官方公钥验签 committed 的 .sig 必须匹配 committed 的 .wasm。
     /// 防止「wasm 改动后忘记重新签名」导致插件在用户处被静默降级/加载失败。
@@ -1960,5 +2330,41 @@ mod tests {
     fn first_party_plugins_are_officially_signed() {
         assert_officially_signed("equalizer", "tuneux-eq");
         assert_officially_signed("compressor", "tuneux-comp");
+        assert_officially_signed("皮肤-Norton蓝", "tuneux-skin");
+        assert_officially_signed("皮肤-午夜蓝", "tuneux-skin");
+    }
+
+    #[test]
+    fn skin_plugin_registers_parseable_theme() {
+        // 用随包的「皮肤-Norton蓝.wasm」验证：init 经 theme_register 注册的皮肤
+        // 文本可解析为调色板（无签名仅影响三态、不影响主题捕获，故不依赖官方私钥）。
+        let base = format!("{}/../../plugins/皮肤-Norton蓝", env!("CARGO_MANIFEST_DIR"));
+        let wasm = std::fs::read(format!("{base}.wasm")).expect("读取皮肤 wasm 失败");
+        let eq_slots: [std::sync::Arc<tuneux_corex::EqParams>; tuneux_corex::EQ_SLOTS] =
+            std::array::from_fn(|_| std::sync::Arc::new(tuneux_corex::EqParams::new()));
+        let comp_slots: [std::sync::Arc<tuneux_corex::CompressorParams>; tuneux_corex::COMP_SLOTS] =
+            std::array::from_fn(|_| std::sync::Arc::new(tuneux_corex::CompressorParams::new()));
+        let host = tuneux_pinx::WasmHost::new(100_000, 4, eq_slots, comp_slots);
+        let mut plugin = host
+            .load(
+                &wasm,
+                "tuneux-skin",
+                None,
+                &tuneux_pinx::TrustList::default(),
+                &[tuneux_pinx::Capability::Theme],
+                &[tuneux_pinx::Capability::Theme],
+            )
+            .expect("皮肤插件应加载成功");
+        plugin.call_init(0).expect("init 应执行成功");
+        let text =
+            std::str::from_utf8(plugin.theme().expect("应注册皮肤")).expect("皮肤文本应为 UTF-8");
+        let pal = crate::tui::theme::Palette::from_skin(text).expect("皮肤应可解析");
+        // 断言值跟随当前随包皮肤（Norton 蓝）：换皮肤时同步改这里。
+        assert_eq!(pal.bg, Some(ratatui::style::Color::Rgb(0x00, 0x00, 0xaa)));
+        assert_eq!(
+            pal.border,
+            Some(ratatui::style::Color::Rgb(0x55, 0xff, 0xff))
+        );
+        assert_eq!(pal.border_type, ratatui::widgets::BorderType::Double);
     }
 }

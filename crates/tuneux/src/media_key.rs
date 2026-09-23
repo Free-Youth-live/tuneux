@@ -8,7 +8,7 @@
 //!   Wayland/X11 均适用，无需窗口。
 //! - **Windows**：`rdev` crate（MIT）装 `WH_KEYBOARD_LL` 低层键盘钩子
 //!   （无窗口、无消息泵、我方零 unsafe），捕获裸媒体键后经通道投递；
-//!   二期可加 souvlaki + winit 隐藏窗口（SMTC）根治与其他播放器的抢占。
+//!   后续可加 souvlaki + winit 隐藏窗口（SMTC）根治与其他播放器的抢占。
 //! - **macOS**：Now Playing 需要 app bundle，TUI 无 bundle，暂不实现。
 //!
 //! 事件经 crossbeam-channel 投递到 TUI 主循环，主循环每帧 poll。

@@ -137,15 +137,14 @@ impl App {
             None => {
                 // 解码失败：记入负缓存（本曲不再重试），并经 UI 提示一次（自动过期）。
                 self.cover_failed_path = Some(path);
-                self.last_error = Some("封面解码失败（已跳过）".to_string());
-                self.last_error_at = Some(std::time::Instant::now());
+                self.flash_message("封面解码失败（已跳过）");
                 None
             }
         }
     }
 
     /// 确保当前曲目封面面板缩略图已就绪（按路径 + 目标像素区缓存，命中跳过 resize）。
-    /// 每帧只做一次键比较，不再逐帧 resize_exact + to_rgba8（回灌 fx）。
+    /// 每帧只做一次键比较，不再逐帧 resize_exact + to_rgba8。
     pub fn ensure_cover_thumb(&mut self, pixel_w: u32, pixel_h: u32) {
         let Some(path) = self.current_path.clone() else {
             return;

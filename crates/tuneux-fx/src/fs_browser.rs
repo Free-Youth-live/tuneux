@@ -34,9 +34,7 @@
 //! 实现上用 `OsStr::to_str()`（返回 `Option`，严格判定）而非
 //! `to_string_lossy()`（容忍替换成占位符），从源头杜绝乱码。
 
-// 本模块与基础版 fs_browser 同源，本产品线已异步化导航并抽取 compute_entries；
-// 尚未接入或不启用的公开接口，临时豁免 dead_code 警告。
-#![allow(dead_code)]
+// 本模块与基础版 fs_browser 同源，本产品线已异步化导航并抽取 compute_entries。
 use std::path::{Path, PathBuf};
 
 /// tuneux 认识的音乐文件扩展名（小写，不含点），清单由内核统一维护
@@ -49,7 +47,8 @@ pub use tuneux_corex::KNOWN_AUDIO_EXTS as SUPPORTED_EXTS;
 /// 判断依据仅看扩展名（不读文件头），原因：
 /// - 速度快——浏览器要在用户每次进入目录时即时列出，读文件头会有可感延迟；
 /// - symphonia 解码时会再次校验真实格式，扩展名误判不会导致崩溃，
-///   顶多播放时报错，影响可控。
+///   顶多播放时报错，影响可控。另放行 `.cue` 分轨索引文件（cue+bin /
+///   cue+flac 镜像场景的入口，点中后按 FILE 引用展开分轨）。
 ///
 /// 路径无扩展名或扩展名不在支持列表中，均返回 false。
 pub fn is_supported(path: &Path) -> bool {
@@ -57,10 +56,17 @@ pub fn is_supported(path: &Path) -> bool {
         // extension() 返回 OsStr，转成小写 Unicode 再比对
         Some(ext) => {
             let ext_lower = ext.to_string_lossy().to_lowercase();
-            SUPPORTED_EXTS.contains(&ext_lower.as_str())
+            SUPPORTED_EXTS.contains(&ext_lower.as_str()) || ext_lower == "cue"
         }
         None => false,
     }
+}
+
+/// 路径是否 `.cue` 分轨索引文件（大小写不敏感）。
+pub fn is_cue_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("cue"))
 }
 
 /// 一条目录条目（目录或音乐文件）。
@@ -99,7 +105,9 @@ impl Entry {
         }
     }
 
-    /// 是否为目录。便于在 TUI 渲染时加目录图标 `▸`。
+    /// 是否为目录。仅单元测试使用（渲染走 match entry 模式匹配，不调此方法；基础版同函数确实被渲染层使用） `▸`。
+    // 仅单元测试使用。
+    #[allow(dead_code)]
     pub fn is_dir(&self) -> bool {
         matches!(self, Entry::Dir { .. })
     }
@@ -357,6 +365,8 @@ impl FsBrowser {
     ///
     /// 到达文件系统根目录（无 parent）时返回 false，浏览器保持不动。
     /// 这是 Unix `/` 和 Windows `C:\` 等根目录的自然边界。
+    // 仅单元测试使用。
+    #[allow(dead_code)]
     pub fn go_up(&mut self) -> bool {
         match self.cwd.parent() {
             Some(parent) => {
@@ -374,6 +384,8 @@ impl FsBrowser {
     /// 这种"类型驱动的行为分离"让 TUI 的 Enter 键逻辑很清晰：
     /// 若 enter_selected() 成功则已进入新目录；否则说明选中的是文件，
     /// 调用方转而触发播放。
+    // 仅单元测试使用。
+    #[allow(dead_code)]
     pub fn enter_selected(&mut self) -> bool {
         match self.current() {
             Some(Entry::Dir { path, .. }) => {

@@ -13,6 +13,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
+use super::fmt_time;
 use crate::config;
 use crate::playlist;
 use tuneux_corex as audio;
@@ -200,12 +201,6 @@ pub(super) fn draw_status_bar(
         0.0
     };
 
-    // 时间格式化：秒 → "M:SS"
-    fn fmt_time(s: f64) -> String {
-        let total = s.max(0.0) as u64;
-        format!("{}:{:02}", total / 60, total % 60)
-    }
-
     // 组装单行状态文本：左 [状态] 标题  中 进度条  右 时间/音量/模式
     // 用 Layout 三段式分割，避免手工算宽度被中英文混排绕进去。
     // 中段进度条用 Min(0) 兜底——窄终端下可被压成 0，不画进度条也不报错。
@@ -223,7 +218,7 @@ pub(super) fn draw_status_bar(
         pos_label,
         dur_label,
         eng.volume() * 100.0,
-        repeat.label(),
+        crate::config::repeat_label(repeat),
         if shuffle { "+随机" } else { "" },
     );
     let left_text = status_icon.to_string();

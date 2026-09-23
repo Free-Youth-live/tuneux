@@ -7,7 +7,7 @@
 #
 # 每个平台产出两个压缩包：
 # - tuneux-<ver>-<平台>    ：基础版二进制 + 使用手册-tuneux；
-# - tuneux-fx-<ver>-<平台> ：插件版二进制 + 使用手册-tuneux-fx + plugins/ 插件目录。
+# - tuneux-fx-<ver>-<平台> ：插件版二进制 + 使用手册-tuneux-fx + 插件开发指南 + plugins/ 插件目录。
 # =============================================================================
 
 name: 发布构建
@@ -29,6 +29,19 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  deny:
+    # 依赖核查关卡：四项（漏洞公告/禁用依赖/许可/源）任一不过则整单不发。
+    # 与构建并行执行，不增加发布串行时长；工具从官方源安装并锁定版本。
+    name: 依赖核查
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      - name: 安装 cargo-deny
+        run: cargo install cargo-deny --locked --version 0.20.2
+      - name: 依赖核查（advisories / bans / licenses / sources）
+        run: cargo deny --workspace check
+
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -109,19 +122,22 @@ jobs:
           VER="${VER%%-*}"
           BIN="target/${{ matrix.target }}/release"
 
-          # 基础版：二进制 + 使用手册
+          # 基础版：二进制 + 使用手册 + 第三方许可声明
           mkdir -p pkg/tuneux
           cp "$BIN/tuneux" pkg/tuneux/
           cp 使用手册-tuneux.txt pkg/tuneux/
-          # 手册首行注入版本号：__VERSION__ → 实际版本（来自 tag）
+          cp THIRD-PARTY-LICENSES.txt pkg/tuneux/
+          # 手册标题行注入版本号：__VERSION__ → 实际版本（来自 tag）
           sed -i.bak "s/__VERSION__/${VER}/" "pkg/tuneux/使用手册-tuneux.txt" && rm -f "pkg/tuneux/使用手册-tuneux.txt.bak"
           tar -czf "tuneux-${VER}-${{ matrix.name }}.tar.gz" -C pkg/tuneux .
 
-          # 插件版：二进制 + 使用手册 + plugins/ 插件目录
+          # 插件版：二进制 + 使用手册 + 插件开发指南 + plugins/ 插件目录
           mkdir -p pkg/tuneux-fx
           cp "$BIN/tuneux-fx" pkg/tuneux-fx/
           cp 使用手册-tuneux-fx.txt pkg/tuneux-fx/
           sed -i.bak "s/__VERSION__/${VER}/" "pkg/tuneux-fx/使用手册-tuneux-fx.txt" && rm -f "pkg/tuneux-fx/使用手册-tuneux-fx.txt.bak"
+          cp 插件开发指南.txt pkg/tuneux-fx/
+          cp THIRD-PARTY-LICENSES.txt pkg/tuneux-fx/
           cp -R plugins pkg/tuneux-fx/plugins
           tar -czf "tuneux-fx-${VER}-${{ matrix.name }}.tar.gz" -C pkg/tuneux-fx .
 
@@ -133,20 +149,23 @@ jobs:
           $ver = $env:TAG -replace '^v', '' -replace '-.*$', ''
           $bin = "target/${{ matrix.target }}/release"
 
-          # 基础版：二进制 + 使用手册
+          # 基础版：二进制 + 使用手册 + 第三方许可声明
           New-Item -ItemType Directory -Force -Path pkg/tuneux | Out-Null
           Copy-Item "$bin/tuneux.exe" pkg/tuneux/
           Copy-Item 使用手册-tuneux.txt pkg/tuneux/
+          Copy-Item THIRD-PARTY-LICENSES.txt pkg/tuneux/
           $m = Get-Content "pkg/tuneux/使用手册-tuneux.txt" -Raw
           Set-Content "pkg/tuneux/使用手册-tuneux.txt" -Value ($m -replace '__VERSION__', $ver) -NoNewline -Encoding UTF8
           Compress-Archive -Path pkg/tuneux/* -DestinationPath "tuneux-$ver-${{ matrix.name }}.zip"
 
-          # 插件版：二进制 + 使用手册 + plugins/ 插件目录
+          # 插件版：二进制 + 使用手册 + 插件开发指南 + plugins/ 插件目录
           New-Item -ItemType Directory -Force -Path pkg/tuneux-fx | Out-Null
           Copy-Item "$bin/tuneux-fx.exe" pkg/tuneux-fx/
           Copy-Item 使用手册-tuneux-fx.txt pkg/tuneux-fx/
           $m = Get-Content "pkg/tuneux-fx/使用手册-tuneux-fx.txt" -Raw
           Set-Content "pkg/tuneux-fx/使用手册-tuneux-fx.txt" -Value ($m -replace '__VERSION__', $ver) -NoNewline -Encoding UTF8
+          Copy-Item 插件开发指南.txt pkg/tuneux-fx/
+          Copy-Item THIRD-PARTY-LICENSES.txt pkg/tuneux-fx/
           Copy-Item -Recurse plugins pkg/tuneux-fx/plugins
           Compress-Archive -Path pkg/tuneux-fx/* -DestinationPath "tuneux-fx-$ver-${{ matrix.name }}.zip"
 
@@ -163,7 +182,7 @@ jobs:
 
   release:
     name: 发布
-    needs: build
+    needs: [build, deny]
     runs-on: ubuntu-latest
     env:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}

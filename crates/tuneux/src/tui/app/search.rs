@@ -104,6 +104,7 @@ impl App {
         self.playlist.ensure_visible_in_rows(rows, visible);
     }
 
+    /// 把选中项跳到过滤结果第一条（无结果时回到列表头）。
     pub fn jump_selected_to_filter_first(&mut self) {
         let filter = self.filter_playlist();
         match filter.first() {
@@ -112,6 +113,7 @@ impl App {
         }
     }
 
+    /// 在过滤结果内上下移动选中（delta 正负定方向，越界停住不动）。
     pub fn move_selection_in_filter(&mut self, delta: i64) {
         let filter = self.filter_playlist();
         if filter.is_empty() {

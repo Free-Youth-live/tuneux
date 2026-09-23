@@ -19,5 +19,11 @@ serde.workspace = true
 encoding_rs.workspace = true
 tuneux-corex = { path = "../tuneux-corex" }
 
+# dev 依赖仅用于冻结表示的契约测试（serde 往返经 toml 验证）
+# 与字符池宽度守护（unicode-width 校验），版本随 workspace 统一，不新增供应链。
+[dev-dependencies]
+toml.workspace = true
+unicode-width.workspace = true
+
 [lints]
 workspace = true

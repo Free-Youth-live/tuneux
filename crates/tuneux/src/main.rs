@@ -1,12 +1,15 @@
 //! # tuneux 程序入口
 //!
-//! tuneux 是一个跨平台命令行音乐播放器，界面、提示、元数据全中文。
+//! tuneux 是一个跨平台命令行音乐播放器。
 //!
 //! 本文件负责：
 //! 1. 初始化终端（进入 raw 模式、切换备用屏幕）；
 //! 2. 加载配置并启动 TUI 主事件循环；
 //! 3. 退出时恢复终端状态并保存配置。
 
+// 测试代码允许 unwrap：断言失败即测试失败，语义与生产路径不同
+//（生产路径零 unwrap 由 workspace lints 强制）。
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 // 项目内部模块
 mod config;
 mod fs_browser;
@@ -168,8 +171,7 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>, config: &mut Config) ->
                         app.browser.apply_loaded(resolved, entries);
                     }
                     Err(e) => {
-                        app.last_error = Some(e);
-                        app.last_error_at = Some(std::time::Instant::now());
+                        app.flash_message(&e);
                     }
                 }
             }
@@ -183,8 +185,8 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>, config: &mut Config) ->
         }
         // 目录递归加入的后台结果：批量合入（条目 + 新探测元数据补缓存）。
         // 多批次全部生效——加入是累积语义（与导航的「最新生效」不同）。
-        if let Ok((dir, items, mds)) = app.add_load_rx.try_recv() {
-            app.apply_dir_add(dir, items, mds, config);
+        if let Ok((dir, items, mds, skipped)) = app.add_load_rx.try_recv() {
+            app.apply_dir_add(dir, items, mds, skipped, config);
         }
         // 播放列表行每帧只算一次，供滚动可见性校正与渲染共用（与 fx 同源）。
         let rows = app.playlist_rows();
@@ -198,12 +200,6 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>, config: &mut Config) ->
 
         // 拉取 engine 错误 + 自动清除过期——每帧都做（100ms 一次轮询）
         app.refresh_last_error();
-
-        // 切曲守卫递减：Play/Seek 异步生效，若干帧内 position 仍是旧值，
-        // 守卫期内主循环不做 CUE 终点判定（防点选更早分轨被滞后 position 误判连跳）。
-        if app.switch_guard > 0 {
-            app.switch_guard -= 1;
-        }
 
         // 帧率自适应：播放中且频谱可见时缩短 poll 超时（约 30 FPS），
         // 让频谱动画（含峰值保持白帽）顺滑；否则维持 100 ms，降低空转开销。
@@ -257,23 +253,8 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>, config: &mut Config) ->
             app.advance_ui_on_gapless(config);
         }
 
-        // CUE 分轨曲目到达终点（position >= end_ms）：整轨文件未 EOF，
-        // 但本曲（INDEX 片段）已播完，同样视为"本曲结束"触发切下一曲
-        // （修复：无结束边界会一路播到整轨末尾）。
-        let cue_finished = app.switch_guard == 0
-            && app
-                .playlist
-                .current_index()
-                .and_then(|i| app.playlist.items().get(i))
-                .and_then(|item| item.cue.as_ref())
-                .and_then(|cue| cue.end_ms)
-                .is_some_and(|end_ms| {
-                    app.engine
-                        .as_ref()
-                        .is_some_and(|e| e.position() >= end_ms as f64 / 1000.0)
-                });
         // ReplayGain：曲目分析完成，把整曲增益缓存（下次播放该曲生效）
-        if got_finished || cue_finished {
+        if got_finished {
             app.consecutive_failures = 0;
             if let Some(db) = app.engine.as_ref().and_then(|e| e.take_measured_gain_db()) {
                 if let Some(path) = app.current_path.clone() {
@@ -281,7 +262,7 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>, config: &mut Config) ->
                 }
             }
         }
-        if got_finished || cue_finished {
+        if got_finished {
             let outcome = app.playlist.next(config.repeat);
             match outcome {
                 playlist::NavOutcome::Switch(_) | playlist::NavOutcome::Repeat => {
@@ -296,8 +277,7 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>, config: &mut Config) ->
             app.consecutive_failures += 1;
             if app.consecutive_failures >= 10 {
                 // 连续失败达到上限：停止自动跳曲，避免列表全损坏时无限循环刷屏。
-                app.last_error = Some("连续 10 首无法播放，已停止自动切换".to_string());
-                app.last_error_at = Some(std::time::Instant::now());
+                app.flash_message("连续 10 首无法播放，已停止自动切换");
                 app.consecutive_failures = 0;
             } else {
                 // 播放失败：强制跳下一首（单曲循环按"顺序"语义，不重复失败曲）。

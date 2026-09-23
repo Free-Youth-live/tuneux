@@ -15,6 +15,14 @@
 //! `码率 = 文件大小(字节) × 8 / 时长(秒)`，得到平均码率（bps）。
 //! 对 CBR 文件较准；VBR 文件反映整首曲目的平均值。
 //!
+//! ## 文件夹封面回退
+//!
+//! 封面来源优先级：内嵌封面（FLAC PICTURE / ID3v2 APIC）＞ 同目录约定
+//! 图片文件。无内嵌封面时，按业界惯例文件名（cover / folder / front /
+//! album × jpg / jpeg / png，大小写不敏感）在音频文件所在目录取第一个
+//! 命中项，读原始字节、按扩展名推断 MIME。只在无内嵌封面时列目录一次，
+//! 开销可忽略。
+//!
 //! ## 时长计算
 //!
 //! 容器记录的 `Track.duration`（time_base 单位）+ `Track.time_base` 换算为秒。
@@ -111,7 +119,11 @@ impl TrackMetadata {
         md.album = tags.album;
         md.track_number = tags.track_number;
         md.lyrics = tags.lyrics;
-        md.cover = tags.cover.map(|(bytes, mime)| CoverImage { bytes, mime });
+        // 内嵌封面优先；无内嵌时回退到同目录约定图片文件（见模块头说明）。
+        md.cover = tags
+            .cover
+            .map(|(bytes, mime)| CoverImage { bytes, mime })
+            .or_else(|| Self::folder_cover(path));
 
         // 码率 = 文件大小 × 8 / 时长
         // 注意：必须全程浮点计算，不能用 `dur as u64` 作除数——
@@ -141,6 +153,60 @@ impl TrackMetadata {
         path.file_stem()
             .and_then(|s| s.to_str())
             .map(|s| s.to_owned())
+    }
+
+    /// 文件夹封面回退：音频文件无内嵌封面时，查其所在目录的约定图片文件。
+    ///
+    /// 约定文件名（大小写不敏感）：cover / folder / front / album ×
+    /// jpg / jpeg / png，按清单序取第一个命中项（cover 优先于 folder 等）。
+    /// 命中但文件超限（防误读异常大文件拖慢元数据提取）则跳过该项继续找。
+    /// 读取或列举失败一律返回 None（无封面），绝不上抛错误。
+    fn folder_cover(audio_path: &Path) -> Option<CoverImage> {
+        const STEMS: [&str; 4] = ["cover", "folder", "front", "album"];
+        const EXTS: [&str; 3] = ["jpg", "jpeg", "png"];
+        /// 文件夹封面超过此字节数不读。
+        const MAX_COVER_BYTES: u64 = 32 * 1024 * 1024;
+
+        let dir = audio_path.parent()?;
+        let entries = std::fs::read_dir(dir).ok()?;
+        // 收集 (小写文件名, 路径)，再按清单序匹配——一次列目录换来
+        // 大小写不敏感（Cover.JPG 也能命中），比逐个试路径稳健。
+        let mut names: Vec<(String, std::path::PathBuf)> = Vec::new();
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() {
+                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                    names.push((name.to_lowercase(), p));
+                }
+            }
+        }
+        for stem in STEMS {
+            for ext in EXTS {
+                let want = format!("{stem}.{ext}");
+                let Some((_, p)) = names.iter().find(|(n, _)| *n == want) else {
+                    continue;
+                };
+                let Ok(meta) = std::fs::metadata(p) else {
+                    continue;
+                };
+                if meta.len() > MAX_COVER_BYTES {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(p) else {
+                    continue;
+                };
+                let mime = if ext == "png" {
+                    "image/png"
+                } else {
+                    "image/jpeg"
+                };
+                return Some(CoverImage {
+                    bytes,
+                    mime: mime.to_string(),
+                });
+            }
+        }
+        None
     }
 
     /// 仅从 AudioParams 构造技术参数部分（标签留空）。
@@ -361,19 +427,9 @@ mod tests {
         assert!(md.duration.is_none());
     }
 
-    /// 回归测试：亚秒时长（0.5s）的音频文件计算码率时不能触发整数
-    /// 除零 panic。旧实现 `(size * 8) / dur as u64` 对 dur ∈ (0, 1) 秒时
-    /// `dur as u64` 截断为 0 → 除零崩溃；修复后全程浮点计算。
-    /// 测试文件用代码内生成的 RIFF WAV（0.5s 静音），不依赖外部夹具，
-    /// 因此不需要 #[ignore]。
-    #[test]
-    fn subsecond_audio_no_div_zero_panic() {
-        let dir = std::env::temp_dir().join("tuneux_metadata_test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("subsecond.wav");
-
-        // 构造 44.1kHz / 16-bit / mono / 0.5 秒的 RIFF WAV 头 + 静音样本
+    /// 造一个最小合法 RIFF WAV（44.1kHz / 16-bit / mono / 0.5s 静音），
+    /// 无内嵌封面。供需要真实音频文件的测试复用。
+    fn write_test_wav(path: &Path) {
         let sample_rate: u32 = 44100;
         let channels: u16 = 1;
         let bits: u16 = 16;
@@ -398,7 +454,21 @@ mod tests {
         wav.extend_from_slice(&data_size.to_le_bytes());
         wav.resize(wav.len() + data_size as usize, 0); // 静音样本
 
-        std::fs::write(&path, &wav).unwrap();
+        std::fs::write(path, &wav).unwrap();
+    }
+
+    /// 回归测试：亚秒时长（0.5s）的音频文件计算码率时不能触发整数
+    /// 除零 panic。旧实现 `(size * 8) / dur as u64` 对 dur ∈ (0, 1) 秒时
+    /// `dur as u64` 截断为 0 → 除零崩溃；修复后全程浮点计算。
+    /// 测试文件用代码内生成的 RIFF WAV（0.5s 静音），不依赖外部夹具，
+    /// 因此不需要 #[ignore]。
+    #[test]
+    fn subsecond_audio_no_div_zero_panic() {
+        let dir = std::env::temp_dir().join("tuneux_metadata_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("subsecond.wav");
+        write_test_wav(&path);
 
         // 核心断言：亚秒文件不 panic，且码率正确（≈44100B×8/0.5s≈705kbps）
         let md = TrackMetadata::from_file(&path);
@@ -409,6 +479,72 @@ mod tests {
             "码率应在 705kbps 附近，实际 {bitrate}"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // —— 文件夹封面回退 ——
+
+    /// 准备临时目录：一张无内嵌封面的 WAV + 可选的若干图片文件。
+    /// 返回（目录, WAV 路径）；调用方负责清理目录。
+    fn setup_cover_dir(
+        tag: &str,
+        images: &[(&str, &[u8])],
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("tuneux_cover_test_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("track.wav");
+        write_test_wav(&wav);
+        for (name, bytes) in images {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+        (dir, wav)
+    }
+
+    /// 无内嵌封面时，同目录 cover.jpg 被回退读取，MIME 按扩展名推断。
+    #[test]
+    fn folder_cover_picks_cover_jpg() {
+        let (dir, wav) = setup_cover_dir("basic", &[("cover.jpg", &[1, 2, 3])]);
+        let md = TrackMetadata::from_file(&wav);
+        let cover = md.cover.expect("应回退到 cover.jpg");
+        assert_eq!(cover.mime, "image/jpeg");
+        assert_eq!(cover.bytes, vec![1, 2, 3]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 优先级：cover 先于 folder；jpg 先于 png。
+    #[test]
+    fn folder_cover_priority_order() {
+        let (dir, wav) = setup_cover_dir(
+            "priority",
+            &[
+                ("folder.png", &[9]),
+                ("cover.jpg", &[1]),
+                ("front.jpg", &[5]),
+            ],
+        );
+        let md = TrackMetadata::from_file(&wav);
+        let cover = md.cover.expect("应命中 cover.jpg");
+        assert_eq!(cover.bytes, vec![1], "cover.jpg 应优先于 folder/front");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 大小写不敏感：Cover.JPG 同样命中。
+    #[test]
+    fn folder_cover_case_insensitive() {
+        let (dir, wav) = setup_cover_dir("case", &[("Cover.JPG", &[7, 7])]);
+        let md = TrackMetadata::from_file(&wav);
+        let cover = md.cover.expect("Cover.JPG 应命中（大小写不敏感）");
+        assert_eq!(cover.bytes, vec![7, 7]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 目录下无约定图片 → 无封面（不回退、不报错）。
+    #[test]
+    fn folder_cover_none_when_absent() {
+        let (dir, wav) = setup_cover_dir("absent", &[("photo.jpg", &[1])]);
+        let md = TrackMetadata::from_file(&wav);
+        assert!(md.cover.is_none(), "非约定文件名不应命中");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

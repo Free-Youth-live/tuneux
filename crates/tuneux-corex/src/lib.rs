@@ -13,6 +13,9 @@
 //! 1.0 前可变更但需 CHANGELOG 标注；`engine_thread`/`resample`/`DecoderCmd`
 //! 为内部实现（`pub(crate)`），不属公共契约。
 
+// 测试代码允许 unwrap：断言失败即测试失败，语义与生产路径不同
+//（生产路径零 unwrap 由 workspace lints 强制）。
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 #![deny(missing_docs)]
 
 mod audio;
@@ -24,7 +27,7 @@ pub use audio::compressor::{CompressorParams, COMP_SLOTS};
 pub use audio::decoder::{
     codec_name_or_ext, open_backend, AudioParams, DecodeError, DecoderBackend, KNOWN_AUDIO_EXTS,
 };
-pub use audio::engine::{AudioCmd, Engine};
+pub use audio::engine::{AudioCmd, Engine, PreloadTarget};
 pub use audio::equalizer::{
     EqParams, EQ_BANDS, EQ_FREQS, EQ_GAIN_MAX_DB, EQ_GAIN_MIN_DB, EQ_SLOTS,
 };

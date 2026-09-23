@@ -8,7 +8,7 @@
 use crate::config::{LeftPanel, LyricsMode, SpectrumMode};
 use crate::tui::app::SearchTarget;
 
-/// 顶部条高度（含边框，固定 6 行）：左当前曲信息 + 右电平。
+/// 顶部条高度（含边框，固定 6 行）：当前曲信息 + 三桶能量 + 电平。
 const TOP_BAR_H: u16 = 6;
 /// 状态条高度（含边框，固定 4 行）：进度/时间/音量/循环/错误。
 const STATUS_BAR_H: u16 = 4;

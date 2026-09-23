@@ -29,8 +29,10 @@ use crate::fs_browser::Entry;
 use crate::playlist::{Panel, PlaylistRow, Selection};
 use tuneux_mediax::lyrics;
 
-use self::popup::{draw_about, draw_compressor, draw_equalizer};
-use self::spectrum::{draw_audio_panel, draw_level_meter, draw_oscilloscope};
+use self::popup::{draw_about, draw_compressor, draw_equalizer, draw_skin_picker};
+use self::spectrum::{
+    draw_audio_panel, draw_band_column, draw_level_meter, draw_oscilloscope, draw_visual_panel,
+};
 
 // —— 样式与排版小工具 ——
 
@@ -56,13 +58,44 @@ fn panel_border(pal: &Palette, focused: bool) -> Style {
     }
 }
 
+/// 弹窗 / 下拉菜单的淡投影：框体右侧两列、下侧一行，给下层已绘内容叠加
+/// `Modifier::DIM`——字符与配色保留、只压暗亮度，不擦除下层内容
+///（终端无真半透明，此为 Turbo Vision 式阴影的惯例做法）。纯修饰符实现，
+/// 不动调色板、不进皮肤；框体贴右 / 下缘时投影自然裁剪消失。
+fn draw_shadow(frame: &mut ratatui::Frame, box_area: Rect) {
+    let buf = frame.buffer_mut();
+    let right = buf.area().right();
+    let bottom = buf.area().bottom();
+    // 右侧两列：从框体第二行起，到框体底下一行止（含右下角）。
+    let x0 = box_area.x.saturating_add(box_area.width);
+    let x1 = x0.saturating_add(2).min(right);
+    let y0 = box_area.y.saturating_add(1);
+    let y1 = box_area
+        .y
+        .saturating_add(box_area.height)
+        .saturating_add(1)
+        .min(bottom);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let style = buf[(x, y)].style().add_modifier(Modifier::DIM);
+            buf[(x, y)].set_style(style);
+        }
+    }
+    // 下侧一行：从框体左缘右移两列起，与右侧投影在右下角汇合。
+    let sy = box_area.y.saturating_add(box_area.height);
+    if sy < bottom {
+        let bx0 = box_area.x.saturating_add(2);
+        for x in bx0..x1 {
+            let style = buf[(x, sy)].style().add_modifier(Modifier::DIM);
+            buf[(x, sy)].set_style(style);
+        }
+    }
+}
+
 /// 秒数 → "m:ss"（超过 1 小时 "h:mm:ss"）。
 fn fmt_time(secs: f64) -> String {
-    // 四舍五入到秒：避免 3.999 显示为 0:03 的观感问题。
-    let secs = (secs.max(0.0) + 0.5) as u64;
-    let h = secs / 3600;
-    let m = (secs % 3600) / 60;
-    let s = secs % 60;
+    // 四舍五入到秒：避免 3.999 显示为 0:03 的观感问题；分解用共享数据层。
+    let (h, m, s) = tuneux_mediax::time::hms_parts((secs.max(0.0) + 0.5) as u64);
     if h > 0 {
         format!("{h}:{m:02}:{s:02}")
     } else {
@@ -147,7 +180,7 @@ pub fn draw(
     rows: &[PlaylistRow],
     dt: std::time::Duration,
 ) {
-    let pal = app.skin.unwrap_or_else(|| app.theme.palette());
+    let pal = app.skin.unwrap_or_default();
     let area = frame.area();
     let m = layout_metrics(
         (area.width, area.height),
@@ -249,7 +282,12 @@ pub fn draw(
 
     // 关于弹窗：最后绘制，覆盖在其它内容之上。
     if app.about_visible {
-        draw_about(frame, area, &pal);
+        draw_about(frame, area, app, &pal);
+    }
+
+    // 皮肤选择器：最上层（覆盖关于弹窗）。
+    if app.skin_picker {
+        draw_skin_picker(frame, area, app, &pal);
     }
 }
 
@@ -322,6 +360,7 @@ fn draw_menu_dropdown(frame: &mut ratatui::Frame, area: Rect, app: &App, pal: &P
         height: box_h,
     };
 
+    draw_shadow(frame, box_area);
     frame.render_widget(Clear, box_area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -353,6 +392,7 @@ fn draw_menu_dropdown(frame: &mut ratatui::Frame, area: Rect, app: &App, pal: &P
                 // 插件清单：√ = 该插件已加载（运行时从 plugins/ 目录装载）。
                 MenuAction::PluginEq => Some(app.eq_plugin.is_some()),
                 MenuAction::PluginComp => Some(app.comp_plugin.is_some()),
+                MenuAction::PluginVisual => Some(!app.visual_plugins.is_empty()),
                 _ => None,
             };
             let mark = match checked {
@@ -410,6 +450,10 @@ fn draw_playlist_or_spectrum(
                 );
             } else if app.spectrum_mode == SpectrumMode::Oscilloscope {
                 draw_oscilloscope(frame, area, &app.engine, pal, app.frame_tick);
+            } else if app.spectrum_mode == SpectrumMode::Plugin {
+                // 插件面板与 Full / 示波器同为整区早返（不与歌词分屏，
+                // 与下方 Hidden 分支的 Plugin 臂口径一致）。
+                draw_visual_panel(frame, area, &app.visual_text, pal);
             } else {
                 let split = Layout::horizontal([
                     Constraint::Percentage(m.playlist_w_pct),
@@ -437,7 +481,8 @@ fn draw_playlist_or_spectrum(
                             dt,
                         );
                     }
-                    // Full 已被外层 if 拦截早返，此处仅为 match 穷尽性，不会执行到。
+                    // Full / Oscilloscope / Plugin 已被外层分支拦截早返，
+                    // 此处仅为 match 穷尽性，不会执行到。
                     _ => {}
                 }
                 draw_lyrics_panel(
@@ -483,6 +528,9 @@ fn draw_playlist_or_spectrum(
             SpectrumMode::Oscilloscope => {
                 draw_oscilloscope(frame, area, &app.engine, pal, app.frame_tick);
             }
+            SpectrumMode::Plugin => {
+                draw_visual_panel(frame, area, &app.visual_text, pal);
+            }
         },
     }
 }
@@ -511,13 +559,9 @@ fn draw_browser(frame: &mut ratatui::Frame, area: Rect, app: &App, pal: &Palette
         frame.render_widget(msg, inner);
         return;
     }
-    if app.browser.entries().is_empty() {
-        let msg = Paragraph::new("（空目录）")
-            .style(pal_style(pal.fg, pal.bg).add_modifier(Modifier::DIM))
-            .alignment(Alignment::Center);
-        frame.render_widget(msg, inner);
-        return;
-    }
+    // 空目录 / 搜索零匹配的提示移到搜索框渲染**之后**（见下方同款判断）：
+    // 搜索态下 entries 是过滤结果，零匹配时同样为空；提前 return 会把搜索
+    // 输入框与「Esc 退出」提示一起顶掉，而按键仍被搜索分支全量吞掉。
 
     // 搜索模式：顶部 1 行搜索输入框，剩余给列表。
     let list_area = if searching {
@@ -541,6 +585,19 @@ fn draw_browser(frame: &mut ratatui::Frame, area: Rect, app: &App, pal: &Palette
     } else {
         inner
     };
+
+    if app.browser.entries().is_empty() {
+        let msg = if searching {
+            "（无匹配）Esc 退出搜索"
+        } else {
+            "（空目录）"
+        };
+        let msg = Paragraph::new(msg)
+            .style(pal_style(pal.fg, pal.bg).add_modifier(Modifier::DIM))
+            .alignment(Alignment::Center);
+        frame.render_widget(msg, list_area);
+        return;
+    }
 
     let entries = app.browser.entries();
     let scroll = app.browser.scroll();
@@ -589,15 +646,9 @@ fn draw_playlist(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if count == 0 {
-        let hint = "空列表：在浏览器按 a 加入，或 Enter 直接播放";
-        let st = pal_style(pal.fg, pal.bg).add_modifier(Modifier::DIM);
-        frame.render_widget(
-            Paragraph::new(hint).style(st).alignment(Alignment::Center),
-            inner,
-        );
-        return;
-    }
+    // 空列表 / 搜索零匹配的提示放在搜索框渲染**之后**（见下方同款判断）：
+    // 搜索态下 rows 是过滤结果，零匹配时为空；若在此提前 return，输入框与
+    // 「Esc 退出」提示会被顶掉，而按键仍被搜索分支全量吞掉（隐形模态态）。
 
     // 搜索模式：顶部 1 行搜索输入框，剩余给列表。
     let list_area = if searching {
@@ -615,14 +666,33 @@ fn draw_playlist(
         inner
     };
 
+    // 无可渲染行 = 列表为空（未搜索）或搜索零匹配——两者 rows 都为空。
+    if rows.is_empty() {
+        let hint = if searching {
+            "（无匹配）Esc 退出搜索"
+        } else {
+            "空列表：在浏览器按 a 加入，或 Enter 直接播放"
+        };
+        let st = pal_style(pal.fg, pal.bg).add_modifier(Modifier::DIM);
+        frame.render_widget(
+            Paragraph::new(hint).style(st).alignment(Alignment::Center),
+            list_area,
+        );
+        return;
+    }
+
     let w = list_area.width as usize;
     let vis_h = list_area.height as usize;
-    // 列宽：▶(1)+空格 + 曲名 + 空格 + 艺术家 + 空格 + 时长(右对齐)。
+    // 列宽：▶(1)+空格 + 序号(右对齐+.) + 空格 + 曲名 + 空格 + 艺术家 + 空格 + 时长(右对齐)。
+    // 序号随视图切换：平铺 = 大排行（全列表 1..N），分组 = 专辑内排行（每专辑 1..N）。
     // 8 列容纳超 1 小时的 `H:MM:SS`（如 1:23:45），避免截成 `1:23:4`。
     let dur_w = 8usize;
     let icon_w = 2usize;
-    let gaps = 3usize;
-    let flexible = w.saturating_sub(icon_w + gaps + dur_w);
+    // 序号列宽 = 最大序号位数 + 1（尾随 "."）；行数（含组头）≥ 最大序号，用它估位足够。
+    let digits = rows.len().to_string().len().max(1);
+    let num_w = digits + 1;
+    let gaps = 4usize;
+    let flexible = w.saturating_sub(icon_w + num_w + gaps + dur_w);
     let artist_w = flexible * 30 / 100;
     let title_w = flexible.saturating_sub(artist_w);
 
@@ -630,13 +700,51 @@ fn draw_playlist(
     let sel_track = app.playlist.selected_track();
     let playing = app.engine.as_ref().is_some_and(|e| e.is_playing());
 
+    // 分组视图（rows 含组头）时维护专辑内序号；平铺视图用行位置作大排行。
+    let grouped = rows
+        .iter()
+        .any(|r| matches!(r, PlaylistRow::AlbumHeader { .. }));
+    let mut album_seq = 0usize;
+
+    // 预扫描构建 item_index → 专辑内序号映射（滚动无关，序号恒为 1..N）。
+    let mut album_track_seq: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+    if grouped {
+        let mut seq;
+        let mut in_album = false;
+        for row in rows.iter() {
+            match row {
+                PlaylistRow::AlbumHeader { track_indices, .. } => {
+                    seq = 0;
+                    in_album = true;
+                    for &idx in track_indices.iter() {
+                        seq += 1;
+                        album_track_seq.insert(idx, seq);
+                    }
+                }
+                PlaylistRow::Track { .. } => {
+                    if !in_album {
+                        // 平铺区域的 Track 行不在此映射中
+                    }
+                }
+            }
+        }
+    }
+
     let mut lines: Vec<Line> = Vec::new();
-    for row in rows.iter().skip(app.playlist.scroll()).take(vis_h) {
+    for (row_idx, row) in rows
+        .iter()
+        .enumerate()
+        .skip(app.playlist.scroll())
+        .take(vis_h)
+    {
         match row {
             PlaylistRow::AlbumHeader {
                 album,
                 track_indices,
             } => {
+                // 新专辑：专辑内序号从头计。
+                album_seq = 0;
                 let mark = if app.playlist.is_album_collapsed(album) {
                     "▸"
                 } else {
@@ -693,8 +801,22 @@ fn draw_playlist(
                 } else {
                     " "
                 };
+                // 序号：平铺 = 大排行（显示序位置），分组 = 专辑内排行。
+                // 专辑内排行用 track_indices 中 item_index 的位置推算，
+                // 而非迭代累计——skip(scroll) 使组头滚出后累计从 0 重算，
+                // 第 12 首会显示成"1."（与手册"专辑内排行序号 1..N"承诺不符）。
+                let num = if grouped {
+                    album_track_seq.get(item_index).copied().unwrap_or({
+                        album_seq += 1;
+                        album_seq
+                    })
+                } else {
+                    row_idx + 1
+                };
                 let mut text = String::new();
                 text.push_str(icon);
+                text.push(' ');
+                text.push_str(&format!("{num:>digits$}."));
                 text.push(' ');
                 text.push_str(&pad_to_width(&title, title_w));
                 text.push(' ');
@@ -873,10 +995,26 @@ fn draw_cover_browser(frame: &mut ratatui::Frame, area: Rect, app: &mut App, pal
     const CELL_W: u16 = 14;
     const COVER_H: u16 = 3;
     let cell_h = COVER_H + 1;
-    let cols = (inner.width / CELL_W).max(1) as usize;
-    let rows = (inner.height / cell_h).max(1) as usize;
+    // 面板放不下一个整格（终端过窄 / 过矮）时直接不画：`.max(1)` 会让
+    // cell_x + CELL_W 越过 inner 右边界，而 ratatui 只按整块 buffer 裁剪，
+    // 于是封面像素覆盖到面板边框甚至状态条上。
+    if inner.width < CELL_W || inner.height < cell_h {
+        app.cover_browser_visible = 0;
+        return;
+    }
+    let cols = (inner.width / CELL_W) as usize;
+    let rows = (inner.height / cell_h) as usize;
     let visible = cols * rows;
     app.cover_browser_visible = visible;
+    // 列表变短（删曲/清空）后 sel/scroll 可能越界——渲染时钳到有效范围，
+    // 否则没有格子被高亮、Enter 走 albums.get(sel) 得 None 无反应。
+    let count = albums.len();
+    if app.cover_browser_sel >= count {
+        app.cover_browser_sel = count.saturating_sub(1);
+    }
+    if app.cover_browser_scroll >= count {
+        app.cover_browser_scroll = count.saturating_sub(1);
+    }
     let start = app.cover_browser_scroll.min(albums.len().saturating_sub(1));
     let end = (start + visible).min(albums.len());
     let base = pal_style(pal.fg, pal.bg);
@@ -1019,9 +1157,13 @@ fn draw_now_playing(frame: &mut ratatui::Frame, area: Rect, app: &App, pal: &Pal
         return;
     };
 
-    // 两栏：左曲目信息（70%）+ 右实时电平（30%）。
-    let columns =
-        Layout::horizontal([Constraint::Percentage(70), Constraint::Percentage(30)]).split(inner);
+    // 三栏：左曲目信息（60%）+ 中三桶能量（15%）+ 右实时电平（25%）。
+    let columns = Layout::horizontal([
+        Constraint::Percentage(60),
+        Constraint::Percentage(15),
+        Constraint::Percentage(25),
+    ])
+    .split(inner);
     let info_area = columns[0];
 
     let title = md.title.clone().unwrap_or_else(|| "未知曲目".to_string());
@@ -1080,7 +1222,8 @@ fn draw_now_playing(frame: &mut ratatui::Frame, area: Rect, app: &App, pal: &Pal
     }
     frame.render_widget(Paragraph::new(lines), info_area);
     // 右栏：实时电平表。
-    draw_level_meter(frame, columns[1], &app.engine, app.frame_tick, pal);
+    draw_band_column(frame, columns[1], &app.engine, app.frame_tick, pal);
+    draw_level_meter(frame, columns[2], &app.engine, app.frame_tick, pal);
 }
 
 /// 状态栏：播放图标 + 进度条 + 时间/音量/循环/随机。
@@ -1159,7 +1302,7 @@ fn draw_status_bar(
     };
     let right_main = format!(
         "{time_str}  音量{vol}%  {}{}",
-        config.repeat.label(),
+        crate::config::repeat_label(config.repeat),
         shuffle_s
     );
     let base_style = pal_style(pal.fg, pal.bg);
@@ -1199,16 +1342,14 @@ fn draw_status_bar(
 fn draw_fkey_bar(frame: &mut ratatui::Frame, area: Rect, pal: &Palette) {
     const KEYS: &[(&str, &str)] = &[
         ("1-8", "菜单"),
-        ("F2", "配色"),
-        ("F3", "打开"),
-        ("F4", "目录"),
         ("F5-F8", "面板"),
         ("F9", "均衡器"),
+        ("F10", "菜单"),
         ("?", "帮助"),
     ];
     match pal.fkey_num {
         None => {
-            let text = " 1-8菜单  F2配色  F3打开  F4目录  F5-F8面板  F9均衡器  ?帮助 ";
+            let text = " 1-8菜单  F5-F8面板  F9均衡器  F10菜单  ?帮助 ";
             frame.render_widget(
                 Paragraph::new(text).style(Style::default().add_modifier(Modifier::DIM)),
                 area,
@@ -1233,5 +1374,58 @@ fn draw_fkey_bar(frame: &mut ratatui::Frame, area: Rect, pal: &Palette) {
                 area,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::app::SearchTarget;
+
+    /// 歌词可见 + 频谱 Plugin 态：插件画面必须整区渲染（曾有 Plugin 落入
+    /// 穷尽臂 `_ => {}`、工作区残留上一帧的缺口）。
+    #[test]
+    fn plugin_visual_draws_when_lyrics_visible() {
+        let config = Config::default();
+        let mut app = App::new(&config);
+        app.lyrics_mode = LyricsMode::Visible;
+        app.spectrum_mode = SpectrumMode::Plugin;
+        app.visual_text = "PLUGIN_CANARY".to_string();
+        let m = layout_metrics(
+            (80, 24),
+            SpectrumMode::Plugin,
+            LyricsMode::Visible,
+            LeftPanel::Browser,
+            false,
+            SearchTarget::Playlist,
+            0.5,
+        );
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("建终端");
+        terminal
+            .draw(|f| {
+                super::draw_playlist_or_spectrum(
+                    f,
+                    f.area(),
+                    &app,
+                    &Palette::default(),
+                    &m,
+                    &[],
+                    std::time::Duration::ZERO,
+                    0.0,
+                );
+            })
+            .expect("绘制");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            text.contains("PLUGIN_CANARY"),
+            "插件画面应整区渲染：{text:?}"
+        );
     }
 }

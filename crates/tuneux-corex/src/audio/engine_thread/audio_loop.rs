@@ -133,16 +133,24 @@ pub(super) fn audio_loop(
                         std::thread::sleep(Duration::from_millis(30));
                         stream.take();
 
-                        // 拿到新设备的默认采样率（如果可读）；拿不到则用 spawn 时捕获的
-                        // device_sample_rate 兜底。新设备默认采样率是最稳的"目标 sr"——
-                        // cpal 在新设备上必支持自家默认值，build_output_stream 不会因采样率不支持失败。
-                        let new_default_sr = new_device
+                        // 采样率跟随新设备默认值（cpal 在新设备上必支持自家
+                        // 默认，重建成功率最高）；拿不到配置时回退 spawn 捕获值。
+                        //
+                        // 通道数刻意**不**跟随新设备（0.5.1 口径）：解码线程的通道
+                        // 适配、ring 交错与重采样器构建均基于 spawn 捕获值，若流按
+                        // 新通道数建而数据仍按旧通道数交错，会变速变调、进度按错
+                        // 倍数推进且无任何提示——比静音更糟。按 spawn 通道数建流
+                        // 在新设备不支持时 cpal 拒绝 → 走 None 分支报"音频设备
+                        // 不可用"（可诊断的静音，**既有**限制，非回归）。
+                        // 完整修复（SharedState.stream_channels 动态同步，与采样率
+                        // 同口径，含回归测试）保留在 0.5.2 计划。
+                        //
+                        // 注意 `sample_format` 同理**不**跟随新设备：build_stream 只
+                        // 接受 F32，跟随新设备默认格式（可能是 I16）会直接建流失败。
+                        let target_sr = new_device
                             .default_output_config()
                             .map(|c| c.sample_rate().0)
                             .unwrap_or(device_sample_rate);
-                        // 重建目标采样率 = 新设备的默认采样率（无论与当前流是否
-                        // 一致，取值都等于 new_default_sr，无需分支）。
-                        let target_sr = new_default_sr;
                         let rebuilt = rebuild_stream(
                             &new_device,
                             target_sr,
@@ -150,6 +158,15 @@ pub(super) fn audio_loop(
                             sample_format,
                             &state,
                         );
+                        // 设备切换前的播放态与暂停进度：进度必须用**旧**流采样率
+                        // 换算——frames_played 由回调按当时流的采样率累加，
+                        // rebuild_stream / NewProducer 都不清零它（只有
+                        // reset_position 会），所以要在下面覆盖 current_stream_sr
+                        // **之前**取值；否则等于把旧率下的帧数除以新率，得到偏小的
+                        // 秒数（44.1k→48k 播 3 分钟约少 14.6 秒，Resume 时向后退）。
+                        let was_playing = state.is_playing();
+                        let resume_secs = state.position(current_stream_sr.max(1));
+
                         match rebuilt {
                             Some((new_stream, new_prod)) => {
                                 let _ = dec_cmd_tx.send(DecoderCmd::NewProducer(new_prod));
@@ -160,13 +177,22 @@ pub(super) fn audio_loop(
                                 if let Some(s) = stream.as_ref() {
                                     let _ = s.pause();
                                 }
-                                // 重新加载当前文件：NewProducer 已清掉 current / resampler，
-                                // 这里用同路径 Load（不传 secs——从 0 重新开始；设备切换时
-                                // 用户对"接着上次"的预期弱于"听见声音"，重新开始是更稳的取舍）。
-                                let _ = dec_cmd_tx.send(DecoderCmd::Load(path));
-                                // 进度基准清零：重建后从文件头重播，回调 add_frames 从 0 起，
-                                // 否则进度显示错位超前。
-                                state.reset_position(0.0);
+                                // 重新加载当前文件：NewProducer 已清掉 current / resampler。
+                                // 暂停态：记录当前进度，改发 LoadAndSeek 恢复到暂停位置
+                                //（否则暂停中拔耳机 → 进度静默归零，Resume 从头播）。
+                                // 播放态：从文件头重播（设备切换时用户对"接着上次"的
+                                // 预期弱于"听见声音"，重新开始是更稳的取舍）。
+                                if was_playing {
+                                    let _ = dec_cmd_tx.send(DecoderCmd::Load(path));
+                                    state.reset_position(0.0);
+                                } else {
+                                    let _ = dec_cmd_tx.send(DecoderCmd::LoadAndSeek {
+                                        path,
+                                        secs: resume_secs,
+                                    });
+                                    // 进度基准 = 暂停位置（解码器 seek 后回调从此起计）。
+                                    state.reset_position(resume_secs);
+                                }
                                 // 新流按设备默认采样率：文件原生率大概率不同，保守标为非直通
                                 //（避免 UI"直通"标识失真）。
                                 state.set_bitstream(false);
@@ -180,7 +206,8 @@ pub(super) fn audio_loop(
                             }
 
                             None => {
-                                // 新设备建流失败：保留 device_sample_rate 回退（最后一次机会）
+                                // 新设备建流失败：保留 device_sample_rate 回退（最后一次机会）。
+                                // 通道数与首选分支同口径：spawn 捕获值（不跟随新设备）。
                                 match rebuild_stream(
                                     &new_device,
                                     device_sample_rate,
@@ -196,8 +223,19 @@ pub(super) fn audio_loop(
                                         if let Some(s) = stream.as_ref() {
                                             let _ = s.pause();
                                         }
-                                        let _ = dec_cmd_tx.send(DecoderCmd::Load(path));
-                                        state.reset_position(0.0);
+                                        // 与首选分支同口径：暂停态保留进度——回退分支
+                                        // 同样不能清零（否则"暂停中拔耳机"仍会丢失位置，
+                                        // 而回退分支恰是该场景更容易走到的一条）。
+                                        if was_playing {
+                                            let _ = dec_cmd_tx.send(DecoderCmd::Load(path));
+                                            state.reset_position(0.0);
+                                        } else {
+                                            let _ = dec_cmd_tx.send(DecoderCmd::LoadAndSeek {
+                                                path,
+                                                secs: resume_secs,
+                                            });
+                                            state.reset_position(resume_secs);
+                                        }
                                         state.set_bitstream(false);
                                         if state.is_playing() {
                                             if let Some(s) = stream.as_ref() {
@@ -287,6 +325,40 @@ pub(super) fn audio_loop(
                 // 记录当前播放路径（PlayResume 同上，路径决定重建用哪首歌的流）
                 current_playback_path = Some(path);
             }
+            AudioCmd::PlayRange {
+                path,
+                start_secs,
+                end_secs,
+            } => {
+                // 区间播放：与 PlayResume 相同的直通 + 流重建（含回退）。
+                switch_stream_for_playback(
+                    &path,
+                    &device,
+                    device_sample_rate,
+                    device_channels,
+                    sample_format,
+                    &mut stream,
+                    &mut current_stream_sr,
+                    &dec_cmd_tx,
+                    &state,
+                );
+                // 进度按文件时间轴（base = start_secs）：UI 层按既有
+                // track_progress 口径换算区间相对进度；时长由解码线程
+                // 按区间长度覆盖上报。
+                state.reset_position(start_secs);
+                state.bump_flush();
+                let _ = state.take_playback_finished();
+                let _ = dec_cmd_tx.send(DecoderCmd::LoadRange {
+                    path: path.clone(),
+                    start_secs,
+                    end_secs,
+                });
+                state.set_playing(true);
+                if let Some(s) = stream.as_ref() {
+                    let _ = s.play();
+                }
+                current_playback_path = Some(path);
+            }
             AudioCmd::Pause => {
                 state.set_playing(false);
                 if let Some(s) = stream.as_ref() {
@@ -322,9 +394,10 @@ pub(super) fn audio_loop(
             AudioCmd::SetVolume(vol) => {
                 state.set_volume(vol);
             }
-            AudioCmd::PreloadNext(path) => {
-                // Gapless 预载：转发给解码线程提前打开下一曲后端（不重建流）。
-                let _ = dec_cmd_tx.send(DecoderCmd::Preload(path));
+            AudioCmd::PreloadNext(target) => {
+                // Gapless 预载：转发给解码线程提前打开下一曲后端（不重建流）；
+                // 区间预载由解码线程先 seek 到 start_secs 再缓存。
+                let _ = dec_cmd_tx.send(DecoderCmd::Preload(target));
             }
         }
     }

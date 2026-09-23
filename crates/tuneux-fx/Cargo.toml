@@ -8,7 +8,7 @@
 [package]
 # 包名 tuneux-fx；可执行文件名 tuneux-fx
 name = "tuneux-fx"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 # 木兰宽松许可证 v2
 license = "MulanPSL-2.0"

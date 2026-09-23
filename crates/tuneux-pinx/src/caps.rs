@@ -11,8 +11,9 @@
 //! 三条仲裁规则：
 //!
 //! 1. **求交授予**：实际授予 = 插件申请 ∩ 宿主允许，未申请的不授予；
-//! 2. **互斥**：网络能力与内容读取能力互斥——堵住「读取的元数据经网络
-//!    批量外带」这条不可见通道。该规则必要但不充分：可见的界面外带
+//! 2. **互斥**：网络能力与内容读取类能力（元数据 / 频谱电平）互斥——
+//!    堵住「读取的内容特征经网络批量外带」这条不可见通道（频谱是内容的
+//!    低保真指纹，与元数据同口径）。该规则必要但不充分：可见的界面外带
 //!    通道（把内容刷到状态栏）由发行版以「通知来源前缀」等方式兜底，
 //!    与本规则、侧载插件默认无网络并列构成三重防线。
 //! 3. **网络可用性**：网络能力还要求编译期开启 network 特性；特性关闭时
@@ -33,6 +34,8 @@ pub enum Capability {
     AudioDsp,
     /// 向界面注册一份调色板（皮肤）：插件只供色、宿主负责渲染（v1 只动颜色）。
     Theme,
+    /// 读取实时频谱数据（宿主注入的快照；只读，供可视化插件）。
+    MeterRead,
 }
 
 impl Capability {
@@ -45,6 +48,7 @@ impl Capability {
             Capability::Network => "network",
             Capability::AudioDsp => "audio_dsp",
             Capability::Theme => "theme",
+            Capability::MeterRead => "meter_read",
         }
     }
 
@@ -57,6 +61,7 @@ impl Capability {
             "network" => Some(Capability::Network),
             "audio_dsp" => Some(Capability::AudioDsp),
             "theme" => Some(Capability::Theme),
+            "meter_read" => Some(Capability::MeterRead),
             _ => None,
         }
     }
@@ -88,7 +93,7 @@ pub fn parse_manifest(text: &str) -> Result<Vec<Capability>, String> {
 /// 能力授予失败的原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapError {
-    /// 网络能力与内容读取能力互斥，二者不能同时授予。
+    /// 网络能力与内容读取类能力（元数据 / 频谱电平）互斥，不能同时授予。
     NetworkExclusive,
     /// 申请了网络能力，但当前构建未开启 network 特性，网络一律不可授予。
     NetworkUnavailable,
@@ -115,8 +120,12 @@ pub fn arbitrate(
     allowed: &[Capability],
 ) -> Result<Vec<Capability>, CapError> {
     let granted = intersect(requested, allowed);
-    // 互斥：网络 ⟂ 内容读取。
-    if granted.contains(&Capability::Network) && granted.contains(&Capability::MetadataRead) {
+    // 互斥：网络 ⟂ 内容读取类（元数据 / 频谱电平）。频谱是内容的低保真
+    // 指纹，与元数据同属「内容特征经网络批量外带」这条不可见通道；
+    // 将来确有「网络 + 频谱」场景（如在线识曲）须经用户显式授权单项豁免。
+    if granted.contains(&Capability::Network)
+        && (granted.contains(&Capability::MetadataRead) || granted.contains(&Capability::MeterRead))
+    {
         return Err(CapError::NetworkExclusive);
     }
     // 网络可用性：特性未开启时，允许集里不该出现网络能力。
@@ -166,6 +175,21 @@ mod tests {
         assert_eq!(
             arbitrate(&requested, &allowed),
             Ok(vec![Capability::AudioPlay])
+        );
+    }
+
+    #[test]
+    fn arbitrate_rejects_network_with_meter_read() {
+        // 频谱电平与元数据同属内容读取类：网络 ⟂ MeterRead。
+        let requested = [Capability::MeterRead, Capability::Network];
+        assert_eq!(
+            arbitrate(&requested, &requested),
+            Err(CapError::NetworkExclusive)
+        );
+        // 无网络时 MeterRead 单独可用（宿主推频谱，纯本地）。
+        assert_eq!(
+            arbitrate(&[Capability::MeterRead], &[Capability::MeterRead]),
+            Ok(vec![Capability::MeterRead])
         );
     }
 

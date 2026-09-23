@@ -192,6 +192,48 @@ mod tests {
         assert_eq!(out, stereo);
     }
 
+    /// 组合回归（重采样通道对齐）：mono 44.1k 经 adapt 上混后再重采样到
+    /// 48k——重采样器按设备通道数（2）构造时，L/R 各自独立滤波、比例保持
+    ///（R ≈ L×0.7071）；若按文件通道数（1）错配构造，滤波窗跨越交错样本
+    /// 会造成声道串扰、比例被破坏。
+    #[test]
+    fn mono_upsampled_then_resampled_keeps_channel_ratio() {
+        use crate::audio::resample::Resample;
+        // 440Hz 正弦，44.1kHz，2048 样本（mono）。
+        let n = 2048;
+        let mono: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
+            .collect();
+        // adapt 上混为立体声（L 原样、R ×0.7071）。
+        let stereo = adapt_channels(&mono, 1, 2);
+        assert_eq!(stereo.len(), n * 2);
+        // 按设备通道数构造重采样器（与解码循环送入数据的实际通道数一致）。
+        let mut rs = Resample::new(44100, 48000, 2, 1024).expect("建重采样器");
+        let out = rs.process(&stereo).expect("重采样");
+        assert!(
+            out.len() > n / 2,
+            "输出样本数应 ≈ 输入×48/44.1（实际 {}）",
+            out.len()
+        );
+        // 线性滤波器对两通道分别作用：R 通道应恒 ≈ L 通道 × 0.7071。
+        //（跳过首尾滤波器瞬态，取中段逐帧断言比例）
+        let frames = out.len() / 2;
+        let mut checked = 0;
+        for f in frames / 4..frames * 3 / 4 {
+            let l = out[f * 2];
+            let r = out[f * 2 + 1];
+            if l.abs() > 1e-3 {
+                let ratio = r / l;
+                assert!(
+                    (ratio - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.01,
+                    "帧 {f} 通道比例 {ratio} 偏离 0.7071（串扰迹象）"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 200, "应有足够样本参与断言（实际 {checked}）");
+    }
+
     #[test]
     fn mono_advances_buf_idx_and_copies_r() {
         let mut l_buf = [0.0f32; spectrum::FFT_SIZE_FOR_BUF];
@@ -309,7 +351,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "时序敏感（断言 < 1.5s 内返回），负载高的机器上会偶发失败；\
+                运行：cargo test -p tuneux-corex -- --ignored"]
     fn push_all_gives_up_after_max_retries_when_full() {
         // 容量极小的 ringbuf
         let ring = HeapRb::<f32>::new(8); // 8 样本 = 2 stereo 帧

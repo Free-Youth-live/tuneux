@@ -47,12 +47,15 @@ pub fn probe_metadata(path: &Path) -> Option<(AudioParams, ProbeTags)> {
         let params = super::opus::OpusBackend::open(path).ok()?.params().clone();
         return Some((params, ProbeTags::default()));
     }
-    // symphonia 不识别 WavPack 容器：同 Opus 处理。
+    // symphonia 不识别 WavPack 容器：轻量探测技术参数（只读块头、不解码，
+    // 修复旧实现整文件解码的缺陷）；标签留空（APEv2 读取属后续工作）。
     if super::wavpack::is_wavpack_path(path) {
-        let params = super::wavpack::WavPackBackend::open(path)
-            .ok()?
-            .params()
-            .clone();
+        let params = super::wavpack::probe_params(path)?;
+        return Some((params, ProbeTags::default()));
+    }
+    // .bin 镜像：自研 CDDA 后端取技术参数（时长精确；无标签）。
+    if super::cdda::is_bin_path(path) {
+        let params = super::cdda::CddaBackend::open(path).ok()?.params().clone();
         return Some((params, ProbeTags::default()));
     }
     let file = std::fs::File::open(path).ok()?;

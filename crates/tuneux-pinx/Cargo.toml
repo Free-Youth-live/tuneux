@@ -34,5 +34,7 @@ tuneux-corex = { path = "../tuneux-corex" }
 [dev-dependencies]
 # 测试：把 WAT 文本编译成 wasm 字节，构建第一方插件（均衡器）验证宿主函数。
 wat = "1"
+# 测试：真实 FFT 链路验证（1kHz 纯音 → compute_spectrum_bands → 插件画面）。
+rustfft.workspace = true
 # 开发工具：官方签名密钥生成的系统安全随机源（仅 gen_signing_key 示例用，离线）。
 getrandom = "0.2"

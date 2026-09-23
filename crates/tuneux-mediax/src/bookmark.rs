@@ -66,9 +66,30 @@ impl BookmarkList {
         self.items.len() < before
     }
 
+    /// 按路径 + 分轨起点精确删除一条书签。
+    ///
+    /// `cue_start_ms` 为 `None` 时匹配整轨书签；否则匹配同起点的分轨书签。
+    /// 与 `remove(path)` 的区别：不会误删同路径下的其他分轨书签。
+    pub fn remove_exact(&mut self, path: &Path, cue_start_ms: Option<u64>) -> bool {
+        let before = self.items.len();
+        self.items
+            .retain(|b| !(b.path == path && b.cue_start_ms == cue_start_ms));
+        self.items.len() < before
+    }
+
     /// 按路径查书签。
     pub fn get(&self, path: &Path) -> Option<&Bookmark> {
         self.items.iter().find(|b| b.path == path)
+    }
+
+    /// 按路径 + 分轨起点精确查找书签。
+    ///
+    /// `cue_start_ms` 为 `None` 时匹配整轨书签；否则匹配同起点的分轨书签。
+    /// 与 `get(path)` 的区别：不会在存在多条同路径书签时误取首条。
+    pub fn get_exact(&self, path: &Path, cue_start_ms: Option<u64>) -> Option<&Bookmark> {
+        self.items
+            .iter()
+            .find(|b| b.path == path && b.cue_start_ms == cue_start_ms)
     }
 
     /// 是否为空。
@@ -118,5 +139,66 @@ mod tests {
         assert!(list.remove(Path::new("/a.mp3")));
         assert!(list.is_empty());
         assert!(!list.remove(Path::new("/a.mp3")));
+    }
+
+    /// `get_exact` 按 (路径, 分轨起点) 精确匹配，不会在多条同路径书签时
+    /// 误取首条（`get` 只按路径匹配，返回插入序第一条）。
+    #[test]
+    fn get_exact_precise_across_cue_bookmarks() {
+        let mut list = BookmarkList::default();
+        list.add(Path::new("/album.flac"), None, 30.0, "整轨");
+        list.add(Path::new("/album.flac"), Some(60_000), 15.0, "分轨2");
+        list.add(Path::new("/album.flac"), Some(180_000), 5.0, "分轨3");
+
+        // 精确命中分轨 2。
+        let cue2 = list
+            .get_exact(Path::new("/album.flac"), Some(60_000))
+            .expect("应命中分轨 2");
+        assert_eq!(cue2.label, "分轨2");
+        assert_eq!(cue2.position_secs, 15.0);
+        // 精确命中整轨。
+        assert_eq!(
+            list.get_exact(Path::new("/album.flac"), None)
+                .map(|b| b.label.as_str()),
+            Some("整轨")
+        );
+        // 不存在的键返回 None。
+        assert!(list
+            .get_exact(Path::new("/album.flac"), Some(999_000))
+            .is_none());
+        assert!(list.get_exact(Path::new("/other.mp3"), None).is_none());
+    }
+
+    /// `remove_exact` 只删目标键，不误删同路径的其他分轨书签
+    ///（`remove(path)` 会一次删掉同路径全部书签，仅整轨/单书签场景用）。
+    #[test]
+    fn remove_exact_precise_across_cue_bookmarks() {
+        let mut list = BookmarkList::default();
+        list.add(Path::new("/album.flac"), None, 30.0, "整轨");
+        list.add(Path::new("/album.flac"), Some(60_000), 15.0, "分轨2");
+        list.add(Path::new("/album.flac"), Some(180_000), 5.0, "分轨3");
+
+        // 删分轨 2：其余两条不受影响。
+        assert!(list.remove_exact(Path::new("/album.flac"), Some(60_000)));
+        assert_eq!(list.items.len(), 2);
+        assert!(list
+            .get_exact(Path::new("/album.flac"), Some(60_000))
+            .is_none());
+        assert!(list.get_exact(Path::new("/album.flac"), None).is_some());
+        assert!(list
+            .get_exact(Path::new("/album.flac"), Some(180_000))
+            .is_some());
+
+        // 删不存在的键返回 false。
+        assert!(!list.remove_exact(Path::new("/album.flac"), Some(60_000)));
+
+        // 删整轨：仅整轨被删，分轨 3 仍在。
+        assert!(list.remove_exact(Path::new("/album.flac"), None));
+        assert_eq!(list.items.len(), 1);
+        assert_eq!(
+            list.get_exact(Path::new("/album.flac"), Some(180_000))
+                .map(|b| b.label.as_str()),
+            Some("分轨3")
+        );
     }
 }

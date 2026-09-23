@@ -8,13 +8,13 @@
 [package]
 # 包名 tuneux；可执行文件名 tuneux
 name = "tuneux"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 # 木兰宽松许可证 v2
 license = "MulanPSL-2.0"
 authors = ["不羁的青春（FreeYouth）"]
 # 项目描述
-description = "跨平台命令行音乐播放器，界面、提示、元数据全中文"
+description = "跨平台命令行音乐播放器"
 # 最小支持 Rust 版本：ratatui 0.30 要求 1.88+（cpal 0.15 要求 1.85+），此处取高者
 rust-version = "1.88"
 
