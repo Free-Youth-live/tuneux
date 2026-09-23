@@ -8,7 +8,7 @@
 //!   Wayland/X11 均适用，无需窗口。
 //! - **Windows**：`rdev` crate（MIT）装 `WH_KEYBOARD_LL` 低层键盘钩子
 //!   （无窗口、无消息泵、我方零 unsafe），捕获裸媒体键后经通道投递；
-//!   二期可加 souvlaki + winit 隐藏窗口（SMTC）根治与其他播放器的抢占。
+//!   后续可加 souvlaki + winit 隐藏窗口（SMTC）根治与其他播放器的抢占。
 //! - **macOS**：Now Playing 需要 app bundle，TUI 无 bundle，暂不实现。
 //!
 //! 事件经 crossbeam-channel 投递到 TUI 主循环，主循环每帧 poll。
@@ -19,7 +19,7 @@ use crossbeam_channel::Receiver;
 /// 系统媒体键事件。
 ///
 /// 主循环收到后直接映射为播放控制（播放/暂停、切曲、音量），
-/// 不经自定义键位层（keymap 尚未接入按键处理）。
+/// 不经自定义键位层（系统媒体键语义固定，不参与键位映射）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // 非 Linux 平台不编译 zbus 监听代码，变体不会被构造，
 // VolumeUp/VolumeDown 变体仅在 Windows 的 rdev 映射中构造，

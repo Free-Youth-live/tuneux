@@ -34,9 +34,7 @@
 //! 实现上用 `OsStr::to_str()`（返回 `Option`，严格判定）而非
 //! `to_string_lossy()`（容忍替换成占位符），从源头杜绝乱码。
 
-// 本模块与插件版（tuneux-fx）fs_browser 同源；异步化导航后 navigate_to/enter_selected/go_up
-// 仅由 FsBrowser::open 与单元测试使用，临时豁免 dead_code 警告。
-#![allow(dead_code)]
+// 本模块与插件版（tuneux-fx）fs_browser 同源。
 
 use std::path::{Path, PathBuf};
 
@@ -50,7 +48,8 @@ pub use tuneux_corex::KNOWN_AUDIO_EXTS as SUPPORTED_EXTS;
 /// 判断依据仅看扩展名（不读文件头），原因：
 /// - 速度快——浏览器要在用户每次进入目录时即时列出，读文件头会有可感延迟；
 /// - symphonia 解码时会再次校验真实格式，扩展名误判不会导致崩溃，
-///   顶多播放时报错，影响可控。
+///   顶多播放时报错，影响可控。另放行 `.cue` 分轨索引文件（cue+bin /
+///   cue+flac 镜像场景的入口，点中后按 FILE 引用展开分轨）。
 ///
 /// 路径无扩展名或扩展名不在支持列表中，均返回 false。
 pub fn is_supported(path: &Path) -> bool {
@@ -58,10 +57,17 @@ pub fn is_supported(path: &Path) -> bool {
         // extension() 返回 OsStr，转成小写 Unicode 再比对
         Some(ext) => {
             let ext_lower = ext.to_string_lossy().to_lowercase();
-            SUPPORTED_EXTS.contains(&ext_lower.as_str())
+            SUPPORTED_EXTS.contains(&ext_lower.as_str()) || ext_lower == "cue"
         }
         None => false,
     }
+}
+
+/// 路径是否 `.cue` 分轨索引文件（大小写不敏感）。
+pub fn is_cue_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("cue"))
 }
 
 /// 一条目录条目（目录或音乐文件）。
@@ -358,6 +364,8 @@ impl FsBrowser {
     ///
     /// 到达文件系统根目录（无 parent）时返回 false，浏览器保持不动。
     /// 这是 Unix `/` 和 Windows `C:\` 等根目录的自然边界。
+    // 仅单元测试使用。
+    #[allow(dead_code)]
     pub fn go_up(&mut self) -> bool {
         match self.cwd.parent() {
             Some(parent) => {
@@ -375,6 +383,8 @@ impl FsBrowser {
     /// 这种"类型驱动的行为分离"让 TUI 的 Enter 键逻辑很清晰：
     /// 若 enter_selected() 成功则已进入新目录；否则说明选中的是文件，
     /// 调用方转而触发播放。
+    // 仅单元测试使用。
+    #[allow(dead_code)]
     pub fn enter_selected(&mut self) -> bool {
         match self.current() {
             Some(Entry::Dir { path, .. }) => {

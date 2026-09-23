@@ -22,7 +22,7 @@ symphonia = { version = "0.6", features = [
     "mp3", "aac", "alac", "flac", "isomp4", "ogg", "vorbis", "wav", "pcm",
 ] }
 # 线程间通信与缓冲
-ringbuf = "0.4"
+ringbuf = "0.5"
 crossbeam-channel = "0.5"
 # 重采样与频谱
 rubato = "0.15"
@@ -51,6 +51,9 @@ rdev = "0.5"
 # -----------------------------------------------------------------------------
 [workspace.lints]
 rust.unsafe_code = "forbid"
+# 生产路径零 unwrap：安全红线的编译期执行（测试模块各 crate 根部
+# cfg_attr(test) 放行；examples 为开发工具，只用 expect 不用 unwrap，天然合规）。
+clippy.unwrap_used = "deny"
 
 # -----------------------------------------------------------------------------
 # 优化配置（仅认 workspace 根；release 构建优化体积与性能）

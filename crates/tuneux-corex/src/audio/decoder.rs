@@ -8,7 +8,7 @@
 //!
 //! 解码职责抽象为 [DecoderBackend] trait，调用方（解码线程）只面向
 //! `Box<dyn DecoderBackend>`，不感知具体后端。当前有 symphonia / Opus /
-//! WavPack / FFmpeg 四个后端。FFmpeg 后端以子进程 IPC 方式
+//! WavPack / FFmpeg / 自研 WAV / 自研 FLAC / 自研 CDDA 七个后端。FFmpeg 后端以子进程 IPC 方式
 //! 隔离 LGPL/GPL 许可传染，仅在桌面平台可选启用。所有后端经
 //! [open_backend] 工厂分发接入，无需改动调用方。
 //!
@@ -29,8 +29,11 @@ use symphonia::core::formats::{FormatOptions, FormatReader, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 
+use super::cdda::{is_bin_path, CddaBackend};
 use super::ffmpeg::{is_ffmpeg_path, FfmpegBackend};
+use super::flac::{is_flac_path, FlacBackend};
 use super::opus::{is_opus_path, OpusBackend};
+use super::wav::{is_wav_path, WavBackend};
 use super::wavpack::{is_wavpack_path, WavPackBackend};
 
 /// 内核认识的音频文件扩展名（小写，不含点）：原生进程内解码 + ffmpeg 桥接长尾。
@@ -208,7 +211,7 @@ impl From<SymphoniaError> for DecodeError {
 
 /// 工厂：按文件扩展名/内容探测分发到具体解码后端。
 ///
-/// 当前有 symphonia / Opus / WavPack / FFmpeg 四个后端，在此按扩展名或
+/// 当前有 symphonia / Opus / WavPack / FFmpeg / 自研 WAV / 自研 FLAC / 自研 CDDA 七个后端，在此按扩展名或
 /// 内容探测追加分支。FFmpeg 后端为进程外 IPC，仅桌面可选。
 /// 返回 `Box<dyn DecoderBackend>` 使调用方与具体后端解耦——
 /// 这是"可插拔"的关键接缝。
@@ -221,6 +224,31 @@ pub fn open_backend(path: &Path) -> Result<Box<dyn DecoderBackend>, DecodeError>
     }
     if is_wavpack_path(path) {
         let backend = WavPackBackend::open(path)?;
+        return Ok(Box::new(backend));
+    }
+    // .flac 扩展名或 fLaC 魔数 → 自研 FLAC 后端。带 ID3 前缀等不严格魔数的
+    // 文件返回 Unsupported → 回退 symphonia（存量文件零退化）。
+    if is_flac_path(path) {
+        match FlacBackend::open(path) {
+            Ok(backend) => return Ok(Box::new(backend)),
+            Err(DecodeError::Unsupported(_)) => {} // 回退 symphonia
+            Err(e) => return Err(e),
+        }
+    }
+    // .wav 扩展名或 RIFF/WAVE 魔数 → 自研 WAV 后端。自研不支持的编码形态
+    //（ADPCM / µ-law 等）回退 symphonia，保证存量文件零退化；其余错误
+    //（如 IO 失败）直接上抛（symphonia 同样打不开）。
+    if is_wav_path(path) {
+        match WavBackend::open(path) {
+            Ok(backend) => return Ok(Box::new(backend)),
+            Err(DecodeError::Unsupported(_)) => {} // 回退 symphonia
+            Err(e) => return Err(e),
+        }
+    }
+    // .bin 扩展名 + 尺寸探测（2352/2448 整除）→ 自研 CDDA 镜像后端。
+    // 尺寸不合法的 .bin 放行给 symphonia（报它自己的错误，语义不变）。
+    if is_bin_path(path) {
+        let backend = CddaBackend::open(path)?;
         return Ok(Box::new(backend));
     }
     // FFmpeg 进程外后端——仅桌面可选。
@@ -371,7 +399,20 @@ impl DecoderBackend for SymphoniaBackend {
 /// 注意：本函数不覆盖 ffmpeg 长尾格式（ape/wma/tak 等）——这些格式恒返回
 /// None、恒走软件重采样（设计可接受：长尾格式本就走进程外解码，无原生直通）。
 pub fn probe_sample_rate(path: &Path) -> Option<u32> {
-    // .wv 走 wavicle 首块头解析（symphonia 不识别 WavPack 容器）。
+    // .bin 镜像：CD 规格恒 44.1kHz（自研探测）。
+    if is_bin_path(path) {
+        return super::cdda::probe_sample_rate(path);
+    }
+    // .flac 走自研 STREAMINFO 头解析（轻量）；失败返回 None = 不直通降级。
+    if is_flac_path(path) {
+        return super::flac::probe_sample_rate(path);
+    }
+    // .wav 走自研头解析（轻量，无需起 symphonia 探测）；失败返回 None，
+    // 调用方按「不直通」降级处理，不影响播放。
+    if is_wav_path(path) {
+        return super::wav::probe_sample_rate(path);
+    }
+    // .wv 走自研 wavpack 首块头解析（symphonia 不识别 WavPack 容器）。
     if is_wavpack_path(path) {
         return super::wavpack::probe_sample_rate(path);
     }

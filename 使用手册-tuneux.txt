@@ -1,10 +1,10 @@
 ============================================================
-tuneux v__VERSION__ 使用手册
+tuneux™ v__VERSION__ 使用手册
 ============================================================
 
 本手册完整介绍 tuneux 的全部功能与操作方法。
 tuneux 是「不羁的青春（FreeYouth）」的纯离线命令行音乐播放器，
-用 Rust 编写，跨平台（Windows / macOS / Linux），界面与提示均为中文。
+用 Rust 编写，跨平台（Windows / macOS / Linux）。
 
 ────────────────────────────────────────────
 
@@ -41,8 +41,8 @@ tuneux 是「不羁的青春（FreeYouth）」的纯离线命令行音乐播放�
 
 三、界面布局（四段）
 
-  ┌ 当前曲目 ───────────────┐ ┌ 电平 ───────┐
-  │ 曲名 / 歌手 / 专辑 / 参数 │ │ 实时电平柱图 │   ← 顶部条
+  ┌ 当前曲目 ────────┐ ┌ 频段 ──┐ ┌ 电平 ───────┐
+  │ 曲名/歌手/专辑/参数 │ │ 低中高 │ │ 实时电平柱图 │   ← 顶部条
   ├────────────────────────┤ ├─────────────┤
   │ [浏览器 |] 播放列表      │ 频谱（半屏/全屏） │   ← 主区
   │           （封面 / 歌词）│                │
@@ -117,6 +117,10 @@ tuneux 是「不羁的青春（FreeYouth）」的纯离线命令行音乐播放�
 
 - 按 a 键加入：选中文件则加入该文件；选中目录则递归加入目录下全部音乐文件
   （含 CUE 分轨展开），并按「专辑 - 曲序」自动排序。
+- **CUE 分轨**：整轨音频旁放同名 `.cue` 自动展开分轨；也可直接选中 `.cue`
+  文件（浏览器已列出）——按 cue 里的 FILE 引用定位音频（支持 `.bin` 光盘
+  镜像，cue+bin 场景）；cue 中的数据轨（MODE1/MODE2 等非音频轨）自动跳过
+  并提示条数；分轨播放按 INDEX 区间起止，终点由音频引擎判定（不多播不少播）。
 - 按 d 删除选中曲目；按 x 清空（两次确认，防止误触）。
 - 按 g 在「平铺」与「按专辑分组」间切换；分组视图下组头显示
   「专辑 - 歌手（N 首）（总时间）」，Enter 折叠 / 展开。
@@ -130,7 +134,9 @@ tuneux 是「不羁的青春（FreeYouth）」的纯离线命令行音乐播放�
 
 【专辑封面（c 键）】
 - c 键三态循环：关 → 单封面 → 封面网格 → 关。
-- 单封面：读取当前曲目标签内嵌封面，以终端字符渲染。
+- 单封面：读取当前曲目标签内嵌封面，以终端字符渲染；无内嵌封面时，
+  自动回退读取同目录的 cover / folder / front / album 图片（jpg/jpeg/png，
+  按此顺序取第一个命中项，大小写不敏感）。
 - 封面网格：按专辑分组展示缩略图，↑↓（k/j）选择、Enter 播放、PageUp/PageDown
   翻页；封面开启时会自动关掉文件浏览器（两者共用左侧位置）。
 
@@ -145,7 +151,8 @@ tuneux 是「不羁的青春（FreeYouth）」的纯离线命令行音乐播放�
 - 示波器：左右声道波形（双边摆动）。
 
 【电平表】
-- 常驻顶部条右侧，显示左右声道实时电平柱图。
+- 常驻顶部条右侧，显示左右声道实时电平柱图；其左侧为频段
+ （低 / 中 / 高频实时强度，字符风格与频谱统一）。
 
 ────────────────────────────────────────────
 
@@ -198,7 +205,7 @@ space / tab / enter / esc / backspace / up / down / left / right / home / end。
   toggle_play = "ctrl+p"
   next = "ctrl+n"
   prev = "ctrl+b"
-  volume_up = "shift+="
+  volume_up = "+"
 
 非法键描述会被忽略并回退默认键，不会导致启动失败。
 
@@ -249,12 +256,16 @@ space / tab / enter / esc / backspace / up / down / left / right / home / end。
 【常用配置项】
   volume            音量（0~1）
   replay_gain       ReplayGain 开关（true / false）
-  repeat            循环模式（off / one / all）
+  repeat            循环模式（off / single / list）
   shuffle           随机播放（true / false）
-  playback_medium   介质风格（none / tape-* / vinyl-*，旧短名 tape/vinyl 兼容）
+  playback_medium   介质风格（none / tape_clear / tape_white /
+                    tape_classic / tape_aged / vinyl_clean / vinyl_dynamic /
+                    vinyl_standard / vinyl_aged，旧短名 tape/vinyl 兼容）
   browser_ratio     浏览器与播放列表的列宽比例
   dedup_on_add      加入播放列表时去重
   media_keys_enabled 系统媒体键开关
+  bar_style         频谱字符风格（matrix 默认 / blocks 块字符 / ascii 复古 /
+                    hanzi 汉字柱，汉字为 2 列宽、横向分辨率减半）
   keymap            自定义键位表
 
 退出（q）时自动保存；直接关窗口也会每 5 秒自动保存一次。
@@ -266,3 +277,4 @@ space / tab / enter / esc / backspace / up / down / left / right / home / end。
 本项目采用木兰宽松许可证 v2（MulanPSL-2.0）开源。
 版权所有 © 2026 不羁的青春（FreeYouth）。
 不羁的青春® 和 FreeYouth® 是注册商标。
+tuneux™ 是商标。

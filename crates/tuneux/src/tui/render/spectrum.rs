@@ -14,6 +14,7 @@ use ratatui::{
 };
 
 use tuneux_corex as audio;
+use tuneux_mediax::BarStyle;
 
 /// splitmix64 一步：给定 u64 状态，原地推进并返回一个伪随机 u64。
 ///
@@ -77,6 +78,7 @@ pub(super) fn draw_level_meter(
     area: Rect,
     engine: &Option<audio::Engine>,
     frame_tick: u64,
+    style: BarStyle,
 ) {
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         " 电平 ",
@@ -94,31 +96,132 @@ pub(super) fn draw_level_meter(
     // 读左右电平（peak 0.0-1.0）。未初始化时 (0.0, 0.0)。
     let (level_l, level_r) = engine.as_ref().map(|e| e.level_lr()).unwrap_or((0.0, 0.0));
 
-    // 拆 L/R 上下两行
-    let rows =
-        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(inner);
+    // 拆 L/R 上下两行（固定行高：高度 2 时 Percentage 分配会把第二行挤成
+    // 0 行导致 R 不显示——fx 同款回归测试守护）。
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(inner);
 
-    draw_vu_row(frame, rows[0], level_l, "L", frame_tick);
+    draw_vu_row(frame, rows[0], level_l, "L", frame_tick, style);
     draw_vu_row(
         frame,
         rows[1],
         level_r,
         "R",
         frame_tick.wrapping_add(0xC0FFEE),
+        style,
     );
+}
+
+/// 三桶默认（Matrix 风格）字符池：纯方块渐进 █▓▒░（从实到虚，每字符连占
+/// 2 格）；非 Matrix 风格用 bar_style 风格池（与电平 / 频谱同族）。
+const BAND_MATRIX_POOL: &[&str] = &["█", "▓", "▒", "░"];
+
+/// 三桶能量面板（顶部条中栏）：低 / 中 / 高各一行，柱长随面板宽度伸缩。
+///
+/// 数据 = 引擎实时频谱（对数 256 段）每桶取最大值（平均会把纯音 /
+/// 稀疏频谱峰值稀释为零）；字符池判定与电平表同口径：Matrix（默认）
+/// 用方块渐进池（按柱位均匀分布，越左越实），其余风格随 bar_style 池
+/// 逐格随机取用（与电平 / 频谱同观感）。`seed` 决定随机序列（每帧不同）。
+pub(super) fn draw_band_column(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    engine: &Option<audio::Engine>,
+    seed: u64,
+    style: BarStyle,
+) {
+    let block = Block::default().borders(Borders::ALL).title(Span::styled(
+        " 频段 ",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width < 8 || inner.height < 3 {
+        return;
+    }
+    // L/R 平均合并为单声道频谱（与频谱面板同口径）。
+    let bands = engine.as_ref().map(|e| {
+        let [l, r] = e.spectrum_lr();
+        let mut merged = [0.0f32; audio::spectrum::N_BANDS];
+        for i in 0..audio::spectrum::N_BANDS {
+            merged[i] = ((l[i] + r[i]) / 2.0).clamp(0.0, 1.0);
+        }
+        merged
+    });
+    // 无引擎时画全零桶（空桶框架在位，栏位不留白）。
+    let bands = bands.unwrap_or([0.0; audio::spectrum::N_BANDS]);
+    let bucket_max = |start: usize, end: usize| -> f32 {
+        bands[start..end].iter().copied().fold(0.0f32, f32::max)
+    };
+    let n = audio::spectrum::N_BANDS;
+    let b1 = n / 3;
+    let b2 = n * 2 / 3;
+    let buckets = [
+        ("低", bucket_max(0, b1)),
+        ("中", bucket_max(b1, b2)),
+        ("高", bucket_max(b2, n)),
+    ];
+    // Matrix（默认）= 纯方块渐进（█▓▒░ 从实到虚，按柱宽均匀分布）；
+    // 其余风格随 bar_style 池逐格随机取用（与电平 / 频谱同观感）。
+    let matrix = style == BarStyle::Matrix;
+    let pool: &[&str] = if matrix {
+        BAND_MATRIX_POOL
+    } else {
+        style.pool()
+    };
+    let col_w = style.col_width();
+    // 每行布局：标签（低/中/高，各 2 列）+ 柱体；柱体填满剩余宽度，
+    // 面板越宽柱越长。
+    let label_w = 2usize;
+    let bar_cols = (inner.width as usize).saturating_sub(label_w) / col_w;
+    if bar_cols == 0 {
+        return;
+    }
+    let mut rng = seed;
+    let mut lines: Vec<Line> = Vec::with_capacity(buckets.len());
+    for (name, energy) in buckets {
+        let active = (energy * bar_cols as f32).ceil() as usize;
+        let mut spans: Vec<Span> = vec![Span::styled(name, Style::default().fg(Color::DarkGray))];
+        for i in 0..bar_cols {
+            if i < active {
+                // Matrix 池按柱位均匀渐变（越左越实）；风格池逐格随机。
+                let ch = if matrix {
+                    pool[((i * pool.len()) / bar_cols).min(pool.len() - 1)]
+                } else {
+                    pool[(rng_next(&mut rng) as usize) % pool.len()]
+                };
+                spans.push(Span::styled(ch, Style::default().fg(Color::LightGreen)));
+            } else {
+                let blank: &str = if col_w == 2 { "· " } else { "·" };
+                spans.push(Span::styled(blank, Style::default().fg(Color::DarkGray)));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// 单个声道的横向 VU 柱。`seed` 决定乱码字符的随机性，每帧不同。
 ///
 /// 行布局：`{label} {百分比}  {乱码柱体}` —— 标签 + 柱。
 /// 柱体部分：active 部分填乱码字符，剩余是空格。
-fn draw_vu_row(frame: &mut ratatui::Frame, area: Rect, level: f32, label: &str, seed: u64) {
+fn draw_vu_row(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    level: f32,
+    label: &str,
+    seed: u64,
+    style: BarStyle,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
 
-    // 乱码字符池：方块渐进（░▒▓█）+ 散点符号（#@*+），按字符宽度都算 1 单元
+    // 乱码字符池：方块渐进（░▒▓█）+ 散点符号（#@*+）——0.5.0 原版观感；
+    // 仅 Matrix（默认）风格用本池，其余风格电平与频谱同族（下方分支）。
     const POOL_CHARS: &[char] = &['░', '▒', '▓', '█', '#', '@', '*', '+'];
+    let col_w = style.col_width();
 
     let w = area.width as usize;
     let level = level.clamp(0.0, 1.0);
@@ -138,11 +241,11 @@ fn draw_vu_row(frame: &mut ratatui::Frame, area: Rect, level: f32, label: &str, 
     let label_w = label_text.chars().count();
 
     // —— 柱体 ——
-    // 柱宽 = w - label_w；柱体可被宽度挤压到 0（窄终端不报错）
-    let bar_w = w.saturating_sub(label_w);
-    let active_cells = (level * bar_w as f32).ceil() as usize;
+    // 柱宽 = w - label_w（电平恒 1 列一格）；可被宽度挤压到 0（窄终端不报错）
+    let bar_cols = w.saturating_sub(label_w) / col_w; // 柱位数（hanzi 2 列一格）
+    let active_cells = (level * bar_cols as f32).ceil() as usize;
 
-    let mut spans: Vec<Span> = Vec::with_capacity(w);
+    let mut spans: Vec<Span> = Vec::with_capacity(bar_cols + 1);
     spans.push(Span::styled(
         label_text,
         Style::default()
@@ -151,14 +254,21 @@ fn draw_vu_row(frame: &mut ratatui::Frame, area: Rect, level: f32, label: &str, 
     ));
 
     let mut rng = seed;
-    for col in 0..bar_w {
+    for col in 0..bar_cols {
         if col < active_cells {
             let r = rng_next(&mut rng);
-            let ch = POOL_CHARS[(r as usize) % POOL_CHARS.len()];
-            spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
+            if style == BarStyle::Matrix {
+                let ch = POOL_CHARS[(r as usize) % POOL_CHARS.len()];
+                spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
+            } else {
+                let pool = style.pool();
+                let ch = pool[(r as usize) % pool.len()];
+                spans.push(Span::styled(ch, Style::default().fg(color)));
+            }
         } else {
             // 不活跃部分：暗灰短横线（让"空"也可见但不抢眼）
-            spans.push(Span::styled("·", Style::default().fg(Color::DarkGray)));
+            let blank: &str = if col_w == 2 { "· " } else { "·" };
+            spans.push(Span::styled(blank, Style::default().fg(Color::DarkGray)));
         }
     }
 
@@ -190,6 +300,7 @@ pub(super) fn draw_audio_panel(
     frame_tick: u64,
     peaks: &std::cell::RefCell<audio::spectrum::SpectrumPeakHold>,
     dt: std::time::Duration,
+    style: BarStyle,
 ) {
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         " 频 谱 ",
@@ -221,15 +332,17 @@ pub(super) fn draw_audio_panel(
     let total_w = inner.width as usize;
     let h = inner.height as usize;
     let bar_max_h = h.saturating_sub(1); // 最底行是基线
-    let active = total_w.min(n_bands);
+    let col_w = style.col_width(); // hanzi 风格 2 列一柱，横向分辨率减半
+    let total_cols = total_w / col_w;
+    let active = total_cols.min(n_bands);
 
     // —— 峰值保持白帽 ——
     // 绿柱实时跟随当前能量；白帽保存每频段历史峰值，能量低于峰值时按固定
     // 每秒速率线性缓落（明显慢于绿柱），且永不低于当前能量。峰值在频段维度
     // 保持，窗口改宽不重置；当前能量与峰值分别 max-pool 到显示列后绘制。
     let peaks_out = peaks.borrow_mut().update(&spectrum, dt);
-    let display_spectrum = pool_to_columns(&spectrum, total_w);
-    let display_peaks = pool_to_columns(&peaks_out, total_w);
+    let display_spectrum = pool_to_columns(&spectrum, total_cols);
+    let display_peaks = pool_to_columns(&peaks_out, total_cols);
     let mut bar_hs = vec![0usize; active];
     let mut peak_hs = vec![0usize; active];
     for i in 0..active {
@@ -237,32 +350,12 @@ pub(super) fn draw_audio_panel(
         peak_hs[i] = (display_peaks[i] * bar_max_h as f32).ceil() as usize;
     }
 
-    // 频段颜色 + 字符：Matrix 风格——纯绿 + 细字符。
-    // 配色：从青改成 LightGreen（Matrix 标志性的亮绿），
-    // 字符池全是 thin（无填充块），每格随机换——
-    // 形成"数据雨"质感的频谱柱。
+    // 柱身单色亮绿（LightGreen），柱顶白色峰值帽；字符池随 bar_style
+    //（宿主内置字符集，hanzi 为 2 列宽）。
     const BAR_COLOR: Color = Color::LightGreen;
-
-    // Matrix 风细字符池：37 个，全部 thin（无填充块）。
-    // 按风格族分组（行注释仅作阅读，运行时无意义）：
-    //   竖线   1 l i I |
-    //   点    · • ◦ : ; , ' ` ´ . j J
-    //   弯折  ~ / \ ⁄
-    //   破折  - – — =
-    //   框线  │ ┆ ┊ ¦ ∣
-    //   符号  ! ? + × ∗ ˖ ˗
-    // 每帧每格随机选——给眼睛"在跳"的活感。
-    // 全部为 1 列宽的窄字符，宽度经 unicode-width 校验。
-    #[allow(clippy::unicode_not_nfc)]
-    const POOL: &[char] = &[
-        // 现有：竖线 + 简单点
-        '1', 'l', 'i', 'I', '|', '\'', ':', '.', // A：点/小字符
-        '·', '•', '◦', ';', ',', '`', '´', 'j', 'J', // B：弯/折
-        '~', '/', '\\', '⁄', // C：破折
-        '-', '–', '—', '=', // D：框线
-        '│', '┆', '┊', '¦', '∣', // F：符号
-        '!', '?', '+', '×', '∗', '˖', '˗',
-    ];
+    let pool = style.pool();
+    let blank: &'static str = if col_w == 2 { "  " } else { " " };
+    let baseline_ch: &'static str = if col_w == 2 { "──" } else { "─" };
 
     let mut rng = frame_tick;
     let mut lines: Vec<Line> = Vec::with_capacity(h);
@@ -275,9 +368,12 @@ pub(super) fn draw_audio_panel(
         let mut spans: Vec<Span> = Vec::with_capacity(total_w);
 
         if row == h - 1 {
-            // 基线行：所有列画一个 ─（深灰，不抢眼）
-            for _ in 0..total_w {
-                spans.push(Span::styled("─", Style::default().fg(Color::DarkGray)));
+            // 基线行：每个柱位画基线字符（深灰，不抢眼）
+            for _ in 0..total_cols {
+                spans.push(Span::styled(
+                    baseline_ch,
+                    Style::default().fg(Color::DarkGray),
+                ));
             }
         } else {
             // 当前行距基线的"高度距离"（row 0 → h-1, from_bottom = h-1 → 1）
@@ -289,24 +385,25 @@ pub(super) fn draw_audio_panel(
                 if peak_h > 0 && from_bottom == peak_h {
                     // 白色峰值帽（可能悬浮在绿柱上方）。
                     let r = rng_next(&mut rng);
-                    let ch = POOL[(r as usize) % POOL.len()];
-                    spans.push(Span::styled(
-                        ch.to_string(),
-                        Style::default().fg(Color::White),
-                    ));
+                    let ch = pool[(r as usize) % pool.len()];
+                    spans.push(Span::styled(ch, Style::default().fg(Color::White)));
                 } else if bar_h > 0 && from_bottom <= bar_h {
                     // 绿色柱体。
                     let r = rng_next(&mut rng);
-                    let ch = POOL[(r as usize) % POOL.len()];
-                    spans.push(Span::styled(ch.to_string(), Style::default().fg(BAR_COLOR)));
+                    let ch = pool[(r as usize) % pool.len()];
+                    spans.push(Span::styled(ch, Style::default().fg(BAR_COLOR)));
                 } else {
-                    spans.push(Span::raw(" "));
+                    spans.push(Span::raw(blank));
                 }
             }
             // 4K 屏等超宽场景：多出的列留空
-            for _ in active..total_w {
-                spans.push(Span::raw(" "));
+            for _ in active..total_cols {
+                spans.push(Span::raw(blank));
             }
+        }
+        // 列宽整除不尽的右缘余量补空（仅 2 列风格遇奇数宽度时出现）。
+        if total_cols * col_w < total_w {
+            spans.push(Span::raw(" "));
         }
         lines.push(Line::from(spans));
     }
@@ -322,6 +419,7 @@ pub(super) fn draw_oscilloscope(
     area: Rect,
     engine: &Option<audio::Engine>,
     frame_tick: u64,
+    style: BarStyle,
 ) {
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         " 示波器 ",
@@ -342,17 +440,18 @@ pub(super) fn draw_oscilloscope(
         .unwrap_or([[0.0; audio::spectrum::WAVEFORM_LEN]; 2]);
     let rows =
         Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(inner);
-    draw_wave_band(frame, rows[0], &l, "L", frame_tick);
-    draw_wave_band(frame, rows[1], &r, "R", frame_tick);
+    draw_wave_band(frame, rows[0], &l, "L", frame_tick, style);
+    draw_wave_band(frame, rows[1], &r, "R", frame_tick, style);
 }
 
-/// 单个声道的双边波形：中线基线 '-'，波形点用随机字符（随帧变化）。
+/// 单个声道的双边波形：中线基线，波形点用风格池字符（随帧变化）。
 fn draw_wave_band(
     frame: &mut ratatui::Frame,
     area: Rect,
     wave: &[f32],
     label: &str,
     frame_tick: u64,
+    style: BarStyle,
 ) {
     if area.width < 3 || area.height < 3 {
         return;
@@ -364,16 +463,19 @@ fn draw_wave_band(
     let amp = (mid.saturating_sub(1)).max(1) as f32;
     // 左侧标签占 2 列（"L " / "R "），其余画波形。
     let label_text = format!("{label} ");
-    let bar_w = w.saturating_sub(label_text.chars().count());
-    if bar_w == 0 {
+    let col_w = style.col_width();
+    let bar_cols = w.saturating_sub(label_text.chars().count()) / col_w;
+    if bar_cols == 0 {
         return;
     }
-    // 随机字符池（纯 ASCII，1 列宽，避免歧义宽度）。
-    const POOL: &[char] = &['1', '0'];
+    // 字符池随 bar_style（与频谱同风格）；中线 / 空白按列宽对齐。
+    let pool = style.pool();
+    let mid_ch: &str = if col_w == 2 { "──" } else { "-" };
+    let blank: &str = if col_w == 2 { "  " } else { " " };
     let mut rng = frame_tick ^ 0x9E37_79B9;
     let mut lines = Vec::with_capacity(h);
     for row in 0..h {
-        let mut spans = Vec::with_capacity(w);
+        let mut spans = Vec::with_capacity(bar_cols + 1);
         if row == 0 {
             spans.push(Span::styled(
                 label_text.clone(),
@@ -384,25 +486,59 @@ fn draw_wave_band(
         } else {
             spans.push(Span::raw("  "));
         }
-        for col in 0..bar_w {
-            let idx = col * audio::spectrum::WAVEFORM_LEN / bar_w;
-            let v = (wave[idx] * 3.0).clamp(-1.0, 1.0); // 增益 ×3，低电平也撑满 // 带符号 -1.0~1.0
-                                                        // 波形点行：v=1 到顶、v=0 中线、v=-1 到底。
+        for col in 0..bar_cols {
+            let idx = col * audio::spectrum::WAVEFORM_LEN / bar_cols;
+            // 增益 ×3 让低电平也撑满；波形点行：v=1 到顶、v=0 中线、v=-1 到底。
+            let v = (wave[idx] * 3.0).clamp(-1.0, 1.0);
             let wave_row = mid as f32 - v * amp;
-            let ch = if (wave_row - row as f32).abs() < 0.5 {
-                // 波形点用随机字符（随帧变化，像老式点阵示波器）。
-                POOL[(rng_next(&mut rng) as usize) % POOL.len()]
+            if (wave_row - row as f32).abs() < 0.5 {
+                // 波形点用风格池字符（随帧变化）。
+                let ch = pool[(rng_next(&mut rng) as usize) % pool.len()];
+                spans.push(Span::styled(ch, Style::default().fg(Color::Green)));
             } else if row == mid {
-                '-'
+                spans.push(Span::styled(mid_ch, Style::default().fg(Color::DarkGray)));
             } else {
-                ' '
-            };
-            spans.push(Span::styled(
-                ch.to_string(),
-                Style::default().fg(Color::Green),
-            ));
+                spans.push(Span::raw(blank));
+            }
         }
         lines.push(Line::from(spans));
     }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 三桶中栏渲染守护：无引擎时也画出带边框标题的空桶框架，
+    /// 低 / 中 / 高三行齐备，每桶占满「内宽 - 标签 2 列」个占位符。
+    #[test]
+    fn band_column_renders_empty_buckets_without_engine() {
+        let backend = ratatui::backend::TestBackend::new(24, 5);
+        let mut terminal = ratatui::Terminal::new(backend).expect("建终端");
+        terminal
+            .draw(|f| {
+                super::draw_band_column(f, f.area(), &None, 0, BarStyle::Matrix);
+            })
+            .expect("绘制");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        for name in ["低", "中", "高"] {
+            assert!(text.contains(name), "{name} 应在：{text:?}");
+        }
+        // 标题「频段」：宽字符在 buffer 中两字间会隔一个 continuation 空串，
+        // 分开断言两字都在即可（视觉上紧邻）。
+        assert!(
+            text.contains('频') && text.contains('段'),
+            "标题应在：{text:?}"
+        );
+        // 无引擎 = 三桶全空：每桶占满内宽（24 列终端：内宽 22 - 标签 2 = 20 格），
+        // 三桶共 60 个占位符「·」（Matrix 单列池）。
+        assert_eq!(text.matches('·').count(), 60, "每桶应占满内宽：{text:?}");
+    }
 }

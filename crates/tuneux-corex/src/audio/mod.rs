@@ -4,10 +4,14 @@
 //!
 //! 子模块：
 //! - [`decoder`]：可插拔解码后端（DecoderBackend trait + open_backend 工厂，
-//!   当前 symphonia + Opus + WavPack + FFmpeg 四个后端；另含采样率探测）；
+//!   当前 symphonia + Opus + WavPack + FFmpeg + 自研 WAV + 自研 FLAC +
+//!   自研 CDDA 七个后端；另含采样率探测）；
+//! - [`cdda`]：CD-DA 镜像（.bin）自研解码后端（扇区流式，镜像进程内路线）；
+//! - [`flac`]：FLAC 自研解码后端（逐帧流式 + SEEKTABLE seek，无损自研第二阶段）；
+//! - [`wav`]：WAV 自研解码后端（RIFF/PCM 流式，无损自研第一阶段）；
 //! - [`opus`]：Opus 解码后端（Ogg Opus 解封装 + opus-decoder 包解码）；
 //! - [`ffmpeg`]：FFmpeg 进程外解码后端（子进程 IPC 隔离 LGPL）；
-//! - [`wavpack`]：WavPack 解码后端（基于 wavicle，`.wv` 无损流）；
+//! - [`wavpack`]：WavPack 解码后端（自研手写，`.wv` 无损流；wavicle 仅留 dev-dependencies 测试对拍）；
 //! - [`ogg_opus`]：Ogg 页解析与逻辑包重组（opus 后端的解封装底层）；
 //! - [`resample`]：rubato 重采样（采样率不匹配时使用）；
 //! - [`engine`]：音频引擎句柄（主线程接口，下发命令、读取状态）；
@@ -20,16 +24,19 @@
 
 // 契约化纪律：engine_thread/resample 是内部实现，
 // 不进入公共 API 面；ringbuf/线程细节不外泄，保拆仓期权。
+pub(crate) mod cdda;
 pub mod compressor;
 pub mod decoder;
 pub mod engine;
 pub(crate) mod engine_thread;
 pub mod equalizer;
 pub(crate) mod ffmpeg;
+pub(crate) mod flac;
 pub(crate) mod ogg_opus;
 pub(crate) mod opus;
 pub mod playback_medium;
 pub(crate) mod probe;
 pub(crate) mod resample;
 pub mod spectrum;
+pub(crate) mod wav;
 pub(crate) mod wavpack;

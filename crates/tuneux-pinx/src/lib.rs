@@ -16,11 +16,15 @@
 //! - [`net`]：网络代发钩子——意图三元组、域名白名单、传输层接口与离线拒绝；
 //! - [`journal`]：插件加载与授权的追加式记录（核查日志，非防篡改）；
 //! - [`runtime`]：WASM 控制面运行时——wasmi 装载 / 实例化、宿主函数注入
-//!   （均衡器 `eq_set` + `log`）、燃料 / 内存页硬配额、能力默认拒绝。
+//!   （`eq_set` / `compressor_set` / `theme_register` / `meter_read` 等）、
+//!   燃料 / 内存页硬配额、能力默认拒绝（ABI 清单见 runtime 模块文档）。
 //!
 //! 音频线程零插件：插件只经宿主函数写参数（控制面），实际 DSP 由宿主
 //! （corex）在音频线程执行。宿主接口以真实插件（均衡器）跑通后冻结。
 
+// 测试代码允许 unwrap：断言失败即测试失败，语义与生产路径不同
+//（生产路径零 unwrap 由 workspace lints 强制）。
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 pub mod caps;
 pub mod journal;
 pub mod net;

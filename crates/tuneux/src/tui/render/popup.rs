@@ -19,9 +19,9 @@ use ratatui::{
 /// 版本号取编译期的 `CARGO_PKG_VERSION`，与 Cargo.toml 保持一致，
 /// 避免手工写死导致版本漂移。
 pub(super) fn draw_about(frame: &mut ratatui::Frame, area: Rect) {
-    // 弹窗尺寸：宽度不超过 66 列，高度不超过 14 行（内容恰好放得下）。
+    // 弹窗尺寸：宽度不超过 66 列，高度不超过 19 行（内容恰好放得下）。
     let box_w = area.width.min(66);
-    let box_h = area.height.min(14);
+    let box_h = area.height.min(19);
     let box_area = Rect {
         x: area.x + (area.width.saturating_sub(box_w)) / 2,
         y: area.y + (area.height.saturating_sub(box_h)) / 2,
@@ -42,8 +42,10 @@ pub(super) fn draw_about(frame: &mut ratatui::Frame, area: Rect) {
     let version = env!("CARGO_PKG_VERSION");
     let lines = vec![
         Line::from(vec![
+            // 商标：tuneux 为**未注册**商标 → \u{2122}（™，普通文本商标符号）；
+            // 用转义写法与紧随的作者标记 \u{00AE}（®）保持同族，避免文件编码差异。
             Span::styled(
-                format!("tuneux v{version}"),
+                format!("tuneux\u{2122} v{version}"),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -59,10 +61,15 @@ pub(super) fn draw_about(frame: &mut ratatui::Frame, area: Rect) {
         Line::from("这是一个基于命令行的音乐播放器"),
         Line::from(""),
         Line::from("支持 MP3 · FLAC · WAV · OGG · OPUS · WV · M4A · AAC · ALAC"),
-        Line::from("中文界面 · 纯离线 · 不收集任何数据"),
+        Line::from("纯离线 · 不收集任何数据"),
         Line::from(""),
         Line::from("本项目采用木兰宽松许可证 v2（MulanPSL-2.0）"),
-        Line::from("基于 symphonia 等开源库构建，详见 README"),
+        Line::from("基于以下开源项目构建："),
+        Line::from("音频  cpal · symphonia · opus-decoder · rubato · rustfft · ringbuf"),
+        Line::from("界面  ratatui · crossterm · image · unicode-width"),
+        Line::from("通用  serde · toml · dirs · encoding_rs · crossbeam-channel"),
+        Line::from("插件  wasmi · ed25519-dalek"),
+        Line::from("平台  zbus（Linux）· rdev（Windows）"),
         Line::from(""),
         // \u{00A9} 是普通文本版权符号（非 emoji 变体 \u{00A9}\u{FE0F}），
         // 与周围文字同号同宽，避免在部分终端上被渲染成大号 emoji 图标。

@@ -169,14 +169,22 @@ pub(super) fn switch_stream_for_playback(
     state.set_bitstream(final_bitstream);
 }
 
+/// 建 cpal 输出流并接线回调。
+///
+/// `stream_sample_rate` / `stream_channels` 是**目标流**的参数，不是"设备默认值"：
+/// 首次由 `spawn_threads` 传设备默认值，重建时由 `rebuild_stream` 按其调用方
+/// 的目标值传入（故旧名 `device_*` 在重建路径上名实不符）。注意 0.5.1 口径下
+/// 设备热切换只跟随新设备的**采样率**，通道数仍传 spawn 捕获值（取舍与完整
+/// 修复计划见 `audio_loop` 设备切换处注释）。回调内频谱 FFT、均衡器、压缩器
+/// 与电平帧数换算全按这两个值计算。
 pub(super) fn build_stream(
     device: &cpal::Device,
     config: &StreamConfig,
     sample_format: SampleFormat,
     mut consumer: HeapCons<f32>,
     state: Arc<SharedState>,
-    device_sample_rate: u32,
-    device_channels: usize,
+    stream_sample_rate: u32,
+    stream_channels: usize,
 ) -> Option<Stream> {
     if sample_format != SampleFormat::F32 {
         // 样本格式非 f32 暂不支持：返回 None，由上层错误通道（init/设备切换）提示。
@@ -271,8 +279,8 @@ pub(super) fn build_stream(
                 medium_effects.apply(
                     state.medium(),
                     &mut data[..n],
-                    device_channels.max(1),
-                    device_sample_rate,
+                    stream_channels.max(1),
+                    stream_sample_rate,
                 );
                 // 均衡器 DSP：介质之后、音量之前（EQ 是音色修饰，与监听音量解耦）。
                 // 按槽位升序遍历，空槽（未分配）跳过。
@@ -280,8 +288,8 @@ pub(super) fn build_stream(
                     if state.eq_slot_used(i) {
                         e.process(
                             &mut data[..n],
-                            device_channels.max(1),
-                            device_sample_rate,
+                            stream_channels.max(1),
+                            stream_sample_rate,
                             state.eq_slot(i),
                         );
                     }
@@ -291,23 +299,26 @@ pub(super) fn build_stream(
                     if state.comp_slot_used(i) {
                         c.process(
                             &mut data[..n],
-                            device_channels.max(1),
-                            device_sample_rate,
+                            stream_channels.max(1),
+                            stream_sample_rate,
                             state.comp_slot(i),
                         );
                     }
                 }
-                // 再应用音量（介质 DSP 之后）。
+                // 再应用音量（介质 DSP 之后），并做输出限幅：ReplayGain 正增益 +
+                // EQ/压缩器补偿叠加可能使 |样本|>1，到 DAC 即硬削波（爆音）。
+                // clamp 到 [-1, 1] 是最后一道防线（rg.rs 的 apply_gain_db 限幅
+                // 未接入播放路径，此处回调内就地兜底）。
                 let vol = state.volume();
                 for s in data[..n].iter_mut() {
-                    *s *= vol;
+                    *s = (*s * vol).clamp(-1.0, 1.0);
                 }
                 // 不足部分静音
                 for s in data[n..].iter_mut() {
                     *s = 0.0;
                 }
                 // 累加进度（帧数 = 样本数 / 通道数）
-                let frames = (n / device_channels.max(1)) as u64;
+                let frames = (n / stream_channels.max(1)) as u64;
                 state.add_frames(frames);
 
                 // —— 累计 L/R peak + 频谱环形缓冲 ——
@@ -315,7 +326,7 @@ pub(super) fn build_stream(
                 // accumulate_spectrum）。buf_idx 由函数内部推进。
                 accumulate_spectrum(
                     &data[..n],
-                    device_channels,
+                    stream_channels,
                     &mut buf_idx,
                     &mut l_buf,
                     &mut r_buf,
@@ -353,14 +364,14 @@ pub(super) fn build_stream(
                     // 满足 clippy unused-assignments）
                     let bands_l = spectrum::compute_spectrum_bands(
                         &l_sorted,
-                        device_sample_rate,
+                        stream_sample_rate,
                         &mut fft_planner,
                         &mut fft_buf_l,
                         &mut fft_plan_scratch_l,
                     );
                     let bands_r = spectrum::compute_spectrum_bands(
                         &r_sorted,
-                        device_sample_rate,
+                        stream_sample_rate,
                         &mut fft_planner,
                         &mut fft_buf_r,
                         &mut fft_plan_scratch_r,

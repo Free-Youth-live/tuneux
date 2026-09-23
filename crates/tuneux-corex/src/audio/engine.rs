@@ -1,29 +1,32 @@
 //! # 音频引擎模块
 //!
 //! 整合解码、重采样、cpal 输出，提供统一的播放控制接口。
-//! 采用**三线程模型**：
+//! 采用**四线程模型**（另有一个瞬态的 ffmpeg stderr 读取线程，随子进程存亡）：
 //!
 //! ```text
 //! 主线程（TUI）
 //!   │  audio_cmd 通道
 //!   ▼
-//! 音频线程 ── 持有 cpal Stream（本线程独占，不跨线程）
-//!   │  ▲                       │
-//!   │  │ consumer               │ decoder_cmd 通道
-//!   │  │ (消费 ringbuf)          ▼
-//!   │  └── ringbuf ◀── producer ── 解码线程（常驻）
-//!   │
-//!   └ finished / failed 通道 → 主线程（EOF / 播放失败通知，用于自动下一曲）
+//! 音频线程 ── 创建并持有 cpal Stream（macOS 上 Stream 非 Send，本线程独占）
+//!   │            │ decoder_cmd 通道
+//!   │            ▼
+//!   │        解码线程（常驻）── producer ──▶ ringbuf（SPSC 无锁）
+//!   │                                          │
+//!   └── finished / failed 通道 ◀──（EOF/失败）─┘
+//!                                             ▼
+//!                                     cpal 回调线程（consumer.pop）
+//!                                     实时 DSP / 频谱 / 电平 / 波形在此
 //! ```
 //!
 //! ## 设计要点
 //!
 //! - **cpal Stream 必须在单一线程内创建并保活**：macOS 上 Stream 非 Send。
-//!   音频线程独占 Stream，主线程通过 audio_cmd 通道控制。
+//!   音频线程独占 Stream 的创建与重建；**音频回调在 cpal 自有的回调线程执行**，
+//!   实时纪律（零堆分配、零锁）约束的是这个回调线程，不是音频线程。
 //! - **解码线程常驻**：不按需 spawn/stop。producer 一直在解码线程
 //!   （ringbuf 的 Prod 不可 Clone，必须固定在一个线程）。换曲时音频线程
 //!   通过 decoder_cmd 通道通知解码线程加载新文件。
-//! - **ringbuf 是无锁 SPSC**：解码线程（唯一 producer）→ 音频回调（唯一 consumer），
+//! - **ringbuf 是无锁 SPSC**：解码线程（唯一 producer）→ cpal 回调线程（唯一 consumer），
 //!   不会阻塞实时回调。
 //! - **状态共享用原子变量**：进度、音量、播放状态跨线程读取，避免 Mutex
 //!   （回调持锁有死锁/延迟风险）。
@@ -38,6 +41,40 @@ use super::playback_medium::PlaybackMedium;
 
 /// 音量原子存储比例：u32 千分比（0-1000），避免 f32 原子操作缺失。
 const VOLUME_SCALE: u32 = 1000;
+
+/// 预载目标：整文件（区间全 None）或指定时间范围（cue 相邻曲目）。
+///
+/// 区间语义与 `AudioCmd::PlayRange` 对齐：预载时后端即 seek 到
+/// `start_secs`，无缝切换后按 [start_secs, end_secs) 继续播。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreloadTarget {
+    /// 音频文件路径。
+    pub path: PathBuf,
+    /// 区间起点（秒；None = 从文件头）。
+    pub start_secs: Option<f64>,
+    /// 区间终点（秒；None = 到文件末尾）。
+    pub end_secs: Option<f64>,
+}
+
+impl PreloadTarget {
+    /// 整文件预载（与原 `PreloadNext(path)` 语义等价）。
+    pub fn whole(path: PathBuf) -> Self {
+        Self {
+            path,
+            start_secs: None,
+            end_secs: None,
+        }
+    }
+
+    /// 区间预载（cue 相邻曲目 / 光盘镜像单曲目）。
+    pub fn range(path: PathBuf, start_secs: f64, end_secs: Option<f64>) -> Self {
+        Self {
+            path,
+            start_secs: Some(start_secs),
+            end_secs,
+        }
+    }
+}
 
 /// 主线程 → 音频线程 的控制命令。
 ///
@@ -55,6 +92,20 @@ pub enum AudioCmd {
         /// 加载完成后 seek 的目标秒数。
         secs: f64,
     },
+    /// 加载并只播放文件中的 [start_secs, end_secs) 区间
+    ///（cue 分轨 / 光盘镜像单曲目 / 外部消费场景）。
+    ///
+    /// 播放位置到达 `end_secs` 后自然结束（draining 播完尾巴再 finished）；
+    /// `end_secs` 为 None 时播到文件末尾。时长与进度按区间长度上报
+    ///（进度从 0 起，终点判定按源文件时间轴、重采样前累计）。
+    PlayRange {
+        /// 待播放的文件路径。
+        path: PathBuf,
+        /// 区间起点（秒）。
+        start_secs: f64,
+        /// 区间终点（秒）；None = 文件末尾。
+        end_secs: Option<f64>,
+    },
     /// 暂停。
     Pause,
     /// 恢复播放。
@@ -68,7 +119,8 @@ pub enum AudioCmd {
     /// 预载下一曲（Gapless 无缝播放）：解码线程提前打开下一曲后端并缓存；
     /// 当前曲 EOF 时若预载就绪且采样率一致，直接无缝切换（不 draining/不重发 Play）。
     /// None = 取消预载（手动切曲/seek/停止时下发）。
-    PreloadNext(Option<PathBuf>),
+    /// 区间预载见 [`PreloadTarget::range`]（cue 相邻曲目）。
+    PreloadNext(Option<PreloadTarget>),
 }
 
 /// 音频线程 → 解码线程 的命令。
@@ -81,12 +133,20 @@ pub(crate) enum DecoderCmd {
     Load(PathBuf),
     /// 加载新文件，加载完立刻 seek 到 `secs`（用于 PlayResume 路径）。
     LoadAndSeek { path: PathBuf, secs: f64 },
+    /// 加载新文件并只播放其中 [start_secs, end_secs) 区间（PlayRange 路径）：
+    /// 终点判定按源文件时间轴在重采样前累计，时长按区间长度上报。
+    LoadRange {
+        path: PathBuf,
+        start_secs: f64,
+        end_secs: Option<f64>,
+    },
     /// Seek 到秒数。
     Seek(f64),
     /// 停止当前解码。
     Stop,
-    /// 预载下一曲后端（Gapless）：open 并缓存，不启动解码。
-    Preload(Option<PathBuf>),
+    /// 预载下一曲后端（Gapless）：open 并缓存，不启动解码；
+    /// 区间预载会先 seek 到 start_secs 再缓存。
+    Preload(Option<PreloadTarget>),
     /// 更换 ringbuf 的 producer。
     /// 用于原生采样率直通：换曲时若采样率变化，音频线程会销毁旧 Stream、
     /// 重建 ringbuf（旧的 consumer 随旧 Stream drop），把新 producer 通过
@@ -132,6 +192,14 @@ pub(super) struct SharedState {
     /// 置 true，音频线程主循环每轮检查到后自动暂停流，避免播完继续吐静音。
     /// 用 AtomicBool 边沿触发：消费后立刻清零，防止重复触发。
     playback_finished: AtomicBool,
+    /// 播放是否已停在末尾（EOF 排空完成 / 解码致命错误 / 加载失败）。
+    /// `signal_playback_finished` 置位，解码恢复（Load / Seek / 无缝切换）清零。
+    /// 与 playback_finished 的区别：后者是一次性边沿信号（音频线程消费即清），
+    /// 本标志是持续状态——主线程据此区分「暂停在中途」与「停在末尾」：
+    /// 末尾态下 Resume 无意义（解码器已耗尽、ring 已空），应重新起播。
+    /// 无时长曲目（duration 上报 0，如 Opus / FFmpeg 后端）尤其依赖本标志——
+    /// 进度判定（position ≥ duration）对其永远不成立。
+    at_eof: AtomicBool,
     /// 实时左右声道电平（peak amplitude 0.0-1.0，f32 位模式存 u32）。
     /// 音频回调每 ~10ms 累计窗口内最大绝对值后写入。
     /// 主线程读出来画 VU 表。AtomicU32 避免 f32 原子操作缺失。
@@ -184,6 +252,7 @@ impl Default for SharedState {
             is_playing: AtomicBool::new(false),
             flush_epoch: AtomicU64::new(0),
             playback_finished: AtomicBool::new(false),
+            at_eof: AtomicBool::new(false),
             level_lr: [AtomicU32::new(0), AtomicU32::new(0)],
             spectrum_lr: [
                 core::array::from_fn(|_| AtomicU32::new(0)),
@@ -264,11 +333,17 @@ impl SharedState {
 
     /// 写入 ReplayGain 测量结果（dB × 100 定点；非有限值清哨兵）。
     /// 值域先钳到 i32：正常增益在 ±百 dB 量级，钳制只防畸形输入。
+    ///
+    /// 下界取 `i32::MIN + 1` 而非 `i32::MIN`：`i32::MIN` 是本字段的"未测量"
+    /// 哨兵，合法值若能落到它上面就会与哨兵碰撞。按 `dB × 100` 换算：
+    /// 哨兵 `i32::MIN` = −21 474 836.48 dB，钳制下界 `i32::MIN + 1` =
+    /// −21 474 836.47 dB——两者都远不可达，但把哨兵排除出值域后，该碰撞在
+    /// 类型层面就不可能发生。
     pub(super) fn set_measured_gain_db(&self, gain_db: f64) {
         let v = if gain_db.is_finite() {
             (gain_db * 100.0)
                 .round()
-                .clamp(i32::MIN as f64, i32::MAX as f64) as i32
+                .clamp((i32::MIN + 1) as f64, i32::MAX as f64) as i32
         } else {
             i32::MIN
         };
@@ -303,8 +378,20 @@ impl SharedState {
         self.flush_epoch.load(Ordering::Relaxed)
     }
     /// 通知音频线程"解码已结束"（EOF 或致命错误）。由解码线程调用。
+    /// 同时置末尾态（`at_eof`）——所有「播放走到尽头」的路径都经本函数，
+    /// 单点置位保证两处口径一致。
     pub(super) fn signal_playback_finished(&self) {
         self.playback_finished.store(true, Ordering::Relaxed);
+        self.at_eof.store(true, Ordering::Relaxed);
+    }
+    /// 清除末尾态（解码恢复时调用：Load / LoadAndSeek / LoadRange / Seek /
+    /// 无缝切换）。
+    pub(super) fn clear_at_eof(&self) {
+        self.at_eof.store(false, Ordering::Relaxed);
+    }
+    /// 播放是否停在末尾（持续状态；见 `at_eof` 字段说明）。
+    pub(super) fn at_eof(&self) -> bool {
+        self.at_eof.load(Ordering::Relaxed)
     }
     /// 音频线程主循环轮询：若解码完成标志已置位则清零并返回 true。
     /// 返回 true 表示"刚收到一次结束事件，应暂停流"。
@@ -324,7 +411,7 @@ impl SharedState {
         )
     }
     /// 写入左右声道频谱（N_BANDS 个频段，dB 归一化 0.0-1.0）。
-    /// 频谱在解码线程/音频线程里每 10ms 算一次后调用。
+    /// 频谱在音频回调里每 10ms 算一次后调用（解码线程不涉频谱）。
     pub(super) fn set_spectrum_lr(&self, l: &[f32], r: &[f32]) {
         for (i, &v) in l.iter().enumerate().take(super::spectrum::N_BANDS) {
             self.spectrum_lr[0][i].store(v.to_bits(), Ordering::Relaxed);
@@ -357,7 +444,8 @@ impl SharedState {
         })
     }
     /// 写入最近一次错误（解码/打开失败）。覆盖式。
-    /// 解码线程在 eprintln! 之后调用，UI 能向用户显示"刚才跳过了什么"。
+    /// 解码线程静默记录（运行期不 eprintln!，避免弄脏 raw-mode 屏幕），
+    /// UI 能向用户显示"刚才跳过了什么"。
     pub(super) fn set_last_error(&self, msg: String) {
         if let Ok(mut g) = self.last_error.lock() {
             *g = Some(msg);
@@ -510,8 +598,14 @@ impl Engine {
     }
 
     /// 下发命令（非阻塞）。
+    ///
+    /// 发送失败（音频线程已退出）不再静默：写入 last_error 供上层感知
+    /// 「命令未送达」——引擎异常遇退出时，UI 能显示原因而非无声无息。
     pub fn send(&self, cmd: AudioCmd) {
-        let _ = self.cmd_tx.send(cmd);
+        if self.cmd_tx.send(cmd).is_err() {
+            self.state
+                .set_last_error("音频线程已退出，命令未送达".to_string());
+        }
     }
 
     /// 当前播放进度（秒）。
@@ -534,6 +628,15 @@ impl Engine {
     /// 是否正在播放。
     pub fn is_playing(&self) -> bool {
         self.state.is_playing()
+    }
+    /// 播放是否已停在末尾（EOF 排空完成 / 解码错误后未恢复）。
+    ///
+    /// 与 `is_playing() == false` 联合区分「暂停在中途」与「播完停在末尾」：
+    /// 末尾态下 Resume 不出声（解码器已耗尽），调用方应重新起播
+    /// （Play / PlayRange）。无时长曲目（`duration()` 为 0）只能靠本标志
+    /// 判定末尾——进度比较对其永远不成立。
+    pub fn at_eof(&self) -> bool {
+        self.state.at_eof()
     }
     /// 左右声道实时电平（peak amplitude，0.0-1.0）。
     /// 供 TUI 绘制 VU 表使用。未播放时为 (0.0, 0.0)。
@@ -706,6 +809,20 @@ mod tests {
         st.set_measured_gain_db(-8.0);
         let _ = st.take_measured_gain_db();
         assert!(st.take_measured_gain_db().is_none());
+    }
+
+    /// 末尾态标志往返：signal 置位、边沿信号消费后仍在（持续状态）、
+    /// clear 复位——无时长曲目 EOF 后空格重播的判定基础。
+    #[test]
+    fn at_eof_state_roundtrip() {
+        let st = SharedState::default();
+        assert!(!st.at_eof(), "初始不在末尾态");
+        st.signal_playback_finished();
+        assert!(st.at_eof(), "结束信号应同时置末尾态");
+        assert!(st.take_playback_finished(), "边沿信号可读");
+        assert!(st.at_eof(), "边沿信号被消费后末尾态仍在（持续状态）");
+        st.clear_at_eof();
+        assert!(!st.at_eof(), "解码恢复应清除末尾态");
     }
 
     /// 槽位分配/释放往返（插件「插入↔拔出」的数据面语义）：

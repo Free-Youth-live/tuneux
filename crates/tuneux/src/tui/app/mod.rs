@@ -40,6 +40,8 @@ pub type DirAddResult = (
     PathBuf,
     Vec<playlist::PlaylistItem>,
     Vec<(PathBuf, tuneux_mediax::metadata::TrackMetadata)>,
+    // 本批跳过的数据轨总数（cue 中的 MODE1/MODE2 等不可播轨；供 UI 提示）。
+    usize,
 );
 
 /// 应用运行时状态。
@@ -98,6 +100,9 @@ pub struct App {
     /// 频谱显示模式（`v` 键切换：关 → 半屏 → 全屏 → 示波器 → 关）。
     /// 默认 Hidden——开屏给完整的播放列表，用户想看的时再 v 键唤出。
     pub spectrum_mode: SpectrumMode,
+    /// 频谱 / 电平表 / 示波器的字符风格（配置键 `bar_style` 解析而来，
+    /// 非法值回落 Matrix）。
+    pub bar_style: tuneux_mediax::BarStyle,
     /// 播放介质风格（`m` 键循环：无 → 4 磁带 → 4 黑胶 → 无）。
     /// 只作用于声音（corex DSP 修饰），不改变界面布局。
     pub playback_medium: audio::PlaybackMedium,
@@ -110,7 +115,7 @@ pub struct App {
     /// 切歌时清空；同一首歌内复用——避免每帧重新解码。
     pub cover_cache: Option<(PathBuf, image::DynamicImage)>,
     /// 当前封面面板缩略图缓存：(path, 请求宽, 请求高, 实际宽, 实际高, RGBA)。
-    /// 面板尺寸不变时复用，避免每帧 resize_exact + to_rgba8（回灌 fx）。
+    /// 面板尺寸不变时复用，避免每帧 resize_exact + to_rgba8。
     pub cover_thumb: Option<(PathBuf, u32, u32, u32, u32, image::RgbaImage)>,
     /// 封面解码负缓存：记录解码失败的曲目路径，命中后不再重试、不刷屏。
     pub cover_failed_path: Option<PathBuf>,
@@ -143,8 +148,6 @@ pub struct App {
     pub last_error_at: Option<std::time::Instant>,
     /// 连续播放失败计数：列表全损坏时避免自动跳曲无限循环（达到阈值即停止）。
     pub consecutive_failures: u32,
-    /// 切曲生效守卫帧数：Play/Seek 异步生效期间主循环不做 CUE 终点判定。
-    pub switch_guard: u32,
     /// 渲染帧计数（u64 取模防溢出）。每帧 draw 时 +1，
     /// 传给电平表的乱码生成器，让柱图字符随帧变化（看起来"活"）。
     pub frame_tick: u64,
@@ -203,18 +206,29 @@ impl App {
             }
             playlist.add(item.clone());
             if !metadata_cache.contains_key(&item.path) {
-                let md = metadata::TrackMetadata::from_file(&item.path);
+                // 与热路径 get_or_extract_metadata 同口径：缓存**不保留封面字节**。
+                // from_file 会填入内嵌封面或同目录约定图片（folder_cover），
+                // 后者使同一专辑的每一首各持一份相同副本——启动恢复既无条数上限、
+                // 也不像热路径那样剥离，2000 首同专辑可达 GB 级重复内存。
+                // 显示也不需要它：封面只随当前曲目保留在 current_metadata。
+                let mut md = metadata::TrackMetadata::from_file(&item.path);
+                md.cover = None;
                 metadata_cache.insert(item.path.clone(), md);
             }
         }
 
         // 自动选中上次播放的歌曲（高亮落在它上，用户按 Enter 才播放）。
+        // CUE 优先按 path+分轨号定位，找不到再退回仅 path（与 fx 同源）。
         if let Some(current_path) = &playlist_state.current {
-            if let Some(index) = playlist
+            let cue_want = playlist_state.current_cue;
+            let exact = playlist.items().iter().position(|it| {
+                &it.path == current_path && it.cue.as_ref().map(|c| c.index) == cue_want
+            });
+            let fallback = playlist
                 .items()
                 .iter()
-                .position(|it| &it.path == current_path)
-            {
+                .position(|it| &it.path == current_path);
+            if let Some(index) = exact.or(fallback) {
                 playlist.set_selected(index);
                 // 展开其所在专辑，保证选中项在 ByAlbum 视图下可见。
                 if let Some(album) = playlist.items().get(index).and_then(|it| it.album.clone()) {
@@ -250,6 +264,7 @@ impl App {
             focus: playlist::Panel::Playlist,
             left_panel: config.left_panel,
             spectrum_mode: config.spectrum_mode,
+            bar_style: tuneux_mediax::BarStyle::from_name(&config.bar_style).unwrap_or_default(),
             playback_medium: medium,
             lyrics_mode: config.lyrics_mode,
             current_lyrics: None,
@@ -268,7 +283,6 @@ impl App {
             last_error: engine_init_error,
             last_error_at: engine_init_error_at,
             consecutive_failures: 0,
-            switch_guard: 0,
             frame_tick: 0,
             spectrum_peaks: std::cell::RefCell::new(audio::spectrum::SpectrumPeakHold::default()),
             about_visible: false,
@@ -277,10 +291,24 @@ impl App {
         }
     }
 
+    /// 短暂提示（走 last_error 通道，5 秒后自动清除；与 fx 同源助手，
+    /// 收敛各处 last_error/last_error_at 成对手写）。
+    pub(crate) fn flash_message(&mut self, msg: &str) {
+        self.last_error = Some(msg.to_string());
+        self.last_error_at = Some(std::time::Instant::now());
+    }
+
     /// 把当前播放列表与当前曲目写回播放状态（退出时调用，下次启动恢复）。
     pub fn save_playlist_to_state(&mut self) {
         self.playlist_state.items = self.playlist.items().to_vec();
         self.playlist_state.current = self.current_path.clone();
+        // 当前曲的 CUE 分轨号：恢复时定位上次播放的分轨（与 fx 同源）。
+        self.playlist_state.current_cue = self
+            .playlist
+            .current_index()
+            .and_then(|i| self.playlist.items().get(i))
+            .and_then(|it| it.cue.as_ref())
+            .map(|c| c.index);
         // ReplayGain 测量缓存同步回持久化状态（随 playlist.toml 落盘，
         // 下次启动经 App::new 重新载入，跨会话免重复分析）。
         // 修剪：只保留当前列表曲目或文件仍在磁盘的（测量代价高，重加入免重测）。
@@ -360,11 +388,11 @@ mod tests {
 
     /// 模拟主循环轮询目录加入结果（测试用，阻塞等待保证确定性）。
     fn drain_add_load(app: &mut App, config: &mut Config) {
-        if let Ok((dir, items, mds)) = app
+        if let Ok((dir, items, mds, skipped)) = app
             .add_load_rx
             .recv_timeout(std::time::Duration::from_secs(1))
         {
-            app.apply_dir_add(dir, items, mds, config);
+            app.apply_dir_add(dir, items, mds, skipped, config);
         }
     }
 
@@ -727,6 +755,8 @@ mod tests {
         assert!(compact.contains("纯离线"), "应包含特性说明");
         assert!(compact.contains("木兰宽松许可证"), "应包含开源声明");
         assert!(compact.contains("symphonia"), "应包含第三方库声明");
+        assert!(compact.contains("cpal"), "应包含音频输出库");
+        assert!(compact.contains("wasmi"), "应包含插件运行时");
         assert!(compact.contains("不羁的青春"), "应包含版权所有人");
         assert!(compact.contains("FreeYouth"), "应包含版权英文名");
         assert!(compact.contains("按任意键关闭"), "应包含关闭提示");

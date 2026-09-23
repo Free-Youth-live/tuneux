@@ -4,7 +4,7 @@
 //! 产物三处：
 //! - 私钥种子（32 字节）写入 seed_path() 指向的仓库外文件（绝不提交进仓库）；
 //! - 官方公钥（32 字节）打印到 stdout，人工内嵌进二进制信任根；
-//! - equalizer.sig / compressor.sig（各 64 字节）写入 plugins/，随包分发。
+//! - equalizer.sig / compressor.sig / skin.sig（各 64 字节）写入 plugins/，随包分发。
 //!
 //! 种子路径解析（不在代码里写死任何本机绝对路径）：
 //! 1. 环境变量 TUNEUX_OFFICIAL_SIGNING_SEED 优先；
@@ -43,6 +43,32 @@ fn main() {
 
     sign_plugin(&signing, "equalizer", "tuneux-eq");
     sign_plugin(&signing, "compressor", "tuneux-comp");
+    // 皮肤与可视化插件（plugins/ 下「皮肤-*」「可视化-*」前缀的 .wasm）：逐份签名。
+    let plugins_dir = format!("{}/../../plugins", env!("CARGO_MANIFEST_DIR"));
+    let mut skin_names: Vec<String> = std::fs::read_dir(&plugins_dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| {
+                    let p = e.path();
+                    let name = p.file_stem()?.to_str()?.to_owned();
+                    (p.extension()?.to_str()? == "wasm"
+                        && (name.starts_with("皮肤-") || name.starts_with("可视化-")))
+                    .then_some(name)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    skin_names.sort();
+    for name in skin_names {
+        // 插件 id 按前缀分工：皮肤 tuneux-skin、可视化 tuneux-vis（签名消息
+        // = id ‖ wasm，两侧必须一致，否则验签不匹配）。
+        let id = if name.starts_with("可视化-") {
+            "tuneux-vis"
+        } else {
+            "tuneux-skin"
+        };
+        sign_plugin(&signing, &name, id);
+    }
 }
 
 /// 复用已有种子；不存在则用系统安全随机源生成并落盘（幂等）。

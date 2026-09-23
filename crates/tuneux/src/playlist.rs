@@ -28,62 +28,10 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
-
 use crate::config::{PlaylistView, RepeatMode};
 
-/// CUE 分轨引用（整轨文件内的曲目片段）。
-///
-/// 播放整轨（整张专辑压成一个音频文件 + 同名 `.cue`）时，
-/// 每个 CUE 曲目展开为一个 PlaylistItem，播放起点 = `start_ms`。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CueRef {
-    /// CUE 曲目号（1-based，来自 `TRACK n AUDIO`）。
-    pub index: u32,
-    /// 曲目标题（来自 `.cue` 的 TITLE，缺失时为 "Track {n}"）。
-    pub title: String,
-    /// 表演者（来自 `.cue` 的 PERFORMER，可选；渲染时优先于整轨元数据）。
-    #[serde(default)]
-    pub performer: Option<String>,
-    /// 起始时间（毫秒，来自 `INDEX 01`，75 帧/秒换算）。
-    pub start_ms: u64,
-    /// 结束时间（毫秒）：下一曲 INDEX 起点；末曲为整轨总时长；未知为 None（播到文件尾）。
-    #[serde(default)]
-    pub end_ms: Option<u64>,
-}
-
-/// 播放列表中的一个条目。
-///
-/// 排序键（`album` + `track_number`）在加入时确定并随条目存储，
-/// 避免每次排序时重新读取 metadata。
-/// 派生 Serialize/Deserialize 用于"保存播放列表，下次启动恢复"。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlaylistItem {
-    /// 文件完整路径
-    pub path: PathBuf,
-    /// 专辑名（来自 ID3/Vorbis 标签），无则归入"无专辑"组
-    pub album: Option<String>,
-    /// 曲序（专辑内 1, 2, 3...），无则排到该专辑末尾
-    pub track_number: Option<u32>,
-    /// CUE 分轨引用：Some 表示这是整轨文件中的一曲（播放从 `start_ms` 起）。
-    /// `#[serde(default)]` 保证旧版保存的播放列表可正常反序列化。
-    #[serde(default)]
-    pub cue: Option<CueRef>,
-}
-
-/// 导航操作的结果。
-///
-/// 调用 `next` / `prev` / `jump_to` 后由 `Playlist` 返回，
-/// App 据此决定是否给音频引擎下发新曲目。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NavOutcome {
-    /// 切到指定 item
-    Switch(usize),
-    /// 单曲循环：保持当前（调用方应重新发 Play 让流再起）
-    Repeat,
-    /// 没有下一曲/上一曲
-    End,
-}
+// 播放列表条目 / CUE 分轨引用 / 导航结果 / 分轨区间钳制：双端共享，定义在 mediax。
+pub use tuneux_mediax::{clamp_seek_to_cue, CueRef, NavOutcome, PlaylistItem};
 
 /// 播放列表面板的选中对象。
 ///
@@ -293,57 +241,6 @@ impl Playlist {
     // 排序增强
     // =========================================================================
 
-    /// 按标题字母序重排条目（原地排序，修改插入序）。
-    ///
-    /// 标题取值优先级：`cue.title` > path 文件名（不含扩展名）。
-    /// 标题相同时回退到 path 字典序，保证排序确定性。
-    /// 当前未接入 UI 快捷键（保留 API 供播放列表增强接入），豁免 dead_code。
-    #[allow(dead_code)]
-    pub fn sort_by_title(&mut self) {
-        self.items.sort_by(|a, b| {
-            let title_a = Self::display_title(a);
-            let title_b = Self::display_title(b);
-            title_a
-                .to_lowercase()
-                .cmp(&title_b.to_lowercase())
-                .then(a.path.cmp(&b.path))
-        });
-        // 排序后 current/selected/history 索引可能失效，重置以保持一致性
-        self.current = None;
-        self.selected = None;
-        self.history.clear();
-        self.invalidate_display_order();
-    }
-
-    /// 按文件路径字母序重排条目（原地排序，修改插入序）。
-    ///
-    /// 直接比较完整 path，排序确定且稳定。
-    /// 当前未接入 UI 快捷键（保留 API 供播放列表增强接入），豁免 dead_code。
-    #[allow(dead_code)]
-    pub fn sort_by_path(&mut self) {
-        self.items.sort_by(|a, b| a.path.cmp(&b.path));
-        // 排序后 current/selected/history 索引可能失效，重置以保持一致性
-        self.current = None;
-        self.selected = None;
-        self.history.clear();
-        self.invalidate_display_order();
-    }
-
-    /// 获取条目的显示标题（用于排序和渲染）。
-    ///
-    /// 优先级：CUE 标题 > path 文件名（去扩展名）> 空字符串。
-    /// 仅供排序使用（sort_by_title），豁免 dead_code。
-    #[allow(dead_code)]
-    fn display_title(item: &PlaylistItem) -> String {
-        if let Some(cue) = &item.cue {
-            return cue.title.clone();
-        }
-        item.path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default()
-    }
-
     /// 清空列表，重置所有状态。
     pub fn clear(&mut self) {
         self.items.clear();
@@ -404,12 +301,15 @@ impl Playlist {
     pub fn len(&self) -> usize {
         self.items.len()
     }
+    /// 播放列表是否为空。
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
+    /// 全部条目（只读视图）。
     pub fn items(&self) -> &[PlaylistItem] {
         &self.items
     }
+    /// 当前选中条目下标（空列表为 None）。
     pub fn current_index(&self) -> Option<usize> {
         self.current
     }
@@ -693,11 +593,13 @@ impl Playlist {
         }
     }
 
-    /// 预览下一曲路径（不改变状态；Gapless 预载用）。
+    /// 预览下一曲条目（不改变状态；Gapless 预载用）。
     ///
     /// 仅顺序播放可预测：单曲循环 / 随机播放返回 None（不预载，
     /// 由现有 EOF→draining→finished 流程兜底）。
-    pub fn peek_next(&self, repeat: RepeatMode) -> Option<PathBuf> {
+    /// CUE 分轨条目照常返回——分轨以区间预载（同文件相邻分轨无缝衔接，
+    /// 引擎侧区间终点判定），不再走文件内 Seek + 前端轮询的旧口径。
+    pub fn peek_next_item(&self, repeat: RepeatMode) -> Option<&PlaylistItem> {
         if self.items.is_empty() {
             return None;
         }
@@ -717,23 +619,7 @@ impl Playlist {
             Some(_) => None,
             None => order.first().copied(),
         };
-        next_idx
-            .and_then(|idx| self.items.get(idx))
-            .and_then(|next| {
-                // 下一曲是同一整轨文件的 CUE 分轨时不预载：分轨切换走文件内
-                // Seek；若照常预载，整轨播到文件尾时解码线程会把同一文件
-                // 无缝重开（自预载），与前端的分轨推进互相错位。普通曲目
-                // 同路径重复加入不受影响（无缝重开是正确行为）。
-                let cur_same_file = self
-                    .current
-                    .and_then(|c| self.items.get(c))
-                    .is_some_and(|cur| cur.path == next.path);
-                if cur_same_file && next.cue.is_some() {
-                    None
-                } else {
-                    Some(next.path.clone())
-                }
-            })
+        next_idx.and_then(|idx| self.items.get(idx))
     }
 
     /// 进入下一曲（按 repeat + shuffle 算）。
@@ -916,49 +802,49 @@ mod tests {
 
         // 未播放（current=None）：预测第一首
         assert_eq!(
-            p.peek_next(RepeatMode::Off),
+            p.peek_next_item(RepeatMode::Off).map(|it| it.path.clone()),
             Some(PathBuf::from("/m/1.mp3"))
         );
         // current=0 → 下一首 = 2
         p.set_current(0);
         assert_eq!(
-            p.peek_next(RepeatMode::Off),
+            p.peek_next_item(RepeatMode::Off).map(|it| it.path.clone()),
             Some(PathBuf::from("/m/2.mp3"))
         );
         // current=2（末尾）→ Off 不循环：None
         p.set_current(2);
-        assert_eq!(p.peek_next(RepeatMode::Off), None);
+        assert_eq!(p.peek_next_item(RepeatMode::Off), None);
         // 列表循环：末尾 → 回第一首
         assert_eq!(
-            p.peek_next(RepeatMode::List),
+            p.peek_next_item(RepeatMode::List).map(|it| it.path.clone()),
             Some(PathBuf::from("/m/1.mp3"))
         );
     }
 
-    /// peek_next：单曲循环 / 随机播放不预载（返回 None，由 EOF 流程兜底）。
+    /// peek_next_item：单曲循环 / 随机播放不预载（返回 None，由 EOF 流程兜底）。
     #[test]
     fn peek_next_no_preload_modes() {
         let mut p = Playlist::new();
         p.add(item(Some("A"), Some(1), "/m/1.mp3"));
         p.add(item(Some("A"), Some(2), "/m/2.mp3"));
         p.set_current(0);
-        assert_eq!(p.peek_next(RepeatMode::Single), None);
+        assert_eq!(p.peek_next_item(RepeatMode::Single), None);
         p.shuffle = true;
-        assert_eq!(p.peek_next(RepeatMode::List), None);
-        assert_eq!(p.peek_next(RepeatMode::Off), None);
+        assert_eq!(p.peek_next_item(RepeatMode::List), None);
+        assert_eq!(p.peek_next_item(RepeatMode::Off), None);
     }
 
-    /// peek_next：空列表 / 单曲列表。
+    /// peek_next_item：空列表 / 单曲列表。
     #[test]
     fn peek_next_empty_or_single() {
         let p = Playlist::new();
-        assert_eq!(p.peek_next(RepeatMode::List), None);
+        assert_eq!(p.peek_next_item(RepeatMode::List), None);
         let mut p = Playlist::new();
         p.add(item(Some("A"), Some(1), "/m/1.mp3"));
         // 单曲列表：Single/List/Off 均无"下一曲"（next 会 Repeat 自身），不预载
-        assert_eq!(p.peek_next(RepeatMode::Single), None);
-        assert_eq!(p.peek_next(RepeatMode::List), None);
-        assert_eq!(p.peek_next(RepeatMode::Off), None);
+        assert_eq!(p.peek_next_item(RepeatMode::Single), None);
+        assert_eq!(p.peek_next_item(RepeatMode::List), None);
+        assert_eq!(p.peek_next_item(RepeatMode::Off), None);
     }
 
     #[test]
@@ -1479,87 +1365,21 @@ mod tests {
     // 排序增强测试
     // =========================================================================
 
-    /// sort_by_title：按标题字母序排列（CUE 标题优先于文件名）。
-    #[test]
-    fn sort_by_title_orders_correctly() {
-        let mut p = Playlist::new();
-        // 故意乱序加入
-        p.add(item(None, None, "/z_song.mp3")); // 标题 "z_song"
-        p.add(item(None, None, "/a_song.mp3")); // 标题 "a_song"
-        p.add(cue_item("/album.flac", 1, "Middle")); // CUE 标题 "Middle"
-
-        p.sort_by_title();
-
-        let titles: Vec<String> = p.items().iter().map(Playlist::display_title).collect();
-        assert_eq!(
-            titles,
-            vec!["a_song", "Middle", "z_song"],
-            "应按标题字母序排列"
-        );
-    }
-
-    /// sort_by_title：大小写不敏感（"Apple" 和 "apple" 相邻）。
-    #[test]
-    fn sort_by_title_case_insensitive() {
-        let mut p = Playlist::new();
-        p.add(item(None, None, "/banana.mp3"));
-        p.add(item(None, None, "/Apple.mp3"));
-        p.add(item(None, None, "/cherry.mp3"));
-
-        p.sort_by_title();
-
-        let titles: Vec<String> = p.items().iter().map(Playlist::display_title).collect();
-        assert_eq!(titles, vec!["Apple", "banana", "cherry"]);
-    }
-
-    /// sort_by_path：按完整路径字母序排列。
-    #[test]
-    fn sort_by_path_orders_correctly() {
-        let mut p = Playlist::new();
-        p.add(item(Some("B"), Some(1), "/music/z.mp3"));
-        p.add(item(Some("A"), Some(1), "/music/a.mp3"));
-        p.add(item(None, None, "/music/m.mp3"));
-
-        p.sort_by_path();
-
-        let paths: Vec<String> = p
-            .items()
-            .iter()
-            .map(|it| it.path.to_string_lossy().to_string())
-            .collect();
-        assert_eq!(paths, vec!["/music/a.mp3", "/music/m.mp3", "/music/z.mp3"]);
-    }
-
-    /// sort_by_title / sort_by_path 排序后 current/selected/history 被重置。
-    #[test]
-    fn sort_resets_navigation_state() {
-        let mut p = Playlist::new();
-        p.add(item(None, None, "/b.mp3"));
-        p.add(item(None, None, "/a.mp3"));
-        p.jump_to(0);
-        p.set_selected(1);
-
-        p.sort_by_path();
-
-        assert_eq!(p.current_index(), None, "排序后 current 应重置");
-        assert_eq!(p.selected(), None, "排序后 selected 应重置");
-    }
-
     /// 预载守卫：下一曲是同一整轨文件的 CUE 分轨时不预载——否则整轨播到
     /// 文件尾时解码线程会把同一文件无缝重开，与前端的分轨推进错位。
+    /// peek_next_item：同文件 CUE 分轨照常返回（区间预载无缝衔接，
+    /// 与旧「同文件分轨跳过预载」口径相反——区间预载后该口径作废）。
     #[test]
-    fn peek_next_skips_same_file_cue_fragment() {
+    fn peek_next_returns_same_file_cue_fragment() {
         let mut p = Playlist::new();
         p.add(cue_item("/album.flac", 1, "Track 1"));
         p.add(cue_item("/album.flac", 2, "Track 2"));
         p.add(cue_item("/album.flac", 3, "Track 3"));
         p.set_current(0);
-        assert_eq!(p.peek_next(RepeatMode::Off), None, "同文件下一分轨不应预载");
+        let next = p.peek_next_item(RepeatMode::Off).expect("应返回下一分轨");
+        assert_eq!(next.cue.as_ref().map(|c| c.index), Some(2));
         p.set_current(2);
-        assert_eq!(
-            p.peek_next(RepeatMode::List),
-            None,
-            "环绕回同文件分轨不应预载"
-        );
+        let wrapped = p.peek_next_item(RepeatMode::List).expect("环绕应回第一轨");
+        assert_eq!(wrapped.cue.as_ref().map(|c| c.index), Some(1));
     }
 }

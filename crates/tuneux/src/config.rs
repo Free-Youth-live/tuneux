@@ -33,43 +33,20 @@ use crate::playlist::PlaylistItem;
 /// 简化代码。配置模块的错误对用户均不致命，调用方据此回退默认值。
 pub type ConfigResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-/// 循环播放模式。
-///
-/// 三态循环：关闭 → 单曲 → 列表，循环切换。
-/// 用枚举而非魔法数字，配合 serde 以可读字符串存入 TOML（如 `repeat = "single"`），
-/// 配置文件对人友好。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum RepeatMode {
-    /// 不循环：播放到列表末尾即停止。
-    #[default]
-    Off,
-    /// 单曲循环：当前曲目无限重复。
-    Single,
-    /// 列表循环：整列表循环播放。
-    List,
-}
-
-impl RepeatMode {
-    /// 循环切换到下一个模式：Off → Single → List → Off。
-    /// 用于按键 `r` 的行为。
-    pub fn next(self) -> Self {
-        match self {
-            RepeatMode::Off => RepeatMode::Single,
-            RepeatMode::Single => RepeatMode::List,
-            RepeatMode::List => RepeatMode::Off,
-        }
-    }
-
-    /// 中文字幕，用于 TUI 状态条显示。
-    pub fn label(self) -> &'static str {
-        match self {
-            RepeatMode::Off => "顺序",
-            RepeatMode::Single => "单曲",
-            RepeatMode::List => "循环",
-        }
+/// 循环播放模式的中文短名（状态条显示）。
+/// 呈现归发行版：枚举本体在数据层（tuneux-mediax），文案不随之下沉。
+pub fn repeat_label(mode: RepeatMode) -> &'static str {
+    match mode {
+        RepeatMode::Off => "顺序",
+        RepeatMode::Single => "单曲",
+        RepeatMode::List => "循环",
     }
 }
+
+// 循环播放模式（三态：Off / Single / List）下沉在数据层共享，
+// serde 表示（"off"/"single"/"list"）已冻结；此处重导出保持
+// `crate::config::RepeatMode` 既有引用路径不变。
+pub use tuneux_mediax::RepeatMode;
 
 /// 播放列表的显示模式。
 ///
@@ -183,6 +160,11 @@ pub struct Config {
     /// 频谱显示模式（关 / 半屏 / 全屏），退出时保留。
     #[serde(default)]
     pub spectrum_mode: SpectrumMode,
+
+    /// 频谱字符风格：matrix（默认）/ blocks / ascii / hanzi（汉字柱，
+    /// 2 列宽、横向分辨率减半）。非法值回落 matrix。
+    #[serde(default)]
+    pub bar_style: String,
 
     /// 歌词显示模式（隐藏 / 显示），退出时保留。
     #[serde(default)]
@@ -347,7 +329,7 @@ pub fn parse_key_desc(desc: &str) -> Option<String> {
 
 /// 把键名部分规范化为小写具名键或单字符（字母 + shift 时统一小写）。
 ///
-/// 与 app.rs 的 `key_to_desc` 输出保持同一格式，二者对齐后才能命中映射。
+/// 与 tui/app/keys.rs 的 `key_to_desc` 输出保持同一格式，二者对齐后才能命中映射。
 fn canonical_key_name(name: &str, shift: bool) -> Option<String> {
     // 具名键：大小写不敏感
     let named = match name.to_ascii_lowercase().as_str() {
@@ -393,6 +375,7 @@ impl Default for Config {
             shuffle: false,
             playlist_view: PlaylistView::ByAlbum,
             spectrum_mode: SpectrumMode::Hidden,
+            bar_style: String::new(),
             lyrics_mode: LyricsMode::Hidden,
             left_panel: LeftPanel::Hidden,
             playback_medium: "none".to_string(),
@@ -430,9 +413,21 @@ pub struct PlaylistState {
     /// 上次退出时正在播放的歌曲路径（下次启动自动选中）。
     #[serde(default)]
     pub current: Option<PathBuf>,
+    /// 上次退出时正在播放的 CUE 分轨号（None = 非分轨曲目）。
+    /// 恢复时按 path + 分轨号精确定位，找不到再退回仅 path（与 fx 同源）。
+    #[serde(default)]
+    pub current_cue: Option<u32>,
     /// 播放列表条目（按插入序）。
+    ///
+    /// `serde(default)` 不可省：缺该键（手改过的文件、其它版本写出的文件）
+    /// 会让整个 `toml::from_str` 失败，而 `load_playlist_state` 是
+    /// `.ok().unwrap_or_default()`——播放列表与**全部断点**会被一次性静默清空。
+    #[serde(default)]
     pub items: Vec<PlaylistItem>,
     /// 每首曲目的播放进度（路径 → 秒）。
+    ///
+    /// 同 [`Self::items`]：缺键时退化为空表，而不是整份状态回退默认值。
+    #[serde(default)]
     pub positions: BTreeMap<PathBuf, f64>,
     /// ReplayGain 测量结果缓存（路径 → 增益 dB）。
     ///
@@ -529,14 +524,31 @@ const KEYMAP_ACTIONS: &[&str] = &["toggle_play", "next", "prev", "volume_up", "v
 /// 避免用户误配导致快捷键静默失效或与退出键（q/Ctrl+C）冲突。
 ///
 /// 非法映射打警告并剔除；保留键冲突由文档警示。
+/// 保留键（规范化后的键描述）：不可作为自定义映射的目标。
+/// 退出路径是安全底线——q / Ctrl+C 被映射走后，用户配置失误将无法退出
+/// 程序（手册「q / Ctrl+C 不可重映射」的承诺由本清单兑现）。
+const RESERVED_KEYS: &[&str] = &["q", "ctrl+c"];
+
 pub(crate) fn validate_keymap(keymap: &mut HashMap<String, String>) {
     keymap.retain(|action, desc| {
         let action_ok = KEYMAP_ACTIONS.contains(&action.as_str());
-        let desc_ok = !desc.trim().is_empty();
-        if !action_ok || !desc_ok {
+        // 键描述必须可解析：加载期即拒绝，而非运行期静默不生效。
+        let parsed = parse_key_desc(desc);
+        if !action_ok || parsed.is_none() {
             eprintln!(
                 "[配置] 忽略非法快捷键映射：动作 {action}（描述 {desc}）——合法动作：{}",
                 KEYMAP_ACTIONS.join(" / ")
+            );
+            return false;
+        }
+        // 保留键拒绝（q / Ctrl+C 退出底线，不可重映射；大小写不敏感——
+        // 规范化对 ctrl+字母保留原大小写，"Ctrl+C" 规范为 "ctrl+C"）。
+        if parsed
+            .as_deref()
+            .is_some_and(|d| RESERVED_KEYS.iter().any(|r| r.eq_ignore_ascii_case(d)))
+        {
+            eprintln!(
+                "[配置] 忽略保留键映射：动作 {action}（描述 {desc}）——q / Ctrl+C 为退出键，不可重映射"
             );
             return false;
         }
@@ -564,6 +576,14 @@ pub fn load() -> Config {
     };
     // 校验并清理自定义快捷键（剔除非法动作，避免静默失效）
     validate_keymap(&mut cfg.keymap);
+    // 浮点字段净化：手写成 nan/inf 时 clamp 失效（NaN 比较全 false），
+    // 会导致 0 宽度浏览器不可见 / 音量归零等，回退默认值（与 fx 同源）。
+    if !cfg.browser_ratio.is_finite() {
+        cfg.browser_ratio = default_browser_ratio();
+    }
+    if !cfg.volume.is_finite() {
+        cfg.volume = default_volume();
+    }
     cfg
 }
 
@@ -598,7 +618,7 @@ fn save_to(path: &Path, cfg: &Config) -> ConfigResult<()> {
         std::fs::create_dir_all(parent)?;
     }
     let text = toml::to_string_pretty(cfg)?;
-    std::fs::write(path, text)?;
+    atomic_write(path, &text)?;
     Ok(())
 }
 
@@ -630,13 +650,25 @@ fn save_playlist_state_to(path: &Path, state: &PlaylistState) -> ConfigResult<()
         std::fs::create_dir_all(parent)?;
     }
     let text = toml::to_string_pretty(state)?;
-    std::fs::write(path, text)?;
+    atomic_write(path, &text)?;
     Ok(())
 }
 
 // =============================================================================
 // 单元测试
 // =============================================================================
+/// 原子写文件：先写同目录临时文件再 rename 替换。
+///
+/// 直接 `fs::write` 是「原地截断再写」，写入过程中断电/强杀会产生半截文件，
+/// 下次启动解析失败 → 回退默认值 → 播放列表/断点/键位静默丢失。
+/// rename(2) 在同一文件系统上是原子操作，要么旧文件完整、要么新文件完整。
+fn atomic_write(path: &Path, content: &str) -> ConfigResult<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,6 +679,17 @@ mod tests {
         assert_eq!(RepeatMode::Off.next(), RepeatMode::Single);
         assert_eq!(RepeatMode::Single.next(), RepeatMode::List);
         assert_eq!(RepeatMode::List.next(), RepeatMode::Off);
+    }
+
+    /// 旧配置兼容：repeat 字段沿用冻结表示（"off"/"single"/"list"）解析。
+    /// 枚举本体下沉数据层（tuneux-mediax）后表示不变，旧 toml 无需迁移。
+    #[test]
+    fn old_toml_repeat_field_still_parses() {
+        let cfg: Config = toml::from_str("repeat = \"single\"\n").unwrap();
+        assert_eq!(cfg.repeat, RepeatMode::Single);
+        // 旧文件常见无引号单引号写法同样解析。
+        let cfg: Config = toml::from_str("repeat = 'list'\n").unwrap();
+        assert_eq!(cfg.repeat, RepeatMode::List);
     }
 
     /// TOML 往返：保存后再加载，字段应完全一致。
@@ -664,6 +707,7 @@ mod tests {
             shuffle: true,
             playlist_view: PlaylistView::Flat,
             spectrum_mode: SpectrumMode::Half,
+            bar_style: String::new(),
             lyrics_mode: LyricsMode::Visible,
             left_panel: LeftPanel::Browser,
             playback_medium: "vinyl".to_string(),
@@ -705,6 +749,7 @@ mod tests {
 
         let original = PlaylistState {
             current: Some(PathBuf::from("/tmp/music/a.mp3")),
+            current_cue: Some(3),
             items: vec![PlaylistItem {
                 path: PathBuf::from("/tmp/music/a.mp3"),
                 album: Some("A".to_string()),
@@ -723,6 +768,7 @@ mod tests {
             Some(std::path::Path::new("/tmp/music/a.mp3")),
             "当前曲目应保留"
         );
+        assert_eq!(loaded.current_cue, Some(3), "CUE 分轨号应保留");
         assert_eq!(loaded.items.len(), 1, "播放列表应保留");
         assert_eq!(loaded.items[0].album.as_deref(), Some("A"));
         assert_eq!(loaded.positions.len(), 1, "进度应保留");
@@ -730,6 +776,11 @@ mod tests {
             loaded.positions.get(&PathBuf::from("/tmp/music/a.mp3")),
             Some(&42.5)
         );
+        // 旧版 playlist.toml（无 current_cue 字段）应照常解析（serde default）。
+        let old: PlaylistState =
+            toml::from_str("current = '/tmp/music/a.mp3'\nitems = []\npositions = {}\n")
+                .expect("旧格式应可解析");
+        assert_eq!(old.current_cue, None, "旧文件无分轨号应为 None");
         assert_eq!(
             loaded.replay_gain.get(&PathBuf::from("/tmp/music/a.mp3")),
             Some(&-8.5),
@@ -1058,6 +1109,32 @@ mod tests {
         assert!(
             (h - 9_999_999.999_999).abs() < 1e-6,
             "极大进度往返后应一致：{h}"
+        );
+    }
+
+    /// 保留键校验：q / Ctrl+C（含大小写变体）不可作为映射目标——退出底线；
+    /// 无法解析的描述同样在加载期拒绝（与字段文档承诺一致）。
+    #[test]
+    fn validate_keymap_rejects_reserved_and_unparsable() {
+        let mut map = HashMap::from([
+            ("toggle_play".to_string(), "q".to_string()), // 保留：q
+            ("next".to_string(), "Ctrl+C".to_string()),   // 保留：ctrl+c（大小写变体）
+            ("prev".to_string(), "shift+q".to_string()),  // 合法：shift+q 非保留键
+            ("volume_up".to_string(), "f5".to_string()),  // 非法：F 键不可自定义
+            ("volume_down".to_string(), "bogus key".to_string()), // 非法：无法解析
+        ]);
+        validate_keymap(&mut map);
+        assert!(!map.contains_key("toggle_play"), "q 映射应被拒绝");
+        assert!(
+            !map.contains_key("next"),
+            "ctrl+c 映射应被拒绝（大小写不敏感）"
+        );
+        assert!(!map.contains_key("volume_up"), "F 键描述应被解析层拒绝");
+        assert!(!map.contains_key("volume_down"), "无法解析的描述应被拒绝");
+        assert_eq!(
+            map.get("prev").map(|s| s.as_str()),
+            Some("shift+q"),
+            "合法映射应保留"
         );
     }
 }

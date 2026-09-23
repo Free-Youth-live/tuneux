@@ -10,11 +10,11 @@
 
 [package]
 name = "tuneux-corex"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 license = "MulanPSL-2.0"
 authors = ["不羁的青春（FreeYouth）"]
-description = "tuneux 系列共享音频内核：解码、三线程引擎、播放时钟、无缝状态机（零 UI、零网络、零插件）"
+description = "tuneux 系列共享音频内核：解码、四线程引擎、播放时钟、无缝状态机（零 UI、零网络、零插件）"
 rust-version = "1.88"
 
 [features]
@@ -30,7 +30,14 @@ crossbeam-channel.workspace = true
 rubato.workspace = true
 rustfft.workspace = true
 opus-decoder = "0.1.1"
-wavicle = "0.1.0"
+# cue 编码链（decode_cue_bytes：UTF-8 → BOM → GB18030）需要；与 mediax 同源
+#（许可/离线/兼容三查已随 mediax 通过）
+encoding_rs.workspace = true
+
+[dev-dependencies]
+# wavicle 仅作自研 WavPack 解码器的测试对拍参照物（生产解码已自研，
+# 不随 release 引入；encode 用于测试侧生成参考流）
+wavicle = { version = "0.1.0", features = ["encode"] }
 
 [lints]
 workspace = true

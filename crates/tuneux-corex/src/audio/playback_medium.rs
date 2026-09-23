@@ -758,6 +758,10 @@ pub(crate) struct MediumEffects {
     prev_medium: PlaybackMedium,
     /// 交叉淡化剩余步数（0 = 已完成 / 未在淡化）。
     ramp_remaining: usize,
+    /// 淡出源介质：目标切到 `None` 时，ramp 期间继续跑「上一个介质」的
+    /// 效果器并让 wet 递减到 0——否则底噪/噼啪与滤波状态被瞬时截断（咔哒声）。
+    /// 默认派生为 `PlaybackMedium::None`（无淡出源）。
+    fade_from: PlaybackMedium,
 }
 
 impl MediumEffects {
@@ -774,7 +778,9 @@ impl MediumEffects {
     ) {
         // 介质切换时启动短交叉淡化：`wet` 由 1/(N+1) 渐入到 1，
         // 兜底切换瞬间的电平 / 滤波器状态突变（增益归一后残留跳变极小）。
+        // 切到 None 时同一 ramp 反向用作淡出（见 None 分支）。
         if medium != self.prev_medium {
+            self.fade_from = self.prev_medium;
             self.prev_medium = medium;
             self.ramp_remaining = MEDIUM_RAMP_STEPS;
         }
@@ -786,7 +792,43 @@ impl MediumEffects {
             (progress / (MEDIUM_RAMP_STEPS + 1) as f32).min(1.0)
         };
         match medium {
-            PlaybackMedium::None => {}
+            PlaybackMedium::None => {
+                // 切出淡出：ramp 期间继续跑旧介质效果器、wet 从近 1 递减——
+                // 底噪/噼啪/滤波染色渐隐到接近干信号，消除瞬时截断的咔哒声。
+                // ramp 走完后复位旧效果器状态（延迟线/噪声种子），防下次切回
+                // 带陈旧残留；末步 wet 约 1/(N+1) 到 0 的残余跳变极小。
+                // 本帧仍在 ramp 中（wet 未走到 1.0）且有淡出源才处理；
+                // wet 计算已递减 ramp_remaining，故收尾判定用 ramp == 0。
+                if wet < 1.0 && self.fade_from != PlaybackMedium::None {
+                    let wet_out = 1.0 - wet;
+                    let src = self.fade_from;
+                    match src {
+                        PlaybackMedium::TapeClear
+                        | PlaybackMedium::TapeWhite
+                        | PlaybackMedium::TapeClassic
+                        | PlaybackMedium::TapeAged => {
+                            self.tape.process(data, channels, sample_rate, wet_out);
+                        }
+                        PlaybackMedium::VinylClean
+                        | PlaybackMedium::VinylDynamic
+                        | PlaybackMedium::VinylStandard
+                        | PlaybackMedium::VinylAged => {
+                            self.vinyl.process(data, channels, sample_rate, wet_out);
+                        }
+                        PlaybackMedium::None => {}
+                    }
+                    if self.ramp_remaining == 0 {
+                        match src {
+                            PlaybackMedium::TapeClear
+                            | PlaybackMedium::TapeWhite
+                            | PlaybackMedium::TapeClassic
+                            | PlaybackMedium::TapeAged => self.tape.reset(),
+                            _ => self.vinyl.reset(),
+                        }
+                        self.fade_from = PlaybackMedium::None;
+                    }
+                }
+            }
             PlaybackMedium::TapeClear
             | PlaybackMedium::TapeWhite
             | PlaybackMedium::TapeClassic
@@ -870,6 +912,37 @@ mod tests {
         assert_eq!(effects.vinyl.process_calls, 0);
     }
 
+    /// 切到 None 的淡出：ramp 期间旧介质效果器仍在跑（wet 递减），
+    /// ramp 走完后完全直通并复位（回归旧缺陷：None 臂直通无淡出，
+    /// 底噪/噼啪与滤波染色被瞬时截断产生咔哒声）。
+    #[test]
+    fn switch_to_none_fades_out() {
+        let mut fx = MediumEffects::default();
+        let mut data = [0.5f32; 8];
+        // 磁带跑起来（效果器状态与调用计数都"脏"了）。
+        fx.apply(PlaybackMedium::TapeClassic, &mut data, 2, 48000);
+        let calls_before = fx.tape.process_calls;
+        assert!(calls_before >= 1, "磁带应已执行");
+
+        // 切 None 第一帧：ramp 期间旧介质仍被调用（淡出中）。
+        let mut first = [0.5f32; 8];
+        fx.apply(PlaybackMedium::None, &mut first, 2, 48000);
+        assert!(
+            fx.tape.process_calls > calls_before,
+            "淡出期间应继续跑旧介质效果器"
+        );
+        assert_eq!(fx.fade_from, PlaybackMedium::TapeClassic, "淡出源应记录");
+
+        // 走完 ramp 后：完全直通、淡出源清除。
+        let mut last = [0.5f32; 8];
+        for _ in 0..MEDIUM_RAMP_STEPS + 1 {
+            last = [0.5f32; 8];
+            fx.apply(PlaybackMedium::None, &mut last, 2, 48000);
+        }
+        assert_eq!(last, [0.5f32; 8], "淡出完成后应完全直通");
+        assert_eq!(fx.fade_from, PlaybackMedium::None, "淡出完成后应清淡出源");
+    }
+
     #[test]
     fn apply_dispatches_to_correct_effect() {
         let mut effects = MediumEffects::default();
@@ -893,7 +966,7 @@ mod tests {
     #[test]
     fn tape_effect_is_finite_and_changes() {
         let mut tape = TapeEffect::default();
-        // 长度超过延迟线（32），确保延迟线填满后抖晃输出非零。
+        // 长度超过延迟线（96），确保延迟线填满后抖晃输出非零。
         let mut data = [0.5f32; 2048];
         tape.process(&mut data, 2, 48000, 1.0);
         assert!(

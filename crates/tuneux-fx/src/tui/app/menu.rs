@@ -11,8 +11,6 @@ use tuneux_corex::PlaybackMedium;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
     // —— 文件 ——
-    OpenFile,
-    OpenDir,
     Quit,
     // —— 播放 ——
     TogglePlay,
@@ -40,12 +38,12 @@ pub enum MenuAction {
     // —— 设置 ——
     OutputDevice,
     ReplayGain,
-    Theme,
+    SkinSelect,
     // —— 插件（插件域，清单；√ = 已加载）——
     PluginEq,
     PluginComp,
+    PluginVisual,
     // —— 帮助 ——
-    Help,
     About,
 }
 
@@ -119,8 +117,8 @@ pub fn menus() -> &'static [Menu] {
             Menu {
                 title: "文件",
                 items: vec![
-                    MenuItem::new("打开文件…（.cue 自动分轨）", "F3", MenuAction::OpenFile),
-                    MenuItem::new("打开目录…", "F4", MenuAction::OpenDir),
+                    // 打开文件/目录已移除：文件浏览器（b 键）+ / 搜索 + a 加入
+                    // 完整覆盖，命令模式不再提供路径手敲入口。
                     MenuItem::new("退出", "q", MenuAction::Quit),
                 ],
             },
@@ -170,7 +168,7 @@ pub fn menus() -> &'static [Menu] {
                 items: vec![
                     MenuItem::new("输出设备（自动跟随）", "", MenuAction::OutputDevice),
                     MenuItem::new("ReplayGain 响度归一", "", MenuAction::ReplayGain),
-                    MenuItem::new("配色切换", "F2", MenuAction::Theme),
+                    MenuItem::new("皮肤配色…", "", MenuAction::SkinSelect),
                 ],
             },
             Menu {
@@ -178,13 +176,14 @@ pub fn menus() -> &'static [Menu] {
                 items: vec![
                     MenuItem::new("均衡器", "", MenuAction::PluginEq),
                     MenuItem::new("压缩器", "", MenuAction::PluginComp),
+                    MenuItem::new("可视化面板", "v", MenuAction::PluginVisual),
                 ],
             },
             Menu {
                 title: "帮助",
                 items: vec![
-                    MenuItem::new("快捷键速查 / 关于", "?", MenuAction::Help),
-                    MenuItem::new("关于", "", MenuAction::About),
+                    // 原两项（快捷键速查/关于、关于）打开的是同一个弹窗，合并为一项。
+                    MenuItem::new("关于 / 快捷键速查", "?", MenuAction::About),
                 ],
             },
         ]

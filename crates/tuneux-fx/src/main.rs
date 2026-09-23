@@ -9,6 +9,9 @@
 //! 2. 加载配置并启动 TUI 主事件循环；
 //! 3. 退出时恢复终端状态并保存配置与播放列表。
 
+// 测试代码允许 unwrap：断言失败即测试失败，语义与生产路径不同
+//（生产路径零 unwrap 由 workspace lints 强制）。
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 // 项目内部模块（配置/浏览器/媒体键/播放列表/TUI；歌词/元数据在 mediax）
 mod config;
 mod fs_browser;
@@ -140,11 +143,37 @@ fn run(
         }
         // 目录递归加入的后台结果：批量合入（条目 + 新探测元数据补缓存）。
         // 多批次全部生效——加入是累积语义（与导航的「最新生效」不同）。
-        if let Ok((dir, items, mds)) = app.add_load_rx.try_recv() {
-            app.apply_dir_add(dir, items, mds, config);
+        if let Ok((dir, items, mds, skipped)) = app.add_load_rx.try_recv() {
+            app.apply_dir_add(dir, items, mds, skipped, config);
         }
         // 播放列表行每帧只算一次，供滚动可见性校正与渲染共用。
         let rows = app.playlist_rows();
+        // 插件可视化面板：每帧把最新频谱推给插件并取回字符画（仅插件面板
+        // 可见且有插件装载时；插件只产文本、宿主负责贴上）。
+        if app.spectrum_mode == crate::config::SpectrumMode::Plugin
+            && !app.visual_plugins.is_empty()
+        {
+            // L/R 平均合并为单声道频谱（与频谱面板同口径）。
+            let bands = app.engine.as_ref().map(|e| {
+                let [l, r] = e.spectrum_lr();
+                let mut merged = [0.0f32; tuneux_corex::spectrum::N_BANDS];
+                for i in 0..tuneux_corex::spectrum::N_BANDS {
+                    merged[i] = ((l[i] + r[i]) / 2.0).clamp(0.0, 1.0);
+                }
+                merged
+            });
+            if let Some(bands) = bands {
+                // 多个可视化插件时取最后一个产出的画面（当前随包一个）。
+                for p in &mut app.visual_plugins {
+                    p.set_meter(&bands);
+                    if p.call_tick().is_ok() {
+                        if let Some(text) = p.read_visual() {
+                            app.visual_text = text;
+                        }
+                    }
+                }
+            }
+        }
         app.browser.ensure_visible(metrics.browser_visible_h);
         app.ensure_playlist_visible(&rows, metrics.playlist_visible_rows);
 
@@ -178,12 +207,6 @@ fn run(
             }
         }
 
-        // 切曲生效守卫倒计时：Play/PlayResume/Seek 异步生效，守卫期内 position 仍是
-        // 旧值，暂停 CUE 终点判定，防"点选更早分轨"被滞后 position 误判连跳。
-        if app.switch_guard > 0 {
-            app.switch_guard -= 1;
-        }
-
         // 音频引擎报告"播放结束"（EOF）：自动切下一曲。
         let got_finished = app
             .engine
@@ -194,22 +217,7 @@ fn run(
             .engine
             .as_ref()
             .is_some_and(|e| e.poll_failed().is_some());
-        // CUE 分轨曲目到达终点（position >= end_ms）：整轨文件未 EOF，
-        // 但本曲（INDEX 片段）已播完，同样视为"本曲结束"触发切下一曲。
-        // 守卫期内不判定（position 尚未追上切曲后的新值）。
-        let cue_finished = app.switch_guard == 0
-            && app
-                .playlist
-                .current_index()
-                .and_then(|i| app.playlist.items().get(i))
-                .and_then(|item| item.cue.as_ref())
-                .and_then(|cue| cue.end_ms)
-                .is_some_and(|end_ms| {
-                    app.engine
-                        .as_ref()
-                        .is_some_and(|e| e.position() >= end_ms as f64 / 1000.0)
-                });
-        if got_finished || cue_finished {
+        if got_finished {
             app.consecutive_failures = 0;
             // ReplayGain：曲目播完，缓存其测量增益（下次播放该曲生效）。
             if let Some(db) = app.engine.as_ref().and_then(|e| e.take_measured_gain_db()) {

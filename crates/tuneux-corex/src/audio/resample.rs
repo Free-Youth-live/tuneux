@@ -81,6 +81,10 @@ const SUB_CHUNKS: usize = 4;
 pub struct Resample {
     /// rubato 重采样器。FftFixedIn = 固定输入帧数，FFT 加速。
     resampler: FftFixedIn<f32>,
+    /// 源采样率（`reset` 按原参数重建滤波器用）。
+    from_sr: u32,
+    /// 目标采样率（同上）。
+    to_sr: u32,
     /// 通道数。
     channels: usize,
     /// 每次期望输入的帧数（chunk 大小）。
@@ -117,10 +121,30 @@ impl Resample {
 
         Ok(Self {
             resampler,
+            from_sr,
+            to_sr,
             channels,
             chunk_frames,
             input_buffer: Vec::new(),
         })
+    }
+
+    /// 清空全部内部状态（输入缓冲 + FFT 滤波器历史），等效按原参数重建。
+    ///
+    /// seek 后必须调用：否则内部缓冲残留的 pre-seek 样本（≤ chunk_frames-1
+    /// 帧）与滤波器旧状态会把 seek 点前约 20-30ms 的旧位置音频混入新位置
+    /// 输出（仅文件率 ≠ 设备率、存在重采样器时）。
+    pub fn reset(&mut self) -> Result<(), ResampleError> {
+        self.resampler = FftFixedIn::<f32>::new(
+            self.from_sr as usize,
+            self.to_sr as usize,
+            self.chunk_frames,
+            SUB_CHUNKS,
+            self.channels,
+        )
+        .map_err(|e| ResampleError::Rubato(e.to_string()))?;
+        self.input_buffer.clear();
+        Ok(())
     }
 
     /// 处理一批交错 f32 输入样本，返回重采样后的交错 f32 样本。
@@ -283,6 +307,30 @@ mod tests {
     }
 
     /// 输入恰好 chunk_frames：满块直接处理，无 padding
+    /// reset 后状态与全新实例逐位一致：seek 场景的回归锚点（旧缺陷：
+    /// seek 不重置重采样器，pre-seek 残留样本与滤波器历史混入新位置输出）。
+    #[test]
+    fn reset_matches_fresh_instance() {
+        let mut dirty = Resample::new(44_100, 48_000, 2, 1024).unwrap();
+        let mut fresh = Resample::new(44_100, 48_000, 2, 1024).unwrap();
+        // 脏化：喂一批样本让输入缓冲与 FFT 滤波器带上历史。
+        let noise = sine(44_100, 2048, 997.0, 2);
+        let _ = dirty.process(&noise).unwrap();
+        dirty.reset().unwrap();
+        // reset 后与全新实例喂同样输入 → 输出逐位一致。
+        let input = sine(44_100, 4096, 440.0, 2);
+        let a = dirty.process(&input).unwrap();
+        let b = fresh.process(&input).unwrap();
+        assert_eq!(a.len(), b.len(), "reset 后输出长度应与全新实例一致");
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "第 {i} 个样本不一致：reset 未清干净状态"
+            );
+        }
+    }
+
     #[test]
     fn exact_chunk_input() {
         let mut rs = Resample::new(48000, 48000, 2, 1024).unwrap();
