@@ -727,11 +727,6 @@ impl Engine {
         }
     }
 
-    /// 音频线程是否仍在运行（退出后 send 不再可达）。
-    pub fn is_alive(&self) -> bool {
-        !self.close.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     /// 枚举系统可用的音频输出设备名（当前设备在前）。
     ///
     /// 读取系统设备列表，不触碰音频线程；UI 设置菜单用。

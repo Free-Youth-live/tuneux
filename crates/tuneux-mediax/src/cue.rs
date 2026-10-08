@@ -41,11 +41,6 @@ impl CueTrack {
         let frames = (frac * 75.0 + 0.5) as u64;
         whole * 75 + frames
     }
-
-    /// 曲目时长（秒；末曲无终点时为 None，由调用方用文件时长补）。
-    pub fn duration_secs(&self) -> Option<f64> {
-        self.end_secs.map(|e| (e - self.start_secs).max(0.0))
-    }
 }
 
 /// 解析后的 CUE Sheet（专辑级信息 + 文件引用 + 曲目表）。

@@ -2,7 +2,11 @@
 
 本文件记录 tuneux 各版本的变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
 
+### 变更
+
+- 废弃代码清理：移除旧异步目录加入链与未接线的皮肤装载帮手，收缩仅测试使用的孤儿导出；第一方插件签名 id 收口为常量（`tuneux_pinx::EQ_ID / COMP_ID / SKIN_ID`）
 
 ## [0.5.5] - 2026-10-08
 
