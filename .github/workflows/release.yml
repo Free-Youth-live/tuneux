@@ -354,6 +354,10 @@ jobs:
     env:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
+      # 发布注记要从 CHANGELOG 提取，需检出仓库（本 job 其余步骤只用产物）
+      - name: 检出代码
+        uses: actions/checkout@v4
+
       - name: 下载产物
         uses: actions/download-artifact@v4
         with:
