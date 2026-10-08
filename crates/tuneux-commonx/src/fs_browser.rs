@@ -37,7 +37,7 @@ pub struct FsBrowserConfig {
 ///
 /// 判断依据仅看扩展名（不读文件头）：浏览器要在用户每次进入目录时
 /// 即时列出，读文件头会有可感延迟；真实格式由解码时再校验。
-pub fn is_supported(path: &Path, audio_exts: &[&str]) -> bool {
+fn is_supported(path: &Path, audio_exts: &[&str]) -> bool {
     match path.extension() {
         Some(ext) => {
             let ext_lower = ext.to_string_lossy().to_lowercase();

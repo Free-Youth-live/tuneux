@@ -344,8 +344,9 @@ fn design_butterworth_hp(state: &mut KWeight, f0: f64, q: f64, sr: f64) {
 ///   LUFS ~= **-3.02 LU**。
 /// - 满幅 100 Hz 正弦: LUFS ~= **-4.9 LU**（HP 在 100 Hz 处 -1.2 dB）。
 /// - 静音 / 空输入: `f64::NEG_INFINITY`。
-#[allow(dead_code)] // 公共工具（整段测量），播放链路用的是流式 LoudnessAnalyzer
-pub fn measure_lufs(samples: &[f32], sample_rate: u32) -> f64 {
+#[allow(dead_code)] // 测试基准与文档参照（流式 LoudnessAnalyzer 的整段对照实现，
+                    // 播放链路不用）；pub(crate)：响度算法验证设施，不作孤儿导出
+pub(crate) fn measure_lufs(samples: &[f32], sample_rate: u32) -> f64 {
     if samples.is_empty() || sample_rate == 0 {
         return f64::NEG_INFINITY;
     }
@@ -412,8 +413,8 @@ pub fn gain_to_target(measured_lufs: f64, target_lufs: f64) -> f64 {
 ///   `MAX_GAIN_LINEAR` = 1e6，输出最终仍限幅在 [-1, 1]，
 ///   不会产生 NaN 或 Inf；
 /// - `sample = NaN` -> 输出 NaN（保留错误信号，调用方自行处理）。
-#[allow(dead_code)] // 预留 API（播放路径的增益在 stream_builder 回调内联）
-pub fn apply_gain_db(sample: f32, gain_db: f64) -> f32 {
+#[allow(dead_code)] // 测试基准与文档参照（播放路径的增益在 stream_builder 回调内联）
+pub(crate) fn apply_gain_db(sample: f32, gain_db: f64) -> f32 {
     // 非有限 dB: 忽略增益、退化为纯 sample clamp
     if !gain_db.is_finite() {
         return sample.clamp(-1.0, 1.0);

@@ -29,12 +29,13 @@
 // 公开项必须有文档注释（与 corex / mediax / commonx 同口径；信任边界 crate 尤其需要）。
 #![deny(missing_docs)]
 pub mod caps;
+pub mod ids;
 pub mod journal;
 pub mod net;
 pub mod runtime;
-pub mod skins;
 pub mod verify;
 
 pub use caps::{parse_manifest, CapError, Capability};
+pub use ids::{COMP_ID, EQ_ID, SKIN_ID};
 pub use runtime::{HostError, HostState, LoadedPlugin, WasmHost};
 pub use verify::{classify, verify_signature, LoadPolicy, Tristate, TrustList};

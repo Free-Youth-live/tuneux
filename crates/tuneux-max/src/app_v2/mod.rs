@@ -1807,14 +1807,14 @@ impl MaxAppV2 {
 
     /// 装载均衡器插件（共享引擎均衡器槽位）。
     fn load_eq_plugin(engine: &tuneux_corex::Engine) -> Option<(u32, tuneux_pinx::LoadedPlugin)> {
-        Self::load_fx_plugin(engine, "equalizer", "tuneux-eq", |e| {
+        Self::load_fx_plugin(engine, "equalizer", tuneux_pinx::EQ_ID, |e| {
             e.alloc_eq_slot().map(|(s, _)| s)
         })
     }
 
     /// 装载压缩器插件（共享引擎压缩器槽位）。
     fn load_comp_plugin(engine: &tuneux_corex::Engine) -> Option<(u32, tuneux_pinx::LoadedPlugin)> {
-        Self::load_fx_plugin(engine, "compressor", "tuneux-comp", |e| {
+        Self::load_fx_plugin(engine, "compressor", tuneux_pinx::COMP_ID, |e| {
             e.alloc_compressor_slot().map(|(s, _)| s)
         })
     }
@@ -1839,7 +1839,7 @@ impl MaxAppV2 {
         let mut out = Vec::new();
         for stem in names {
             let Some((mut plugin, granted)) =
-                Self::load_first_party_core(engine, &stem, "tuneux-skin", Some(&allowed))
+                Self::load_first_party_core(engine, &stem, tuneux_pinx::SKIN_ID, Some(&allowed))
             else {
                 continue;
             };

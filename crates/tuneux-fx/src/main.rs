@@ -141,11 +141,6 @@ fn run(
                 app.browser.apply_search_collected(entries, truncated);
             }
         }
-        // 目录递归加入的后台结果：批量合入（条目 + 新探测元数据补缓存）。
-        // 多批次全部生效——加入是累积语义（与导航的「最新生效」不同）。
-        if let Ok((dir, items, mds, skipped)) = app.add_load_rx.try_recv() {
-            app.apply_dir_add(dir, items, mds, skipped, config);
-        }
         // 播放列表行每帧只算一次，供滚动可见性校正与渲染共用。
         let rows = app.playlist_rows();
         // 插件可视化面板：每帧把最新频谱推给插件并取回字符画（仅插件面板

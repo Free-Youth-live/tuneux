@@ -30,7 +30,6 @@ pub use cue::{
     build_items_for_paths, cue_items_from, cue_items_from_cue_file, decode_cue_bytes, parse_cue,
     parse_cue_sheet, CueExpansion, CueParseError, CueSheet, CueTrack,
 };
-pub use metadata::{BitsDisplay, ChannelsDisplay, SampleRateDisplay};
 pub use playback_decision::{
     resume_secs, single_repeat_decision, toggle_decision, PlaybackDecision,
 };

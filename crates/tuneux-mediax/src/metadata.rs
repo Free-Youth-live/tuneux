@@ -34,6 +34,7 @@ use tuneux_corex::{probe_metadata, AudioParams};
 
 /// 采样率显示标签（语义枚举，产品本地化）。
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg(test)]
 pub enum SampleRateDisplay {
     /// 采样率（kHz，如 44.1）。
     KHz(f64),
@@ -43,6 +44,7 @@ pub enum SampleRateDisplay {
 
 /// 位深显示标签。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub enum BitsDisplay {
     /// 确定位深（如 16、24）。
     Bits(u32),
@@ -54,6 +56,7 @@ pub enum BitsDisplay {
 
 /// 通道数显示标签。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub enum ChannelsDisplay {
     /// 单声道。
     Mono,
@@ -262,8 +265,8 @@ impl TrackMetadata {
     }
 
     // —— 中文格式化方法（供 TUI 显示）——
-
     /// 时长格式化为 "分:秒"（如 "3:45"），未知返回 "??:??"。
+    #[cfg(test)]
     pub fn duration_label(&self) -> String {
         match self.duration {
             Some(d) => format!("{}:{:02}", (d as u64) / 60, (d as u64) % 60),
@@ -313,16 +316,16 @@ impl TrackMetadata {
             None => "未知".to_string(),
         }
     }
-
     /// 采样率语义标签（产品据此本地化，替代 *_label 的中文硬编码）。
+    #[cfg(test)]
     pub fn sample_rate_display(&self) -> SampleRateDisplay {
         match self.sample_rate {
             Some(sr) => SampleRateDisplay::KHz(sr as f64 / 1000.0),
             None => SampleRateDisplay::Unknown,
         }
     }
-
     /// 位深语义标签。
+    #[cfg(test)]
     pub fn bits_display(&self) -> BitsDisplay {
         match self.bits_per_sample {
             Some(b) => BitsDisplay::Bits(b),
@@ -340,8 +343,8 @@ impl TrackMetadata {
             }
         }
     }
-
     /// 通道数语义标签。
+    #[cfg(test)]
     pub fn channels_display(&self) -> ChannelsDisplay {
         match self.channels {
             Some(1) => ChannelsDisplay::Mono,

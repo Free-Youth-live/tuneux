@@ -65,11 +65,11 @@ impl BookmarkList {
         self.items.retain(|b| b.path != path);
         self.items.len() < before
     }
-
     /// 按路径 + 分轨起点精确删除一条书签。
     ///
     /// `cue_start_ms` 为 `None` 时匹配整轨书签；否则匹配同起点的分轨书签。
     /// 与 `remove(path)` 的区别：不会误删同路径下的其他分轨书签。
+    #[cfg(test)]
     pub fn remove_exact(&mut self, path: &Path, cue_start_ms: Option<u64>) -> bool {
         let before = self.items.len();
         self.items
@@ -81,11 +81,11 @@ impl BookmarkList {
     pub fn get(&self, path: &Path) -> Option<&Bookmark> {
         self.items.iter().find(|b| b.path == path)
     }
-
     /// 按路径 + 分轨起点精确查找书签。
     ///
     /// `cue_start_ms` 为 `None` 时匹配整轨书签；否则匹配同起点的分轨书签。
     /// 与 `get(path)` 的区别：不会在存在多条同路径书签时误取首条。
+    #[cfg(test)]
     pub fn get_exact(&self, path: &Path, cue_start_ms: Option<u64>) -> Option<&Bookmark> {
         self.items
             .iter()

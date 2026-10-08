@@ -18,10 +18,6 @@
 //!
 //! 纪律（与 mod.rs 同源）：调色板是唯一色彩来源，渲染层只读 Palette 字段；
 //! 生产路径零 unwrap / expect。
-//!
-//! `allocate_ui_at_rect` 弃用告警与经典路径（mod.rs）同源同口径，待整体迁移
-//! `allocate_new_ui` 时一并处理，此处显式豁免保持告警面干净。
-#![allow(deprecated)]
 
 use super::*;
 use egui::{CornerRadius, RichText};
@@ -1359,7 +1355,7 @@ impl MaxAppV2 {
             Pos2::new(rect.left() + 2.0, head.bottom() + 2.0),
             Pos2::new(rect.right() - 2.0, rect.bottom() - 4.0),
         );
-        ui.allocate_ui_at_rect(inner, |ui| {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
             ui.push_id(format!("mdock_{module:?}"), |ui| {
                 self.render_module_modern(module, ui);
             });

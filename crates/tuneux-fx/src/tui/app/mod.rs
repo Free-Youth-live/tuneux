@@ -45,17 +45,6 @@ pub use self::search::SearchTarget;
 
 use self::menu::{menus, MenuAction};
 
-/// 后台目录加入的结果消息：目录 + 构建好的条目 + 新探测的元数据
-/// （封面字节已剥离，仅缓存未命中的项）。
-#[allow(clippy::type_complexity)]
-pub type DirAddResult = (
-    PathBuf,
-    Vec<playlist::PlaylistItem>,
-    Vec<(PathBuf, TrackMetadata)>,
-    // 本批跳过的数据轨总数（cue 中的 MODE1/MODE2 等不可播轨；供 UI 提示）。
-    usize,
-);
-
 /// 应用运行时状态。
 pub struct App {
     /// 当前生效的调色板（来自皮肤清单选中项；None = 内置默认 DOS 风配色）。
@@ -97,12 +86,6 @@ pub struct App {
     pub search_load_rx: crossbeam_channel::Receiver<(u64, Vec<crate::fs_browser::Entry>, bool)>,
     /// 搜索收集代次：每次进入搜索 +1，用于丢弃陈旧收集（重进搜索 / 切目录后）。
     pub search_load_gen: u64,
-    /// 目录递归加入的异步构建：后台线程收集 + CUE 展开 + 元数据探测后
-    /// 发回 [`DirAddResult`]。加入是累积语义，多批次全部合入
-    /// （与导航的「最新生效」不同，不用代次丢弃）。
-    pub add_load_tx: crossbeam_channel::Sender<DirAddResult>,
-    /// 目录加入接收端。
-    pub add_load_rx: crossbeam_channel::Receiver<DirAddResult>,
     /// 播放列表（右侧主面板，多列展示）。
     pub playlist: Playlist,
     /// 播放列表持久化状态（退出/定时落盘，下次启动恢复）。
@@ -397,7 +380,7 @@ fn load_first_party_plugin(
 fn load_eq_plugin(
     engine: &audio::Engine,
 ) -> Option<(u32, tuneux_pinx::LoadedPlugin, Vec<tuneux_pinx::Capability>)> {
-    load_first_party_plugin(engine, "equalizer", "tuneux-eq", |e| {
+    load_first_party_plugin(engine, "equalizer", tuneux_pinx::EQ_ID, |e| {
         e.alloc_eq_slot().map(|(s, _)| s)
     })
 }
@@ -406,7 +389,7 @@ fn load_eq_plugin(
 fn load_comp_plugin(
     engine: &audio::Engine,
 ) -> Option<(u32, tuneux_pinx::LoadedPlugin, Vec<tuneux_pinx::Capability>)> {
-    load_first_party_plugin(engine, "compressor", "tuneux-comp", |e| {
+    load_first_party_plugin(engine, "compressor", tuneux_pinx::COMP_ID, |e| {
         e.alloc_compressor_slot().map(|(s, _)| s)
     })
 }
@@ -485,16 +468,16 @@ fn load_skin_palettes(engine: &audio::Engine) -> Vec<LoadedSkin> {
     let mut out: Vec<LoadedSkin> = Vec::new();
     for file_stem in names {
         let Some((mut plugin, granted)) =
-            load_first_party_core(engine, &file_stem, "tuneux-skin", Some(&allowed))
+            load_first_party_core(engine, &file_stem, tuneux_pinx::SKIN_ID, Some(&allowed))
         else {
             continue;
         };
         if plugin.call_init(0).is_err() {
             continue;
         }
-        // 同可视化插件：日志键带文件名，签名 id 保持 "tuneux-skin"。
+        // 同可视化插件：日志键带文件名，签名 id 保持 tuneux_pinx::SKIN_ID。
         record_plugin_load(
-            &format!("tuneux-skin:{file_stem}"),
+            &format!("{}:{file_stem}", tuneux_pinx::SKIN_ID),
             plugin.tristate,
             granted,
         );
@@ -546,7 +529,7 @@ impl App {
             .as_ref()
             .and_then(load_eq_plugin)
             .map(|(s, p, caps)| {
-                record_plugin_load("tuneux-eq", p.tristate, caps);
+                record_plugin_load(tuneux_pinx::EQ_ID, p.tristate, caps);
                 (Some(s), Some(p))
             })
             .unwrap_or((None, None));
@@ -554,7 +537,7 @@ impl App {
             .as_ref()
             .and_then(load_comp_plugin)
             .map(|(s, p, caps)| {
-                record_plugin_load("tuneux-comp", p.tristate, caps);
+                record_plugin_load(tuneux_pinx::COMP_ID, p.tristate, caps);
                 (Some(s), Some(p))
             })
             .unwrap_or((None, None));
@@ -625,7 +608,6 @@ impl App {
         let (dir_load_tx, dir_load_rx) = crossbeam_channel::unbounded();
         // 浏览器搜索收集与目录加入的后台通道（同机制，见对应字段说明）。
         let (search_load_tx, search_load_rx) = crossbeam_channel::unbounded();
-        let (add_load_tx, add_load_rx) = crossbeam_channel::unbounded();
 
         Self {
             skin,
@@ -647,8 +629,6 @@ impl App {
             search_load_tx,
             search_load_rx,
             search_load_gen: 0,
-            add_load_tx,
-            add_load_rx,
             playlist,
             playlist_state,
             i18n,
@@ -1774,7 +1754,7 @@ impl App {
         let Some((slot, plugin, caps)) = self.engine.as_ref().and_then(load_eq_plugin) else {
             return;
         };
-        record_plugin_load("tuneux-eq", plugin.tristate, caps);
+        record_plugin_load(tuneux_pinx::EQ_ID, plugin.tristate, caps);
         self.eq_slot = slot;
         self.eq_plugin = Some(plugin);
     }
@@ -1859,7 +1839,7 @@ impl App {
         let Some((slot, plugin, caps)) = self.engine.as_ref().and_then(load_comp_plugin) else {
             return;
         };
-        record_plugin_load("tuneux-comp", plugin.tristate, caps);
+        record_plugin_load(tuneux_pinx::COMP_ID, plugin.tristate, caps);
         self.comp_slot = slot;
         self.comp_plugin = Some(plugin);
     }
@@ -1931,8 +1911,7 @@ impl App {
                     }
                 }
                 if was_empty && !self.playlist.is_empty() {
-                    // 加入前列表为空：播放/选中"专辑-曲序"排序后的第一首
-                    // （目录分支为异步加入，首播在 apply_dir_add 合入时触发）。
+                    // 加入前列表为空：播放/选中"专辑-曲序"排序后的第一首。
                     let first = self.playlist.display_order().first().copied().unwrap_or(0);
                     self.playlist.set_selected(first);
                     self.play_and_update_current(first, config);
@@ -1948,90 +1927,12 @@ impl App {
     }
 
     /// 异步递归收集目录并构建播放列表条目（`a` 键加目录用）：
-    /// 后台线程完成目录遍历、CUE 展开与逐文件元数据探测（重活全在后台，
-    /// 元数据缓存优先——与同步路径同口径），结果由主循环轮询后经
-    /// [`App::apply_dir_add`] 批量合入。大目录加入不再卡 UI。
+    /// 共享扫描池后台完成目录遍历、CUE 展开与逐文件元数据探测
+    /// （重活全在后台），结果由主循环逐帧排空合入。大目录加入不卡 UI。
     fn add_dir_async(&mut self, dir: PathBuf) {
         // 共享扫描池：submit 即返回，结果由主循环逐帧排空
         let msg = format!("{}：{}", self.i18n.t("msg.scan_dir"), dir.display());
         self.scan_pool.submit(dir);
-        self.flash_message(&msg);
-    }
-
-    #[allow(dead_code)]
-    fn add_dir_async_old(&mut self, dir: PathBuf) {
-        // 快照当前元数据缓存给后台线程（命中免探测）；只读不写，无竞争。
-        let cache = self.metadata_cache.clone();
-        let tx = self.add_load_tx.clone();
-        let msg = format!("{}：{}", self.i18n.t("msg.scan_dir"), dir.display());
-        self.flash_message(&msg);
-        // 优雅降级：线程启动失败（极罕见）时提示而非 panic。
-        if std::thread::Builder::new()
-            .name("fx-dir-add".to_string())
-            .spawn(move || {
-                let mut paths = Vec::new();
-                FsBrowser::collect_music_recursive(&dir, &mut paths, fs_browser::browser_config());
-                let (mut items, mds, skipped) = cue::build_items_for_paths(&paths, &cache);
-                // 按"专辑-曲序"预排序：让新增批次的插入序 = 显示序，
-                // 添加目录后自动播放/选中的第一首就是专辑-曲序的第一首。
-                Playlist::sort_items(&mut items);
-                let _ = tx.send((dir, items, mds, skipped));
-            })
-            .is_err()
-        {
-            let m = self.i18n.t("msg.thread_fail").into_owned();
-            self.flash_message(&m);
-        }
-    }
-
-    /// 合入一次后台目录加入的结果（主循环轮询用）：
-    /// 新探测的元数据补入缓存、条目批量加入（按配置去重）、
-    /// 加入前列表为空时自动播放第一首、完成提示。
-    pub(crate) fn apply_dir_add(
-        &mut self,
-        dir: PathBuf,
-        items: Vec<playlist::PlaylistItem>,
-        mds: Vec<(PathBuf, TrackMetadata)>,
-        skipped_data_tracks: usize,
-        config: &Config,
-    ) {
-        if skipped_data_tracks > 0 {
-            let msg = self
-                .i18n
-                .t("msg.skipped_data")
-                .replace("{}", &skipped_data_tracks.to_string());
-            self.flash_message(&msg);
-        }
-        let was_empty = self.playlist.is_empty();
-        let before = self.playlist.len();
-        let empty_dir = items.is_empty();
-        for (path, md) in mds {
-            // 只补缺失项：不覆盖已有缓存（含当前曲目等热条目）。
-            self.metadata_cache.entry(path).or_insert(md);
-        }
-        if config.dedup_on_add {
-            self.playlist.add_many_dedup(items);
-        } else {
-            self.playlist.add_many(items);
-        }
-        let added = self.playlist.len() - before;
-        if empty_dir || self.playlist.is_empty() {
-            let msg = format!("{}：{}", self.i18n.t("msg.no_music"), dir.display());
-            self.flash_message(&msg);
-            return;
-        }
-        if added == 0 {
-            let msg = format!("{}：{}", self.i18n.t("msg.all_dup"), dir.display());
-            self.flash_message(&msg);
-            return;
-        }
-        if was_empty {
-            // 加入前列表为空：播放/选中"专辑-曲序"排序后的第一首。
-            let first = self.playlist.display_order().first().copied().unwrap_or(0);
-            self.playlist.set_selected(first);
-            self.play_and_update_current(first, config);
-        }
-        let msg = format!("{}：{}", self.i18n.t("msg.added"), dir.display());
         self.flash_message(&msg);
     }
 
