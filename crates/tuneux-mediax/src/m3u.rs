@@ -77,4 +77,32 @@ mod tests {
         let paths = parse(content);
         assert_eq!(paths, vec![PathBuf::from("/a.mp3")]);
     }
+
+    /// 模糊化烟雾测试：任意字节的 m3u 文本经 parse 不得 panic。
+    ///（m3u 是外部可投喂的不可信文本；真 fuzz 用 cargo-fuzz + 消毒器，
+    /// 此处用确定性伪随机做「永不 panic」轻量守护。）
+    #[test]
+    fn parse_never_panics_on_garbage() {
+        let mut state: u64 = 0x5eed_2026_0927_00b1;
+        let mut rng = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 32
+        };
+        for len in 0..256usize {
+            for variant in 0..3 {
+                let bytes: Vec<u8> = (0..len).map(|_| (rng() & 0xff) as u8).collect();
+                let mut text = String::from_utf8_lossy(&bytes).into_owned();
+                // 变体：裸垃圾 / 带 #EXTM3U 头 / 带 #EXTINF 行，后两者走进更深分支。
+                match variant {
+                    1 => text = format!("#EXTM3U\n{text}"),
+                    2 => text = format!("#EXTM3U\n#EXTINF:{} , x\n{text}", rng() % 1000),
+                    _ => {}
+                }
+                let _ = parse(&text);
+                let _ = serialize(&parse(&text));
+            }
+        }
+    }
 }

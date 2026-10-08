@@ -18,6 +18,7 @@
 pub mod cue;
 pub mod media;
 pub mod menu;
+pub mod mouse;
 pub mod playback;
 pub mod search;
 
@@ -65,6 +66,12 @@ pub struct App {
     pub skin_sel: usize,
     /// 皮肤选择器弹窗开关。
     pub skin_picker: bool,
+    /// 语言选择器是否打开（↑↓ 选、Enter 确认立即生效、Esc 取消）。
+    pub lang_picker: bool,
+    /// 语言选择器当前高亮索引。
+    pub lang_picker_sel: usize,
+    /// 可用语言列表（启动时扫描 locales/ + 内置 zh，形如 [("zh","中文"),("en","English")]）。
+    pub lang_list: Vec<(String, String)>,
     /// 选择器内高亮序号（0 = 终端原生）。
     pub skin_picker_sel: usize,
     /// 打开选择器前的生效皮肤（Esc 取消时恢复）。
@@ -100,6 +107,8 @@ pub struct App {
     pub playlist: Playlist,
     /// 播放列表持久化状态（退出/定时落盘，下次启动恢复）。
     pub playlist_state: PlaylistState,
+    /// i18n 查询器：请求语言表（locales/<lang>.txt）+ zh 内置兜底。
+    pub i18n: tuneux_commonx::I18n,
     /// ReplayGain 增益缓存：path → 整曲增益（dB）。首次播放无缓存（增益 1.0），
     /// 播放中引擎测量完成后缓存，下次播放该曲生效。随 playlist.toml 落盘。
     pub replay_gain_cache: std::collections::BTreeMap<PathBuf, f64>,
@@ -133,6 +142,11 @@ pub struct App {
     pub cover_browser_sel: usize,
     /// 封面浏览：网格滚动偏移（第一个可见专辑的索引）。
     pub cover_browser_scroll: usize,
+    /// 鼠标命中矩形（渲染层每帧写；Cell 使 &App 可写）。
+    pub browser_list_rect: std::cell::Cell<ratatui::layout::Rect>,
+    pub playlist_list_rect: std::cell::Cell<ratatui::layout::Rect>,
+    /// 上次左键点击（时刻 + 坐标）——双击判定。
+    last_click: Option<(std::time::Instant, u16, u16)>,
     /// 封面浏览：当前可视格数（渲染时写入，按键层据此让选中滚入可视窗）。
     pub cover_browser_visible: usize,
     /// 封面网格缩略图缓存：(路径, 目标宽, 目标高) → RGBA 缩略图（None=无封面/解码失败）。
@@ -156,6 +170,9 @@ pub struct App {
     pub command_mode: bool,
     /// 当前命令输入内容。
     pub command_query: String,
+    /// 共享扫描池（mediax 下沉：1 walker + N 工人，替代单线程 add_dir_async）。
+    pub scan_pool: tuneux_mediax::scan_pool::ScanPool,
+    pub track_envelope: Vec<f32>,
     /// 菜单栏是否激活（数字 1-8 / F10 唤起，方向键/Enter 导航）。
     pub menu_active: bool,
     /// 激活的顶级菜单下标（0-7）。
@@ -173,10 +190,16 @@ pub struct App {
     /// 频谱峰值保持状态机（频段维度，0.0-1.0），用于"峰值保持白帽"：
     /// 绿柱实时跟随能量，白帽从峰值缓慢下落。用 RefCell 内部可变，便于渲染侧持 `&App` 更新。
     pub spectrum_peaks: std::cell::RefCell<audio::spectrum::SpectrumPeakHold>,
+    /// 指针表针物理（L/R 双针；渲染侧 RefCell 借用更新——与频谱峰帽同口径）。
+    pub gauge_needles: std::cell::RefCell<[tuneux_commonx::gauge::NeedlePhys; 2]>,
     /// "关于"弹窗是否可见（`?` 键切换，任意键关闭）。
     pub about_visible: bool,
     /// 均衡器面板是否可见（「工具 › 均衡器」/ F9 打开，Esc 关闭）。
     pub eq_visible: bool,
+    /// 滤波器面板可见性（F10 菜单或键切换）。
+    pub filter_visible: bool,
+    /// 滤波器参数选中索引（0=截止，1=谐振）。
+    pub filter_sel: usize,
     /// 均衡器当前选中的段（0-9，↑/↓ 调增益、←/→ 切段）。
     pub eq_band_sel: usize,
     /// 已加载的第一方均衡器插件（持有其 WASM 实例与槽位共享）。
@@ -266,7 +289,7 @@ fn keycode_to_action<'a>(
 ) -> Option<&'a str> {
     let desc = key_to_desc(key)?;
     keymap.iter().find_map(|(action, configured)| {
-        if crate::config::parse_key_desc(configured).as_deref() == Some(desc.as_str()) {
+        if tuneux_commonx::parse_key_desc(configured).as_deref() == Some(desc.as_str()) {
             Some(action.as_str())
         } else {
             None
@@ -334,20 +357,20 @@ fn load_first_party_core(
     let host = tuneux_pinx::WasmHost::new(100_000, 4, engine.eq_slots(), engine.compressor_slots());
     // 第一方插件：官方公钥验签（Trusted 才加载），申请集 = manifest 声明。
     let trust = tuneux_pinx::TrustList::from_parts(vec![OFFICIAL_PUBKEY]);
+    // 第一方插件必须验签为 Trusted：用 load_enforced 把「不静默降级」变成
+    // 运行时事实——未达 Trusted 直接 PolicyDenied，不靠手工查 tristate。
     let plugin = host
-        .load(
+        .load_enforced(
             &wasm,
             id,
+            manifest.as_bytes(),
             Some((&OFFICIAL_PUBKEY, &sig)),
             &trust,
             &requested,
             allowed,
+            tuneux_pinx::LoadPolicy::Silent,
         )
         .ok()?;
-    // 第一方插件必须验签为 Trusted，否则按加载失败处理（防 .sig 缺失/被篡改）。
-    if plugin.tristate != tuneux_pinx::Tristate::Trusted {
-        return None;
-    }
     Some((plugin, granted))
 }
 
@@ -499,13 +522,15 @@ impl App {
             .playback_medium
             .parse()
             .unwrap_or(audio::PlaybackMedium::None);
+        // i18n 先于引擎构建：初始化失败的提示同样走语言表。
+        let i18n = crate::config::build_i18n(&config.lang);
         // 启动音频引擎；失败不阻塞程序，错误经 last_error 通道显示
         //（避免 raw 模式下 eprintln 花屏）。
         let (engine, engine_init_error) = match audio::Engine::new(config.volume) {
             Ok(e) => (Some(e), None),
             Err(e) => (
                 None,
-                Some(format!("音频引擎初始化失败，播放功能不可用：{e}")),
+                Some(i18n.t("msg.engine_fail").replace("{}", &e.to_string())),
             ),
         };
         let engine_init_error_at = engine_init_error.as_ref().map(|_| Instant::now());
@@ -607,12 +632,15 @@ impl App {
             skins,
             skin_sel,
             skin_picker: false,
+            lang_picker: false,
+            lang_picker_sel: 0,
+            lang_list: crate::config::scan_langs(),
             skin_picker_sel: 0,
             skin_prev: None,
             visual_plugins,
             visual_text: String::new(),
             engine,
-            browser: FsBrowser::open(&initial),
+            browser: FsBrowser::open(&initial, fs_browser::browser_config()),
             dir_load_tx,
             dir_load_rx,
             dir_load_gen: 0,
@@ -623,6 +651,7 @@ impl App {
             add_load_rx,
             playlist,
             playlist_state,
+            i18n,
             replay_gain_cache,
             // 浏览器可见时启动焦点落在浏览器（与 toggle_browser_panel 打开时
             // 置焦点的口径一致）；隐藏/封面时焦点在播放列表。
@@ -643,6 +672,9 @@ impl App {
             coverless_files: std::collections::HashSet::new(),
             cover_browser_sel: 0,
             cover_browser_scroll: 0,
+            browser_list_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            playlist_list_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            last_click: None,
             cover_browser_visible: 0,
             cover_thumb_cache: std::collections::HashMap::new(),
             consecutive_failures: 0,
@@ -654,6 +686,8 @@ impl App {
             search_target: SearchTarget::Playlist,
             command_mode: false,
             command_query: String::new(),
+            scan_pool: tuneux_mediax::scan_pool::ScanPool::new(),
+            track_envelope: vec![0.0; 256],
             menu_active: false,
             menu_top: 0,
             menu_dropdown: false,
@@ -662,8 +696,14 @@ impl App {
             last_error_at: engine_init_error_at,
             frame_tick: 0,
             spectrum_peaks: std::cell::RefCell::new(audio::spectrum::SpectrumPeakHold::default()),
+            gauge_needles: std::cell::RefCell::new([
+                tuneux_commonx::gauge::NeedlePhys::default(),
+                tuneux_commonx::gauge::NeedlePhys::default(),
+            ]),
             about_visible: false,
             eq_visible: false,
+            filter_visible: false,
+            filter_sel: 0,
             eq_band_sel: 0,
             eq_plugin,
             eq_slot: eq_slot.unwrap_or(0),
@@ -756,6 +796,39 @@ impl App {
             return true;
         }
 
+        // —— 语言选择器（↑/↓ 选语言、Enter 确认立即生效、Esc 取消）——
+        if self.lang_picker {
+            let count = self.lang_list.len();
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.lang_picker_sel = self.lang_picker_sel.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.lang_picker_sel + 1 < count {
+                        self.lang_picker_sel += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    let picked = self.lang_list.get(self.lang_picker_sel).cloned();
+                    if let Some((lang, name)) = picked {
+                        config.lang = lang;
+                        config::save(config);
+                        // 就地重建 i18n：界面文案每帧经 t() 现查，换表即全局
+                        // 生效、无需重启（已弹出的旧提示保持旧语言至下次刷新）。
+                        self.i18n = crate::config::build_i18n(&config.lang);
+                        let msg = self.i18n.t("msg.lang_switched").replace("{}", &name);
+                        self.flash_message(&msg);
+                    }
+                    self.lang_picker = false;
+                }
+                KeyCode::Esc => {
+                    self.lang_picker = false;
+                }
+                _ => {}
+            }
+            return true;
+        }
+
         // —— 皮肤选择器（↑/↓ 即时预览、Enter 确认并持久化、Esc 取消恢复）——
         if self.skin_picker {
             let count = self.skins.len() + 2; // +2 = 内置默认 / 终端原生
@@ -797,6 +870,9 @@ impl App {
         }
 
         // —— 均衡器面板（↑/↓ 调增益、←/→ 切段、e 旁路、Esc 关闭）——
+        if self.filter_visible {
+            return self.handle_filter_key(key);
+        }
         if self.eq_visible {
             return self.handle_eq_key(key);
         }
@@ -950,12 +1026,20 @@ impl App {
             // 歌词偏移：`[` 提前、`]` 延后（每次 0.5 秒）。
             KeyCode::Char('[') => {
                 config.lyrics_offset -= 0.5;
-                self.flash_message(&format!("歌词偏移 {:.1}s", config.lyrics_offset));
+                self.flash_message(&format!(
+                    "{} {:.1}s",
+                    self.i18n.t("msg.lyrics_offset"),
+                    config.lyrics_offset
+                ));
                 return true;
             }
             KeyCode::Char(']') => {
                 config.lyrics_offset += 0.5;
-                self.flash_message(&format!("歌词偏移 {:.1}s", config.lyrics_offset));
+                self.flash_message(&format!(
+                    "{} {:.1}s",
+                    self.i18n.t("msg.lyrics_offset"),
+                    config.lyrics_offset
+                ));
                 return true;
             }
             KeyCode::Char('-') => {
@@ -995,11 +1079,13 @@ impl App {
                     self.clear_playlist();
                     self.pending_clear = false;
                     self.pending_clear_at = None;
-                    self.flash_message("播放列表已清空");
+                    let m = self.i18n.t("msg.cleared").into_owned();
+                    self.flash_message(&m);
                 } else if !self.playlist.is_empty() {
                     self.pending_clear = true;
                     self.pending_clear_at = Some(Instant::now());
-                    self.flash_message("再按一次 x 确认清空播放列表");
+                    let msg = self.i18n.t("msg.clear_confirm").into_owned();
+                    self.flash_message(&msg);
                 }
                 return true;
             }
@@ -1294,7 +1380,8 @@ impl App {
         match cmd.as_str() {
             "quit" | "q" | "exit" => {
                 // 退出交由主循环：这里用标志位不合适，直接提示用 q 键。
-                self.flash_message("退出请按 q 或 Ctrl+C");
+                let m = self.i18n.t("msg.quit_hint").into_owned();
+                self.flash_message(&m);
             }
             "volume" | "vol" => {
                 // is_finite 校验："nan"/"inf" 能 parse 成功但 clamp 对 NaN 失效，
@@ -1308,34 +1395,49 @@ impl App {
                     if let Some(engine) = &self.engine {
                         engine.send(audio::AudioCmd::SetVolume(v));
                     }
-                    self.flash_message(&format!("音量已设为 {}%", (v * 100.0).round() as u32));
+                    let msg = self
+                        .i18n
+                        .t("msg.vol_set")
+                        .replace("{}", &format!("{}", (v * 100.0).round() as u32));
+                    self.flash_message(&msg);
                 } else {
-                    self.flash_message("用法：volume <0-100>");
+                    let m = self.i18n.t("msg.usage_vol").into_owned();
+                    self.flash_message(&m);
                 }
             }
             "repeat" => match parts.next().map(|s| s.to_lowercase()).as_deref() {
                 Some("off") => {
                     config.repeat = crate::config::RepeatMode::Off;
                     self.refresh_preload(config);
-                    self.flash_message("循环：关闭");
+                    let m = self.i18n.t("msg.repeat_off").into_owned();
+                    self.flash_message(&m);
                 }
                 Some("list") | Some("all") => {
                     config.repeat = crate::config::RepeatMode::List;
                     self.refresh_preload(config);
-                    self.flash_message("循环：列表");
+                    let m = self.i18n.t("msg.repeat_list").into_owned();
+                    self.flash_message(&m);
                 }
                 Some("single") | Some("one") => {
                     config.repeat = crate::config::RepeatMode::Single;
                     self.refresh_preload(config);
-                    self.flash_message("循环：单曲");
+                    let m = self.i18n.t("msg.repeat_single").into_owned();
+                    self.flash_message(&m);
                 }
-                _ => self.flash_message("用法：repeat <off|list|single>"),
+                _ => {
+                    let msg = self.i18n.t("msg.usage_repeat").into_owned();
+                    self.flash_message(&msg)
+                }
             },
             "save-m3u" | "m3u-save" => {
                 let path = self.browser.cwd().join("playlist.m3u");
                 match self.save_m3u(&path) {
-                    Ok(n) => self.flash_message(&format!("已保存 {n} 首到 {}", path.display())),
-                    Err(e) => self.flash_message(&format!("保存失败：{e}")),
+                    Ok(n) => self.flash_message(&format!(
+                        "{} {}",
+                        self.i18n.t("msg.saved_m3u").replace("{}", &n.to_string()),
+                        path.display()
+                    )),
+                    Err(e) => self.flash_message(&format!("{}：{e}", self.i18n.t("msg.save_fail"))),
                 }
             }
             "load-m3u" | "m3u-load" => {
@@ -1345,8 +1447,10 @@ impl App {
                     None => self.browser.cwd().join("playlist.m3u"),
                 };
                 match self.load_m3u(&path, config) {
-                    Ok(n) => self.flash_message(&format!("已载入 {n} 首")),
-                    Err(e) => self.flash_message(&format!("载入失败：{e}")),
+                    Ok(n) => {
+                        self.flash_message(&self.i18n.t("msg.loaded").replace("{}", &n.to_string()))
+                    }
+                    Err(e) => self.flash_message(&format!("{}：{e}", self.i18n.t("msg.load_fail"))),
                 }
             }
             "bookmark" | "bm" => self.add_bookmark(),
@@ -1355,20 +1459,22 @@ impl App {
                 if let Some(n) = parts.next().and_then(|s| s.parse::<usize>().ok()) {
                     self.jump_bookmark(n, config);
                 } else {
-                    self.flash_message("用法：bookmark-jump <序号>");
+                    let m = self.i18n.t("msg.usage_bm_jump").into_owned();
+                    self.flash_message(&m);
                 }
             }
             "bookmark-del" | "bm-del" => {
                 if let Some(n) = parts.next().and_then(|s| s.parse::<usize>().ok()) {
                     self.remove_bookmark(n);
                 } else {
-                    self.flash_message("用法：bookmark-del <序号>");
+                    let msg = self.i18n.t("msg.usage_bm_del").into_owned();
+                    self.flash_message(&msg);
                 }
             }
             "help" | "about" => {
                 self.about_visible = true;
             }
-            _ => self.flash_message(&format!("未知命令：{cmd}（输入 help 查看）")),
+            _ => self.flash_message(&self.i18n.t("msg.unknown_cmd").replace("{}", &cmd)),
         }
     }
 
@@ -1381,7 +1487,12 @@ impl App {
         }
         config.playback_medium = medium.as_str().to_string();
         // 界面不再显示介质，切换后提示当前档位（声音变化本身不易一眼看出）。
-        self.flash_message(&format!("介质：{}", menu::medium_menu_label(medium)));
+        let m = format!(
+            "{}：{}",
+            self.i18n.t("msg.medium"),
+            self.i18n.t(menu::medium_menu_label(medium))
+        );
+        self.flash_message(&m);
     }
 
     /// 菜单栏激活态按键分派：←/→ 切菜单、↑/↓ 选项、Enter 执行、Esc 收起/退出。
@@ -1463,7 +1574,10 @@ impl App {
                         }
                         self.execute_menu_action(mi.action, config);
                     }
-                    Some(_) => self.flash_message("该功能暂未提供（随插件/后续版本开放）"),
+                    Some(_) => {
+                        let m = self.i18n.t("msg.feature_na").into_owned();
+                        self.flash_message(&m)
+                    }
                     None => {}
                 }
             }
@@ -1501,9 +1615,10 @@ impl App {
                 self.about_visible = true;
             }
             // 输出设备：corex 已自动跟随系统默认输出（无需手动），这里给出说明。
-            MenuAction::OutputDevice => self.flash_message(
-                "输出设备：自动跟随系统默认输出——插拔耳机/连断蓝牙约 2 秒内自动切换续播；手动指定设备暂未提供",
-            ),
+            MenuAction::OutputDevice => {
+                let m = self.i18n.t("msg.output_device_info").into_owned();
+                self.flash_message(&m);
+            }
             // ReplayGain：响度归一开关（默认关），切换后立即下发引擎。
             MenuAction::ReplayGain => {
                 config.replay_gain = !config.replay_gain;
@@ -1511,8 +1626,12 @@ impl App {
                 if let Some(e) = &self.engine {
                     e.set_replay_gain_enabled(config.replay_gain);
                 }
-                let state = if config.replay_gain { "已开启" } else { "已关闭" };
-                self.flash_message(&format!("ReplayGain 响度归一：{state}"));
+                let state = if config.replay_gain {
+                    self.i18n.t("msg.rg_on")
+                } else {
+                    self.i18n.t("msg.rg_off")
+                };
+                self.flash_message(&format!("{}：{state}", self.i18n.t("msg.rg_state")));
             }
             // 皮肤配色：打开选择器（↑/↓ 即时预览、Enter 确认并持久化、Esc 取消恢复）。
             MenuAction::SkinSelect => {
@@ -1520,8 +1639,19 @@ impl App {
                 self.skin_picker_sel = self.skin_sel;
                 self.skin_picker = true;
             }
+            // 语言选择器：↑/↓ 选语言，Enter 确认写 config.lang 并就地重建语言表（立即生效），Esc 取消。
+            MenuAction::LangSelect => {
+                // 初始高亮 = 当前语言在列表中的位置。
+                self.lang_picker_sel = self
+                    .lang_list
+                    .iter()
+                    .position(|(id, _)| *id == config.lang)
+                    .unwrap_or(0);
+                self.lang_picker = true;
+            }
             // 均衡器：切换面板（Esc 关闭）。插件加载失败时面板内提示。
             MenuAction::Equalizer => self.eq_visible = !self.eq_visible,
+            MenuAction::Filter => self.filter_visible = !self.filter_visible,
             // 压缩器：切换面板（Esc 关闭）。
             MenuAction::Compressor => self.comp_visible = !self.comp_visible,
             // 插件菜单的清单项：同样打开对应面板（√ 已表示加载态）。
@@ -1530,7 +1660,8 @@ impl App {
             // 可视化面板：直接切到频谱 v 循环的「插件」态；无可视化插件时提示。
             MenuAction::PluginVisual => {
                 if self.visual_plugins.is_empty() {
-                    self.flash_message("无可视化插件（plugins/ 下放「可视化-*」插件并重启）");
+                    let m = self.i18n.t("msg.no_visual_pick").into_owned();
+                    self.flash_message(&m);
                 } else {
                     self.spectrum_mode = crate::config::SpectrumMode::Plugin;
                     config.spectrum_mode = self.spectrum_mode;
@@ -1539,7 +1670,10 @@ impl App {
             // 介质：菜单显式选择（与 m 键循环同一落地函数）。
             MenuAction::SetMedium(m) => self.apply_medium(m, config),
             // 未实现功能的兜底（enabled=false 已在上方拦截，此为保险）。
-            _ => self.flash_message("该功能暂未提供（随插件/后续版本开放）"),
+            _ => {
+                let m = self.i18n.t("msg.feature_na").into_owned();
+                self.flash_message(&m)
+            }
         }
     }
 
@@ -1559,6 +1693,42 @@ impl App {
             KeyCode::Char('e') => self.toggle_eq_enabled(),
             KeyCode::Char('r') => self.reset_eq(),
             KeyCode::Char('u') => self.toggle_eq_loaded(),
+            _ => {}
+        }
+        true
+    }
+
+    /// 滤波器面板按键：↑/↓ 调值，←/→ 切参数，e 旁路，r 重置，Esc 关闭。
+    fn handle_filter_key(&mut self, key: KeyEvent) -> bool {
+        let Some(engine) = &self.engine else {
+            return true;
+        };
+        let Some((slot, _)) = engine.alloc_filter_slot() else {
+            return true;
+        };
+        let params = &engine.filter_slots()[slot as usize];
+        match key.code {
+            KeyCode::Esc => self.filter_visible = false,
+            KeyCode::Up => {
+                if self.filter_sel == 0 {
+                    let step = params.cutoff_hz() * 0.05;
+                    params.set_cutoff_hz(params.cutoff_hz() + step);
+                } else {
+                    params.set_resonance_q(params.resonance_q() + 0.1);
+                }
+            }
+            KeyCode::Down => {
+                if self.filter_sel == 0 {
+                    let step = params.cutoff_hz() * 0.05;
+                    params.set_cutoff_hz(params.cutoff_hz() - step);
+                } else {
+                    params.set_resonance_q(params.resonance_q() - 0.1);
+                }
+            }
+            KeyCode::Left => self.filter_sel = 0,
+            KeyCode::Right => self.filter_sel = 1,
+            KeyCode::Char('e') => params.set_enabled(!params.enabled()),
+            KeyCode::Char('r') => params.reset(),
             _ => {}
         }
         true
@@ -1710,9 +1880,11 @@ impl App {
                     match cue::cue_items_from_cue_file(&path) {
                         Some((items, skipped, _)) => {
                             if skipped > 0 {
-                                self.flash_message(&format!(
-                                    "已跳过 {skipped} 条数据轨（不可播放）"
-                                ));
+                                let msg = self
+                                    .i18n
+                                    .t("msg.skipped_data")
+                                    .replace("{}", &skipped.to_string());
+                                self.flash_message(&msg);
                             }
                             if config.dedup_on_add {
                                 self.playlist.add_many_dedup(items);
@@ -1721,7 +1893,8 @@ impl App {
                             }
                         }
                         None => {
-                            self.flash_message("cue 解析失败或 FILE 引用的音频文件不存在");
+                            let m = self.i18n.t("msg.cue_fail").into_owned();
+                            self.flash_message(&m);
                             return;
                         }
                     }
@@ -1730,7 +1903,11 @@ impl App {
                 // 整轨 + 同名 .cue → 展开为多首 CUE 曲目；否则按普通文件加入。
                 let (expanded, skipped) = self.cue_items_for(&path);
                 if skipped > 0 {
-                    self.flash_message(&format!("已跳过 {skipped} 条数据轨（不可播放）"));
+                    let msg = self
+                        .i18n
+                        .t("msg.skipped_data")
+                        .replace("{}", &skipped.to_string());
+                    self.flash_message(&msg);
                 }
                 if !expanded.is_empty() {
                     // CUE 分轨按 (path, cue.index) 判定唯一性。
@@ -1775,16 +1952,25 @@ impl App {
     /// 元数据缓存优先——与同步路径同口径），结果由主循环轮询后经
     /// [`App::apply_dir_add`] 批量合入。大目录加入不再卡 UI。
     fn add_dir_async(&mut self, dir: PathBuf) {
+        // 共享扫描池：submit 即返回，结果由主循环逐帧排空
+        let msg = format!("{}：{}", self.i18n.t("msg.scan_dir"), dir.display());
+        self.scan_pool.submit(dir);
+        self.flash_message(&msg);
+    }
+
+    #[allow(dead_code)]
+    fn add_dir_async_old(&mut self, dir: PathBuf) {
         // 快照当前元数据缓存给后台线程（命中免探测）；只读不写，无竞争。
         let cache = self.metadata_cache.clone();
         let tx = self.add_load_tx.clone();
-        self.flash_message(&format!("正在扫描目录：{}", dir.display()));
+        let msg = format!("{}：{}", self.i18n.t("msg.scan_dir"), dir.display());
+        self.flash_message(&msg);
         // 优雅降级：线程启动失败（极罕见）时提示而非 panic。
         if std::thread::Builder::new()
             .name("fx-dir-add".to_string())
             .spawn(move || {
                 let mut paths = Vec::new();
-                FsBrowser::collect_music_recursive(&dir, &mut paths);
+                FsBrowser::collect_music_recursive(&dir, &mut paths, fs_browser::browser_config());
                 let (mut items, mds, skipped) = cue::build_items_for_paths(&paths, &cache);
                 // 按"专辑-曲序"预排序：让新增批次的插入序 = 显示序，
                 // 添加目录后自动播放/选中的第一首就是专辑-曲序的第一首。
@@ -1793,7 +1979,8 @@ impl App {
             })
             .is_err()
         {
-            self.flash_message("目录加入线程启动失败");
+            let m = self.i18n.t("msg.thread_fail").into_owned();
+            self.flash_message(&m);
         }
     }
 
@@ -1809,9 +1996,11 @@ impl App {
         config: &Config,
     ) {
         if skipped_data_tracks > 0 {
-            self.flash_message(&format!(
-                "已跳过 {skipped_data_tracks} 条数据轨（不可播放）"
-            ));
+            let msg = self
+                .i18n
+                .t("msg.skipped_data")
+                .replace("{}", &skipped_data_tracks.to_string());
+            self.flash_message(&msg);
         }
         let was_empty = self.playlist.is_empty();
         let before = self.playlist.len();
@@ -1827,11 +2016,13 @@ impl App {
         }
         let added = self.playlist.len() - before;
         if empty_dir || self.playlist.is_empty() {
-            self.flash_message(&format!("目录中无音乐文件：{}", dir.display()));
+            let msg = format!("{}：{}", self.i18n.t("msg.no_music"), dir.display());
+            self.flash_message(&msg);
             return;
         }
         if added == 0 {
-            self.flash_message(&format!("未加入新曲目（均已存在）：{}", dir.display()));
+            let msg = format!("{}：{}", self.i18n.t("msg.all_dup"), dir.display());
+            self.flash_message(&msg);
             return;
         }
         if was_empty {
@@ -1840,7 +2031,8 @@ impl App {
             self.playlist.set_selected(first);
             self.play_and_update_current(first, config);
         }
-        self.flash_message(&format!("已加入 {added} 首：{}", dir.display()));
+        let msg = format!("{}：{}", self.i18n.t("msg.added"), dir.display());
+        self.flash_message(&msg);
     }
 
     /// 异步收集当前目录树（浏览器搜索 `/` 用）：后台线程递归收集，
@@ -1860,7 +2052,8 @@ impl App {
             })
             .is_err()
         {
-            self.flash_message("搜索收集线程启动失败");
+            let m = self.i18n.t("msg.thread_fail").into_owned();
+            self.flash_message(&m);
         }
     }
 
@@ -1884,7 +2077,11 @@ impl App {
             }
         }
         if skipped_total > 0 {
-            self.flash_message(&format!("已跳过 {skipped_total} 条数据轨（不可播放）"));
+            let msg = self
+                .i18n
+                .t("msg.skipped_data")
+                .replace("{}", &skipped_total.to_string());
+            self.flash_message(&msg);
         }
         if config.dedup_on_add {
             self.playlist.add_many_dedup(items);
@@ -1904,7 +2101,10 @@ impl App {
             std::collections::HashSet::new();
         let mut albums: Vec<(String, std::path::PathBuf)> = Vec::new();
         for item in self.playlist.items() {
-            let album = item.album.clone().unwrap_or_else(|| "未知专辑".to_string());
+            let album = item
+                .album
+                .clone()
+                .unwrap_or_else(|| self.i18n.t("msg.bm_unknown_album").into_owned().to_string());
             let dir = item.path.parent().map(|p| p.to_path_buf());
             if seen.insert((album.clone(), dir)) {
                 albums.push((album, item.path.clone()));
@@ -1931,7 +2131,7 @@ impl App {
         let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         let paths = tuneux_mediax::m3u::parse(&content);
         if paths.is_empty() {
-            return Err("m3u 中无有效路径".to_string());
+            return Err(self.i18n.t("msg.m3u_empty").into_owned().to_string());
         }
         // 相对路径按 m3u 文件所在目录解析（外部播放器导出的 m3u 主流写法）。
         let base = path.parent().unwrap_or(std::path::Path::new(""));
@@ -1955,7 +2155,8 @@ impl App {
     /// 正确分轨并从书签处起播，而不是被 CUE 起点覆盖、永远落在分轨头。
     fn add_bookmark(&mut self) {
         let Some(path) = self.current_path.clone() else {
-            self.flash_message("无当前曲目");
+            let m = self.i18n.t("msg.no_current").into_owned();
+            self.flash_message(&m);
             return;
         };
         let cue_start_ms = self
@@ -1982,9 +2183,19 @@ impl App {
             .bookmarks
             .add(&path, cue_start_ms, pos, &label);
         if is_new {
-            self.flash_message(&format!("已加书签：{label} @ {pos:.0}s"));
+            self.flash_message(&format!(
+                "{} {} @ {:.0}s",
+                self.i18n.t("msg.bm_added"),
+                label,
+                pos
+            ));
         } else {
-            self.flash_message(&format!("已更新书签：{label} @ {pos:.0}s"));
+            self.flash_message(&format!(
+                "{} {} @ {:.0}s",
+                self.i18n.t("msg.bm_updated"),
+                label,
+                pos
+            ));
         }
     }
 
@@ -1992,7 +2203,8 @@ impl App {
     fn list_bookmarks(&mut self) {
         let bms = &self.playlist_state.bookmarks.items;
         if bms.is_empty() {
-            self.flash_message("暂无书签");
+            let m = self.i18n.t("msg.bm_empty").into_owned();
+            self.flash_message(&m);
             return;
         }
         let mut msg = String::new();
@@ -2005,7 +2217,8 @@ impl App {
     /// 跳到第 n 个书签：写回位置并播放该曲（不在列表则先加入）。
     fn jump_bookmark(&mut self, n: usize, config: &mut Config) {
         let Some(b) = self.playlist_state.bookmarks.items.get(n).cloned() else {
-            self.flash_message("无此书签");
+            let m = self.i18n.t("msg.bm_not_found").into_owned();
+            self.flash_message(&m);
             return;
         };
         // 整轨书签：写回断点位置（绕过 save_position 的 0.5s 阈值），供续播。
@@ -2038,7 +2251,8 @@ impl App {
             }) {
                 Some(i) => i,
                 None => {
-                    self.flash_message("书签文件不存在");
+                    let m = self.i18n.t("msg.bm_no_file").into_owned();
+                    self.flash_message(&m);
                     return;
                 }
             }
@@ -2051,17 +2265,20 @@ impl App {
             self.pending_cue_offset = Some(b.position_secs);
         }
         self.play_and_update_current(idx, config);
-        self.flash_message(&format!("跳到书签：{}", b.label));
+        let m = self.i18n.t("msg.bm_jump").replace("{}", &b.label);
+        self.flash_message(&m);
     }
 
     /// 删除第 n 个书签。
     fn remove_bookmark(&mut self, n: usize) {
         if self.playlist_state.bookmarks.items.get(n).is_none() {
-            self.flash_message("无此书签");
+            let m = self.i18n.t("msg.bm_not_found").into_owned();
+            self.flash_message(&m);
             return;
         }
         let b = self.playlist_state.bookmarks.items.remove(n);
-        self.flash_message(&format!("已删书签：{}", b.label));
+        let m = self.i18n.t("msg.bm_deleted").replace("{}", &b.label);
+        self.flash_message(&m);
     }
 
     /// 异步导航到目录：后台线程读目录，结果由主循环轮询后 apply_loaded。
@@ -2080,7 +2297,8 @@ impl App {
                     })
                     .is_err()
                 {
-                    self.flash_message("目录载入线程启动失败");
+                    let m = self.i18n.t("msg.thread_fail").into_owned();
+                    self.flash_message(&m);
                 }
             }
             Err(e) => self.flash_message(&e),
@@ -2092,7 +2310,7 @@ impl App {
     /// 搜索模式下定位到目标后自动退出搜索——用户搜索的目的就是快速
     /// 跳到某个文件/目录，找到后理应立即回到正常浏览（与 tuneux 一致；
     /// 目录与文件分支都要退，否则旧关键字残留、后续按键仍被搜索框吃掉）。
-    fn handle_browser_enter(&mut self, config: &mut Config) {
+    pub(crate) fn handle_browser_enter(&mut self, config: &mut Config) {
         let was_searching = self.search_mode && self.search_target == SearchTarget::Browser;
         if let Some(dir) = self.browser.selected_dir() {
             // 异步进入目录；退出搜索态（否则按键被搜索框吞掉、旧关键字残留）。
@@ -2107,7 +2325,11 @@ impl App {
                 match cue::cue_items_from_cue_file(&path) {
                     Some((items, skipped, audio_path)) => {
                         if skipped > 0 {
-                            self.flash_message(&format!("已跳过 {skipped} 条数据轨（不可播放）"));
+                            let msg = self
+                                .i18n
+                                .t("msg.skipped_data")
+                                .replace("{}", &skipped.to_string());
+                            self.flash_message(&msg);
                         }
                         // 记下第一轨起点：去重全命中时据此定位「第一曲」
                         //（CUE 同 path，不能只按 path 定位，否则命中任意分轨）。
@@ -2139,7 +2361,8 @@ impl App {
                         self.play_and_update_current(play_idx, config);
                     }
                     None => {
-                        self.flash_message("cue 解析失败或 FILE 引用的音频文件不存在");
+                        let m = self.i18n.t("msg.cue_fail").into_owned();
+                        self.flash_message(&m);
                     }
                 }
                 if was_searching {
@@ -2150,7 +2373,11 @@ impl App {
             // 整轨 + 同名 .cue → 展开为多首 CUE 曲目，加入并播放本整轨第一曲。
             let (expanded, skipped) = self.cue_items_for(&path);
             if skipped > 0 {
-                self.flash_message(&format!("已跳过 {skipped} 条数据轨（不可播放）"));
+                let msg = self
+                    .i18n
+                    .t("msg.skipped_data")
+                    .replace("{}", &skipped.to_string());
+                self.flash_message(&msg);
             }
             if !expanded.is_empty() {
                 // 记下第一轨起点：去重全命中时据此定位「第一曲」（同 path 多分轨）。
@@ -2315,14 +2542,17 @@ mod tests {
         let base = format!("{}/../../plugins/{name}", env!("CARGO_MANIFEST_DIR"));
         let wasm = std::fs::read(format!("{base}.wasm")).expect("读取 wasm 失败");
         let sig_bytes = std::fs::read(format!("{base}.sig")).expect("读取 .sig 失败");
+        let manifest = std::fs::read(format!("{base}.manifest")).unwrap_or_default();
         let sig: [u8; 64] = sig_bytes.try_into().expect(".sig 应为 64 字节");
 
-        let mut message = Vec::with_capacity(id.len() + wasm.len());
+        // v2 签名格式：id ‖ manifest ‖ wasm。
+        let mut message = Vec::with_capacity(id.len() + manifest.len() + wasm.len());
         message.extend_from_slice(id.as_bytes());
+        message.extend_from_slice(&manifest);
         message.extend_from_slice(&wasm);
         assert!(
             tuneux_pinx::verify_signature(&OFFICIAL_PUBKEY, &message, &sig),
-            "{name} 的 .sig 与 .wasm 不匹配（wasm 改动后需重新签名）"
+            "{name} 的 .sig 与 .wasm/.manifest 不匹配（v2 格式）"
         );
     }
 
@@ -2349,6 +2579,7 @@ mod tests {
             .load(
                 &wasm,
                 "tuneux-skin",
+                b"",
                 None,
                 &tuneux_pinx::TrustList::default(),
                 &[tuneux_pinx::Capability::Theme],

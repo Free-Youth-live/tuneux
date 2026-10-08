@@ -41,9 +41,10 @@ pub(super) fn draw_cover_panel(
     frame: &mut ratatui::Frame,
     area: Rect,
     thumb: Option<(u32, u32, &image::RgbaImage)>,
+    i18n: &tuneux_commonx::I18n,
 ) {
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
-        " 专辑封面 · 按 c 隐藏 ",
+        format!(" {} · c ", i18n.t("panel.cover")),
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -60,7 +61,7 @@ pub(super) fn draw_cover_panel(
     // 不做逐帧 resize），这里只做 halfblock 逐行渲染。
     let Some((dst_w, dst_h, rgba)) = thumb else {
         // 无封面：居中显示灰色提示
-        let msg = Paragraph::new("（无封面）\n按 c 隐藏")
+        let msg = Paragraph::new(i18n.t("empty.cover").into_owned())
             .style(Style::default().fg(Color::DarkGray))
             .alignment(Alignment::Center);
         frame.render_widget(msg, inner);
@@ -146,9 +147,14 @@ pub(super) fn draw_browser(
     search_mode: bool,
     search_query: &str,
     focused: bool,
+    i18n: &tuneux_commonx::I18n,
 ) {
     let title_color = if focused { Color::Yellow } else { Color::Cyan };
-    let title = format!(" 文件浏览器 - {} ", browser.cwd().display());
+    let title = format!(
+        " {} · {} ",
+        i18n.t("panel.browser"),
+        browser.cwd().display()
+    );
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         title,
         Style::default()
@@ -161,7 +167,8 @@ pub(super) fn draw_browser(
 
     // 三种特殊状态优先处理：错误 / 空目录 / 正常列表
     if let Some(err) = browser.last_error() {
-        let msg = Paragraph::new(format!("错误: {err}")).style(Style::default().fg(Color::Red));
+        let msg = Paragraph::new(format!("{}: {err}", i18n.t("msg.error")))
+            .style(Style::default().fg(Color::Red));
         frame.render_widget(msg, inner);
         return;
     }
@@ -175,9 +182,14 @@ pub(super) fn draw_browser(
         // 搜索框："/ " 前缀 + query + 光标 + Esc 退出提示；
         // 截断时追加提示，让用户知道大目录下只搜索了前 2 万条。
         let prompt = if browser.search_truncated() {
-            format!("/ {search_query}█  Esc 退出  目录过大，仅搜索前 2 万条")
+            format!(
+                "/ {}█  {}  {}",
+                search_query,
+                i18n.t("search.esc_exit"),
+                i18n.t("search.truncated")
+            )
         } else {
-            format!("/ {search_query}█  Esc 退出")
+            format!("/ {}█  {}", search_query, i18n.t("search.esc_exit"))
         };
         frame.render_widget(
             Paragraph::new(Span::styled(
@@ -197,9 +209,9 @@ pub(super) fn draw_browser(
         // 空目录（未搜索）或搜索零匹配：提示画在 list_area 内——搜索框已在
         // 上方渲染，不会再被这条提示遮住。
         let msg = if search_mode {
-            "（无匹配）Esc 退出搜索"
+            i18n.t("search.no_match").into_owned()
         } else {
-            "（空目录）"
+            i18n.t("empty.dir").into_owned()
         };
         let msg = Paragraph::new(msg)
             .style(Style::default().fg(Color::DarkGray))
@@ -289,7 +301,7 @@ fn album_total_duration(
 ///
 /// # 元数据降级
 /// 标题/艺术家优先从 `metadata_cache` 取（同一首只 probe 一次）。
-/// - 缓存命中但字段缺失：标题降级为文件名，艺术家显示"未知艺人"；
+/// - 缓存命中但字段缺失：标题降级为文件名，艺术家显示i18n.t("group.unknown_artist")；
 /// - 缓存未命中（极少，理论不应发生，因为加入列表时已 probe）：
 ///   标题降级为文件名，艺术家留空。
 ///
@@ -309,14 +321,20 @@ pub(super) fn draw_playlist(
     rows: &[playlist::PlaylistRow],
     search_mode: bool,
     search_query: &str,
+    i18n: &tuneux_commonx::I18n,
 ) {
     let focused = focus == playlist::Panel::Playlist;
     let title_color = if focused { Color::Yellow } else { Color::Cyan };
     // 标题：搜索时显示 "匹配 N/M" 让用户知道过滤效果
     let title = if search_mode && !search_query.is_empty() {
-        format!(" 播放列表 (匹配 {}/{}) ", rows.len(), playlist.len())
+        format!(
+            " {} ({}/{}) ",
+            i18n.t("panel.playlist"),
+            rows.len(),
+            playlist.len()
+        )
     } else {
-        format!(" 播放列表 ({}) ", playlist.len())
+        format!(" {} ({}) ", i18n.t("panel.playlist"), playlist.len())
     };
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         title,
@@ -335,7 +353,7 @@ pub(super) fn draw_playlist(
     let list_area = if search_mode {
         let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
         // 输入框："/ " 前缀 + query + 闪烁光标 + Esc 退出提示
-        let prompt = format!("/ {search_query}█  Esc 退出");
+        let prompt = format!("/ {}█  {}", search_query, i18n.t("search.esc_exit"));
         frame.render_widget(
             Paragraph::new(Span::styled(
                 prompt,
@@ -354,9 +372,9 @@ pub(super) fn draw_playlist(
     // 提示画在 list_area 内，搜索框已在上面占掉 1 行，不会被遮住。
     if rows.is_empty() {
         let msg = if search_mode {
-            "（无匹配）Esc 退出搜索"
+            i18n.t("search.no_match").into_owned()
         } else {
-            "（空）按 b 打开浏览器，a 加入列表"
+            i18n.t("empty.playlist").into_owned()
         };
         let msg = Paragraph::new(msg)
             .style(Style::default().fg(Color::DarkGray))
@@ -395,16 +413,24 @@ pub(super) fn draw_playlist(
                 };
                 let artists = album_artists(cache, playlist, track_indices);
                 let artist_label = if artists.len() > 3 {
-                    "群星".to_string()
+                    i18n.t("group.various").to_string()
                 } else if artists.is_empty() {
-                    "未知艺人".to_string()
+                    i18n.t("group.unknown_artist").to_string()
                 } else {
                     artists.join("、")
                 };
                 let total = album_total_duration(cache, playlist, track_indices);
+                // 空专辑名 = 分组哨兵：显示层翻译为「未知专辑」（语言切换不漂移）。
+                let album_label = if album.is_empty() {
+                    i18n.t("group.unknown_album")
+                } else {
+                    std::borrow::Cow::Borrowed(album.as_str())
+                };
+                let count_label = i18n
+                    .t("group.track_count")
+                    .replace("{}", &track_indices.len().to_string());
                 let text = format!(
-                    "{arrow} {album} - {artist_label} ({}首) ({})",
-                    track_indices.len(),
+                    "{arrow} {album_label} - {artist_label} ({count_label}) ({})",
                     super::fmt_time(total),
                 );
                 let is_selected =
@@ -432,7 +458,7 @@ pub(super) fn draw_playlist(
                         .performer
                         .clone()
                         .or_else(|| cache.get(&item.path).and_then(|md| md.artist.clone()))
-                        .unwrap_or_else(|| "未知艺人".to_string());
+                        .unwrap_or_else(|| i18n.t("group.unknown_artist").to_string());
                     (cue.title.clone(), artist)
                 } else {
                     // 普通曲目：取标题/艺术家，优先元数据缓存，降级文件名
@@ -445,7 +471,9 @@ pub(super) fn draw_playlist(
                                     .map(|s| s.to_string())
                                     .unwrap_or_default()
                             }),
-                            md.artist.clone().unwrap_or_else(|| "未知艺人".to_string()),
+                            md.artist
+                                .clone()
+                                .unwrap_or_else(|| i18n.t("group.unknown_artist").to_string()),
                         ),
                         None => (
                             // 缓存未命中：标题降级文件名，艺术家留空
@@ -523,9 +551,10 @@ pub(super) fn draw_lyrics_panel(
     area: Rect,
     engine: &Option<audio::Engine>,
     lyrics_opt: Option<&lyrics::Lyrics>,
+    i18n: &tuneux_commonx::I18n,
 ) {
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
-        " 歌词 ",
+        format!(" {} ", i18n.t("panel.lyrics")),
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -534,7 +563,7 @@ pub(super) fn draw_lyrics_panel(
     frame.render_widget(block, area);
 
     let Some(lyrics) = lyrics_opt.filter(|l| !l.is_empty()) else {
-        let msg = Paragraph::new("（无歌词）\n放置同名 .lrc 或在标签内嵌歌词（USLT/LYRICS）可显示")
+        let msg = Paragraph::new(i18n.t("empty.lyrics").into_owned())
             .style(Style::default().fg(Color::DarkGray))
             .alignment(Alignment::Center);
         frame.render_widget(msg, inner);
@@ -595,9 +624,10 @@ pub(super) fn draw_cover_browser(
     frame: &mut ratatui::Frame,
     area: Rect,
     app: &mut crate::tui::app::App,
+    i18n: &tuneux_commonx::I18n,
 ) {
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
-        " 封面浏览 · ↑↓ 选择 · PgUp/PgDn 翻页 · Enter 播放 · c 隐藏 ",
+        format!(" {} ", i18n.t("panel.cover_browser")),
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -607,7 +637,7 @@ pub(super) fn draw_cover_browser(
 
     let albums = app.cover_browser_albums();
     if albums.is_empty() {
-        let msg = Paragraph::new("（播放列表为空）\n按 c 隐藏");
+        let msg = Paragraph::new(i18n.t("empty.playlist_short").into_owned());
         frame.render_widget(msg, inner);
         return;
     }

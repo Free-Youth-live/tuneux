@@ -4,7 +4,7 @@
 # 版权所有 © 2026 不羁的青春（FreeYouth）
 # 本项目采用木兰宽松许可证，第 2 版（MulanPSL-2.0）开源。
 #
-# 架构：mono repo + Cargo workspace 五 crate 同仓（corex / mediax / pinx / tuneux / tuneux-fx）。
+# 架构：mono repo + Cargo workspace 七 crate 同仓（corex / mediax / commonx / pinx / tuneux / tuneux-fx / tuneux-max）。
 # 单一 Cargo.lock 保证跨 crate 依赖类型一致。
 # =============================================================================
 
@@ -36,6 +36,10 @@ ratatui = "0.30.2"
 unicode-width = "0.1"
 crossterm = "0.28"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# GUI（tuneux-max）：egui 生态官方壳（winit 窗口 + wgpu/glow 渲染）
+eframe = "0.32"
+# 原生文件对话框（tuneux-max）：Linux 走 xdg-portal（纯 Rust，不引 GTK 运行时依赖）
+rfd = "0.15"
 # 配置文件
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

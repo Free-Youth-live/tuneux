@@ -79,9 +79,10 @@ pub(super) fn draw_level_meter(
     engine: &Option<audio::Engine>,
     frame_tick: u64,
     style: BarStyle,
+    i18n: &tuneux_commonx::I18n,
 ) {
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
-        " 电平 ",
+        format!(" {} ", i18n.t("panel.level")),
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -127,9 +128,10 @@ pub(super) fn draw_band_column(
     engine: &Option<audio::Engine>,
     seed: u64,
     style: BarStyle,
+    i18n: &tuneux_commonx::I18n,
 ) {
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
-        " 频段 ",
+        format!(" {} ", i18n.t("panel.bands")),
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -157,10 +159,15 @@ pub(super) fn draw_band_column(
     let n = audio::spectrum::N_BANDS;
     let b1 = n / 3;
     let b2 = n * 2 / 3;
+    let (low_name, mid_name, high_name) = (
+        i18n.t("spectrum.low"),
+        i18n.t("spectrum.mid"),
+        i18n.t("spectrum.high"),
+    );
     let buckets = [
-        ("低", bucket_max(0, b1)),
-        ("中", bucket_max(b1, b2)),
-        ("高", bucket_max(b2, n)),
+        (low_name.as_ref(), bucket_max(0, b1)),
+        (mid_name.as_ref(), bucket_max(b1, b2)),
+        (high_name.as_ref(), bucket_max(b2, n)),
     ];
     // Matrix（默认）= 纯方块渐进（█▓▒░ 从实到虚，按柱宽均匀分布）；
     // 其余风格随 bar_style 池逐格随机取用（与电平 / 频谱同观感）。
@@ -293,6 +300,7 @@ fn draw_vu_row(
 /// - 柱身单色亮绿（LightGreen），柱顶一格白色高亮
 ///   让眼睛能跟上"条顶位置"；
 /// - 无信号区域留空，底部一行 `─` 基线。
+#[allow(clippy::too_many_arguments)]
 pub(super) fn draw_audio_panel(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -301,9 +309,10 @@ pub(super) fn draw_audio_panel(
     peaks: &std::cell::RefCell<audio::spectrum::SpectrumPeakHold>,
     dt: std::time::Duration,
     style: BarStyle,
+    i18n: &tuneux_commonx::I18n,
 ) {
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
-        " 频 谱 ",
+        format!(" {} ", i18n.t("panel.spectrum")),
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -420,9 +429,10 @@ pub(super) fn draw_oscilloscope(
     engine: &Option<audio::Engine>,
     frame_tick: u64,
     style: BarStyle,
+    i18n: &tuneux_commonx::I18n,
 ) {
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
-        " 示波器 ",
+        format!(" {} ", i18n.t("panel.oscilloscope")),
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -518,7 +528,14 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(backend).expect("建终端");
         terminal
             .draw(|f| {
-                super::draw_band_column(f, f.area(), &None, 0, BarStyle::Matrix);
+                super::draw_band_column(
+                    f,
+                    f.area(),
+                    &None,
+                    0,
+                    BarStyle::Matrix,
+                    &crate::config::build_i18n("zh"),
+                );
             })
             .expect("绘制");
         let text: String = terminal
@@ -531,8 +548,7 @@ mod tests {
         for name in ["低", "中", "高"] {
             assert!(text.contains(name), "{name} 应在：{text:?}");
         }
-        // 标题「频段」：宽字符在 buffer 中两字间会隔一个 continuation 空串，
-        // 分开断言两字都在即可（视觉上紧邻）。
+        // 标题：zh 内置表命中「频段」（CJK 占两格，逐字符断言）。
         assert!(
             text.contains('频') && text.contains('段'),
             "标题应在：{text:?}"

@@ -114,6 +114,7 @@ pub fn draw(
         &app.engine,
         frame_tick,
         app.bar_style,
+        &app.i18n,
     );
     // 帧计数 +1，供电平/频谱的乱码字符用。
     app.frame_tick = app.frame_tick.wrapping_add(1);
@@ -139,6 +140,7 @@ pub fn draw(
                 metrics.browser_searching,
                 &app.search_query,
                 app.focus == playlist::Panel::Browser,
+                &app.i18n,
             );
             draw_playlist_or_spectrum(frame, main[1], app, &metrics, rows, dt);
         }
@@ -157,7 +159,7 @@ pub fn draw(
                 app.ensure_cover_thumb(iw, ih);
                 thumb = app.cover_thumb();
             }
-            draw_cover_panel(frame, main[0], thumb);
+            draw_cover_panel(frame, main[0], thumb, &app.i18n);
             draw_playlist_or_spectrum(frame, main[1], app, &metrics, rows, dt);
         }
         LeftPanel::Hidden => {
@@ -165,29 +167,32 @@ pub fn draw(
         }
         LeftPanel::CoverBrowser => {
             // 封面网格浏览占满整个主区（不含播放列表）。
-            draw_cover_browser(frame, vertical[1], app);
+            let i18n_copy = app.i18n.clone();
+            draw_cover_browser(frame, vertical[1], app, &i18n_copy);
         }
     }
 
     // —— 状态条 + 帮助栏 ——
+    let repeat_label = app.i18n.t(crate::config::repeat_key(config.repeat));
     draw_status_bar(
         frame,
         vertical[2],
         &app.current_metadata,
         &app.engine,
-        config.repeat,
+        repeat_label.as_ref(),
         app.playlist.is_shuffle(),
         app.last_error.as_deref(),
         app.playlist
             .current_index()
             .and_then(|i| app.playlist.items().get(i))
             .and_then(|it| it.cue.as_ref()),
+        &app.i18n,
     );
-    draw_help_bar(frame, vertical[3], app.focus);
+    draw_help_bar(frame, vertical[3], app.focus, &app.i18n);
 
     // —— 关于弹窗：最后绘制，覆盖在其它内容之上 ——
     if app.about_visible {
-        draw_about(frame, area);
+        draw_about(frame, area, &app.i18n);
     }
 }
 
@@ -241,9 +246,17 @@ fn draw_playlist_or_spectrum(
                     &app.spectrum_peaks,
                     dt,
                     app.bar_style,
+                    &app.i18n,
                 );
             } else if app.spectrum_mode == SpectrumMode::Oscilloscope {
-                draw_oscilloscope(frame, area, &app.engine, app.frame_tick, app.bar_style);
+                draw_oscilloscope(
+                    frame,
+                    area,
+                    &app.engine,
+                    app.frame_tick,
+                    app.bar_style,
+                    &app.i18n,
+                );
             } else {
                 // 列表与歌词横向分屏比例取自 metrics（单一真相源）
                 let split = Layout::horizontal([
@@ -264,6 +277,7 @@ fn draw_playlist_or_spectrum(
                             rows,
                             metrics.playlist_searching,
                             &app.search_query,
+                            &app.i18n,
                         );
                     }
                     // 半屏：左侧区域下半显示频谱
@@ -283,6 +297,7 @@ fn draw_playlist_or_spectrum(
                             rows,
                             metrics.playlist_searching,
                             &app.search_query,
+                            &app.i18n,
                         );
                         draw_audio_panel(
                             frame,
@@ -292,12 +307,19 @@ fn draw_playlist_or_spectrum(
                             &app.spectrum_peaks,
                             dt,
                             app.bar_style,
+                            &app.i18n,
                         );
                     }
                     // Full / Oscilloscope 已在上方分支处理
                     SpectrumMode::Full | SpectrumMode::Oscilloscope => {}
                 }
-                draw_lyrics_panel(frame, split[1], &app.engine, app.current_lyrics.as_ref());
+                draw_lyrics_panel(
+                    frame,
+                    split[1],
+                    &app.engine,
+                    app.current_lyrics.as_ref(),
+                    &app.i18n,
+                );
             }
         }
         // 歌词关闭：走原频谱逻辑
@@ -313,6 +335,7 @@ fn draw_playlist_or_spectrum(
                     rows,
                     metrics.playlist_searching,
                     &app.search_query,
+                    &app.i18n,
                 );
             }
             SpectrumMode::Half => {
@@ -329,6 +352,7 @@ fn draw_playlist_or_spectrum(
                     rows,
                     metrics.playlist_searching,
                     &app.search_query,
+                    &app.i18n,
                 );
                 draw_audio_panel(
                     frame,
@@ -338,6 +362,7 @@ fn draw_playlist_or_spectrum(
                     &app.spectrum_peaks,
                     dt,
                     app.bar_style,
+                    &app.i18n,
                 );
             }
             SpectrumMode::Full => {
@@ -349,10 +374,18 @@ fn draw_playlist_or_spectrum(
                     &app.spectrum_peaks,
                     dt,
                     app.bar_style,
+                    &app.i18n,
                 );
             }
             SpectrumMode::Oscilloscope => {
-                draw_oscilloscope(frame, area, &app.engine, app.frame_tick, app.bar_style);
+                draw_oscilloscope(
+                    frame,
+                    area,
+                    &app.engine,
+                    app.frame_tick,
+                    app.bar_style,
+                    &app.i18n,
+                );
             }
         },
     }
@@ -369,6 +402,7 @@ fn draw_top_bar(
     engine: &Option<audio::Engine>,
     frame_tick: u64,
     bar_style: tuneux_mediax::BarStyle,
+    i18n: &tuneux_commonx::I18n,
 ) {
     let cols = Layout::horizontal([
         Constraint::Percentage(60),
@@ -376,7 +410,7 @@ fn draw_top_bar(
         Constraint::Percentage(25),
     ])
     .split(area);
-    draw_now_playing(frame, cols[0], metadata, engine);
-    draw_band_column(frame, cols[1], engine, frame_tick, bar_style);
-    draw_level_meter(frame, cols[2], engine, frame_tick, bar_style);
+    draw_now_playing(frame, cols[0], metadata, engine, i18n);
+    draw_band_column(frame, cols[1], engine, frame_tick, bar_style, i18n);
+    draw_level_meter(frame, cols[2], engine, frame_tick, bar_style, i18n);
 }

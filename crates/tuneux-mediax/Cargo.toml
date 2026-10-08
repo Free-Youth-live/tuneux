@@ -7,7 +7,7 @@
 
 [package]
 name = "tuneux-mediax"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MulanPSL-2.0"
 authors = ["不羁的青春（FreeYouth）"]
@@ -18,6 +18,10 @@ rust-version = "1.88"
 serde.workspace = true
 encoding_rs.workspace = true
 tuneux-corex = { path = "../tuneux-corex" }
+crossbeam-channel.workspace = true
+# 封面解码（artwork）：image 已在 workspace 构建图中（三产品各自在用），
+# 收进 mediax 不新增依赖边（评审 R1 #9 裁决）。
+image = { workspace = true }
 
 # dev 依赖仅用于冻结表示的契约测试（serde 往返经 toml 验证）
 # 与字符池宽度守护（unicode-width 校验），版本随 workspace 统一，不新增供应链。

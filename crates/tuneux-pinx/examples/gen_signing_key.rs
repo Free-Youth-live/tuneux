@@ -92,14 +92,21 @@ fn load_or_generate_seed(path: &std::path::Path) -> [u8; 32] {
 fn sign_plugin(signing: &SigningKey, name: &str, id: &str) {
     let wasm_path = format!("{}/../../plugins/{name}.wasm", env!("CARGO_MANIFEST_DIR"));
     let sig_path = format!("{}/../../plugins/{name}.sig", env!("CARGO_MANIFEST_DIR"));
+    let manifest_path = format!(
+        "{}/../../plugins/{name}.manifest",
+        env!("CARGO_MANIFEST_DIR")
+    );
     let wasm = std::fs::read(&wasm_path).expect("读 wasm 失败");
-    let mut message = Vec::with_capacity(id.len() + wasm.len());
+    // v2 签名格式：id ‖ manifest ‖ wasm（能力清单纳入签名面）。
+    let manifest = std::fs::read(&manifest_path).unwrap_or_default();
+    let mut message = Vec::with_capacity(id.len() + manifest.len() + wasm.len());
     message.extend_from_slice(id.as_bytes());
+    message.extend_from_slice(&manifest);
     message.extend_from_slice(&wasm);
     let sig = signing.sign(&message);
     std::fs::write(&sig_path, sig.to_bytes()).expect("写 .sig 失败");
     println!(
-        "签名 {name}.wasm -> {name}.sig（{} 字节）",
+        "签名 {name}.wasm + {name}.manifest -> {name}.sig（{} 字节，v2 格式）",
         sig.to_bytes().len()
     );
 }

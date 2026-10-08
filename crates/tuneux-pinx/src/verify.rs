@@ -48,7 +48,11 @@ impl Tristate {
 }
 
 /// 各三态对应的加载口径（枚举含义见各项说明）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// 派生 `Ord` 使策略可按「信任强度」比较：变体声明序即强度序——
+/// `Silent < AskAuthor < ConfirmAndRecord`。加载方要求「至少达到某档」
+/// 时，用 `plugin.load_policy() <= min_policy` 判定（越严格 = 越靠前）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LoadPolicy {
     /// 静默加载（界面可展示官方徽章）。
     Silent,
@@ -88,6 +92,13 @@ impl TrustList {
 
 /// Ed25519 验签（严格模式）：公钥（32 字节）验证签名（64 字节）对消息的签名。
 ///
+/// 官方第一方签名公钥（32 字节 Ed25519）。公开信息，供各发行版宿主
+/// （tuneux-fx / tuneux-max）构建 TrustList 单一事实源；私钥种子永不入仓。
+pub const OFFICIAL_PUBKEY: [u8; 32] = [
+    0x9a, 0xc3, 0x5b, 0x76, 0xa9, 0xaf, 0xbe, 0x5f, 0xfc, 0xab, 0x74, 0x35, 0xeb, 0xaf, 0xb2, 0x83,
+    0x46, 0x56, 0x55, 0xda, 0x84, 0x58, 0xd9, 0xec, 0x3f, 0x4d, 0xa3, 0xb8, 0x4e, 0xb8, 0xcb, 0x29,
+];
+
 /// 任何失败（公钥非法 / 签名长度错 / 验证不过 / 弱公钥）返回 false，不 panic。
 ///
 /// 严格模式（`verify_strict` + `is_weak` 双重防护）：ed25519-dalek 的普通
@@ -109,19 +120,24 @@ pub fn verify_signature(public_key: &[u8; 32], message: &[u8], signature: &[u8; 
 
 /// 由「是否命中官方公钥 / 是否验签通过」判定信任三态。
 ///
-/// - 签名消息 = 插件 id ‖ wasm 字节（绑定插件身份，防掉包）；
+/// - 签名消息 = 插件 id ‖ manifest 字节 ‖ wasm 字节（v2：绑定身份 + 能力面 + 代码）；
+/// - **已修复（签名规格 v2）**：能力清单（manifest）已纳入签名消息，清单篡改会导致验签失败；
+///   改动后需重签全部第一方插件 .sig。
 /// - 官方公钥命中且验签通过 → [`Tristate::Trusted`]；
 /// - 验签通过但作者非官方 → [`Tristate::SignedUnknown`]；
 /// - 无签名 / 验签失败 → [`Tristate::Unsigned`]。
 pub fn classify(
     plugin_id: &str,
+    manifest_bytes: &[u8],
     wasm_bytes: &[u8],
     signature: Option<(&[u8; 32], &[u8; 64])>,
     trust: &TrustList,
 ) -> Tristate {
     // 拼接签名消息（load 路径，非音频线程，允许分配）。
-    let mut message = Vec::with_capacity(plugin_id.len() + wasm_bytes.len());
+    // v2 格式：id ‖ manifest ‖ wasm。
+    let mut message = Vec::with_capacity(plugin_id.len() + manifest_bytes.len() + wasm_bytes.len());
     message.extend_from_slice(plugin_id.as_bytes());
+    message.extend_from_slice(manifest_bytes);
     message.extend_from_slice(wasm_bytes);
 
     match signature {
@@ -241,6 +257,39 @@ mod tests {
         assert!(!verify_signature(&[0u8; 32], msg, &sig.to_bytes()));
     }
 
+    /// 模糊化烟雾测试：任意公钥 / 消息 / 签名长度下验签不得 panic。
+    ///（验签面对的是不可信插件数据，任何 panic 都是缺陷。）
+    #[test]
+    fn verify_signature_never_panics_on_garbage() {
+        let mut state: u64 = 0xc0ffee;
+        for len in 0..=256usize {
+            let mut msg = vec![0u8; len];
+            let mut pk = [0u8; 32];
+            let mut sig = [0u8; 64];
+            for b in &mut msg {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *b = (state >> 32) as u8;
+            }
+            for b in &mut pk {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *b = (state >> 32) as u8;
+            }
+            for b in &mut sig {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *b = (state >> 32) as u8;
+            }
+            // 结果真/假均可，不得 panic。
+            let _ = verify_signature(&pk, &msg, &sig);
+            let _ = classify("x", b"", &msg, Some((&pk, &sig)), &TrustList::default());
+        }
+    }
+
     #[test]
     fn classify_maps_signature_to_tristate() {
         use ed25519_dalek::{Signer, SigningKey};
@@ -255,13 +304,20 @@ mod tests {
         // 官方公钥命中 → Trusted。
         let trust = TrustList::from_parts(vec![vk.to_bytes()]);
         assert_eq!(
-            classify(id, wasm, Some((&vk.to_bytes(), &sig.to_bytes())), &trust),
+            classify(
+                id,
+                b"",
+                wasm,
+                Some((&vk.to_bytes(), &sig.to_bytes())),
+                &trust
+            ),
             Tristate::Trusted
         );
         // 验签通过但作者非官方 → SignedUnknown。
         assert_eq!(
             classify(
                 id,
+                b"",
                 wasm,
                 Some((&vk.to_bytes(), &sig.to_bytes())),
                 &TrustList::default()
@@ -269,12 +325,18 @@ mod tests {
             Tristate::SignedUnknown
         );
         // 无签名 → 一律 Unsigned（id 不再参与判定，签名是唯一信任来源）。
-        assert_eq!(classify(id, wasm, None, &trust), Tristate::Unsigned);
+        assert_eq!(classify(id, b"", wasm, None, &trust), Tristate::Unsigned);
         // 篡改 wasm → 验签失败 → Unsigned。
         let mut bad = wasm.to_vec();
         bad[0] ^= 1;
         assert_eq!(
-            classify(id, &bad, Some((&vk.to_bytes(), &sig.to_bytes())), &trust),
+            classify(
+                id,
+                b"",
+                &bad,
+                Some((&vk.to_bytes(), &sig.to_bytes())),
+                &trust
+            ),
             Tristate::Unsigned
         );
     }

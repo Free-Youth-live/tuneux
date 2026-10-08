@@ -1,0 +1,48 @@
+# =============================================================================
+# tuneux-commonx · 发行版通用机制层（lib）
+#
+# 版权所有 © 2026 不羁的青春（FreeYouth）
+# 本项目采用木兰宽松许可证，第 2 版（MulanPSL-2.0）开源。
+#
+# 定位：与「音频领域」无关、与「UI 呈现」无关、≥2 个发行版共用的
+# 应用机制层。键位解析 / 配置便携路径 / 系统媒体键 / 目录浏览机制。
+#
+# 红线（机器可断言，不靠自觉）：
+#   - 零 workspace 内部依赖（不依赖 corex / mediax / pinx，平级叶子防循环）；
+#   - 零 UI 依赖（ratatui / crossterm / egui / image 严禁引入）；
+#   - 零网络、零插件。
+#   - 事实与策略构造注入（扩展名清单、MPRIS 服务名 / identity 都是参数）。
+# =============================================================================
+
+[package]
+name = "tuneux-commonx"
+version = "0.2.0"
+edition = "2021"
+license = "MulanPSL-2.0"
+authors = ["不羁的青春（FreeYouth）"]
+description = "tuneux 系列发行版通用机制：键位解析、配置便携路径、系统媒体键、目录浏览机制（零 UI、零网络、零插件、零内部依赖）"
+rust-version = "1.88"
+
+[features]
+# 默认不启用：rdev 是 Windows 系统级低层键盘钩子（接收全机击键，含他程序
+# 密码），杀软/EDR 易误报；不想装全局钩子的平台/产品可不启用。
+# 需要媒体键的产品显式启用 `media-key`。
+default = []
+media-key = ["dep:crossbeam-channel", "dep:zbus", "dep:rdev"]
+
+[dependencies]
+# 媒体键事件通道（仅 media-key feature 启用时引入）。
+crossbeam-channel = { workspace = true, optional = true }
+# 配置便携路径：exe 同目录 / 系统配置目录回退 + 主目录兜底。
+dirs.workspace = true
+
+# 系统媒体键（仅 Linux）：MPRIS D-Bus 服务（zbus 纯 safe Rust，MIT 许可）。
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { workspace = true, optional = true }
+
+# 系统媒体键（仅 Windows）：rdev 低层键盘钩子（MIT，unsafe 全在 crate 内部）。
+[target.'cfg(target_os = "windows")'.dependencies]
+rdev = { workspace = true, optional = true }
+
+[lints]
+workspace = true

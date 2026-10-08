@@ -178,25 +178,25 @@ cargo run --release
 
 ## 下载与首次运行
 
-| 系统      | CPU 架构              | 文件（以 v0.5.1 为例）                     |
+| 系统      | CPU 架构              | 文件（以 v0.5.5 为例）                     |
 | ------- | ------------------- | ----------------------------------- |
-| Windows | x86_64（多数 PC）       | `tuneux-0.5.1-windows-x86_64.zip`   |
-| Windows | arm64               | `tuneux-0.5.1-windows-arm64.zip`    |
-| macOS   | Apple Silicon（M 系列） | `tuneux-0.5.1-macos-arm64.tar.gz`   |
-| macOS   | Intel               | `tuneux-0.5.1-macos-x86_64.tar.gz`  |
-| Linux   | x86_64              | `tuneux-0.5.1-linux-x86_64.tar.gz`  |
-| Linux   | arm64               | `tuneux-0.5.1-linux-arm64.tar.gz`   |
+| Windows | x86_64（多数 PC）       | `tuneux-0.5.5-windows-x86_64.zip`   |
+| Windows | arm64               | `tuneux-0.5.5-windows-arm64.zip`    |
+| macOS   | Apple Silicon（M 系列） | `tuneux-0.5.5-macos-arm64.tar.gz`   |
+| macOS   | Intel               | `tuneux-0.5.5-macos-x86_64.tar.gz`  |
+| Linux   | x86_64              | `tuneux-0.5.5-linux-x86_64.tar.gz`  |
+| Linux   | arm64               | `tuneux-0.5.5-linux-arm64.tar.gz`   |
 
-插件版 **tuneux-fx** 另有一套下载包（以 v0.5.1 为例），压缩包内额外含 `plugins/` 插件目录（均衡器 / 压缩器 / 皮肤「Norton 蓝」「午夜蓝」）与《插件开发指南.txt》：
+插件版 **tuneux-fx** 另有一套下载包（以 v0.5.5 为例），压缩包内额外含 `plugins/` 插件目录（均衡器 / 压缩器 / 皮肤「Norton 蓝」「午夜蓝」）与《插件开发指南.txt》：
 
 | 系统      | CPU 架构              | 文件                                     |
 | ------- | ------------------- | -------------------------------------- |
-| Windows | x86_64（多数 PC）       | `tuneux-fx-0.5.1-windows-x86_64.zip`   |
-| Windows | arm64               | `tuneux-fx-0.5.1-windows-arm64.zip`    |
-| macOS   | Apple Silicon（M 系列） | `tuneux-fx-0.5.1-macos-arm64.tar.gz`   |
-| macOS   | Intel               | `tuneux-fx-0.5.1-macos-x86_64.tar.gz`  |
-| Linux   | x86_64              | `tuneux-fx-0.5.1-linux-x86_64.tar.gz`  |
-| Linux   | arm64               | `tuneux-fx-0.5.1-linux-arm64.tar.gz`   |
+| Windows | x86_64（多数 PC）       | `tuneux-fx-0.5.5-windows-x86_64.zip`   |
+| Windows | arm64               | `tuneux-fx-0.5.5-windows-arm64.zip`    |
+| macOS   | Apple Silicon（M 系列） | `tuneux-fx-0.5.5-macos-arm64.tar.gz`   |
+| macOS   | Intel               | `tuneux-fx-0.5.5-macos-x86_64.tar.gz`  |
+| Linux   | x86_64              | `tuneux-fx-0.5.5-linux-x86_64.tar.gz`  |
+| Linux   | arm64               | `tuneux-fx-0.5.5-linux-arm64.tar.gz`   |
 
 > 预编译二进制未做代码签名，首次运行会被系统拦截，按下面步骤放行即可。
 > 若不想处理提示，用源码自行编译（`cargo build --release`）则不会有任何拦截。
@@ -216,7 +216,7 @@ cargo run --release
 cd ~/Downloads
 
 # 2. 解压
-tar xzf tuneux-0.5.1-macos-arm64.tar.gz
+tar xzf tuneux-0.5.5-macos-arm64.tar.gz
 
 # 3. 清除隔离属性（关键一步）
 xattr -cr tuneux
@@ -230,7 +230,7 @@ xattr -cr tuneux
 ### Linux 首次运行
 
 ```bash
-tar xzf tuneux-0.5.1-linux-x86_64.tar.gz
+tar xzf tuneux-0.5.5-linux-x86_64.tar.gz
 chmod +x tuneux
 ./tuneux
 ```

@@ -247,4 +247,26 @@ mod tests {
     fn parse_manifest_rejects_unknown() {
         assert!(parse_manifest("audio_dsp\nbogus\n").is_err());
     }
+
+    /// 模糊化烟雾测试：任意文本解析 manifest 不得 panic（结果 Ok/Err 均可）。
+    #[test]
+    fn parse_manifest_never_panics_on_garbage() {
+        let mut state: u64 = 0xdead_beef;
+        for len in 0..=256usize {
+            let mut s = String::with_capacity(len);
+            for _ in 0..len {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                // 覆盖可打印 ASCII（能力名与注释形态）与部分高位字节。
+                let c = if state & 0x10 == 0 {
+                    ((state >> 32) as u8 % 0x5e).wrapping_add(0x20) as char
+                } else {
+                    (state >> 32) as u8 as char
+                };
+                s.push(c);
+            }
+            let _ = parse_manifest(&s);
+        }
+    }
 }

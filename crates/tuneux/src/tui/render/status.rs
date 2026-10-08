@@ -14,7 +14,6 @@ use ratatui::{
 };
 
 use super::fmt_time;
-use crate::config;
 use crate::playlist;
 use tuneux_corex as audio;
 use tuneux_mediax::metadata;
@@ -40,9 +39,10 @@ pub(super) fn draw_now_playing(
     area: Rect,
     metadata: &Option<metadata::TrackMetadata>,
     engine: &Option<audio::Engine>,
+    i18n: &tuneux_commonx::I18n,
 ) {
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
-        " 当前曲目 ",
+        format!(" {} ", i18n.t("panel.current_track")),
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -54,7 +54,7 @@ pub(super) fn draw_now_playing(
     let md = match metadata {
         Some(m) => m,
         None => {
-            let hint = Paragraph::new("（未播放）")
+            let hint = Paragraph::new(i18n.t("msg.empty").into_owned())
                 .style(Style::default().fg(Color::DarkGray))
                 .alignment(Alignment::Center);
             frame.render_widget(hint, inner);
@@ -63,18 +63,25 @@ pub(super) fn draw_now_playing(
     };
 
     // 字段降级：标签缺失时显示"未知xxx"
-    let title = md.title.clone().unwrap_or_else(|| "未知曲目".to_string());
-    let artist = md.artist.clone().unwrap_or_else(|| "未知艺人".to_string());
+    let title = md
+        .title
+        .clone()
+        .unwrap_or_else(|| i18n.t("metadata.unknown_title").into_owned());
+    let artist = md
+        .artist
+        .clone()
+        .unwrap_or_else(|| i18n.t("metadata.unknown_artist").into_owned());
     // 专辑与曲序组合显示：四种组合各有合理文案
+    let track_label = i18n.t("metadata.track_label").into_owned();
     let album_line = match (&md.album, md.track_number) {
-        (Some(a), Some(n)) => format!("{a} · 曲目 {n}"),
+        (Some(a), Some(n)) => format!("{a} · {track_label} {n}"),
         (Some(a), None) => a.clone(),
-        (None, Some(n)) => format!("曲目 {n}"),
-        (None, None) => "未知专辑".to_string(),
+        (None, Some(n)) => format!("{track_label} {n}"),
+        (None, None) => i18n.t("metadata.unknown_album").into_owned(),
     };
     let tech = format!(
         "{} · {} · {} · {}",
-        md.codec.as_deref().unwrap_or("未知格式"),
+        md.codec.as_deref().unwrap_or(&i18n.t("msg.unknown_format")),
         md.bitrate_label(),
         md.sample_rate_label(),
         md.bits_label(),
@@ -97,15 +104,25 @@ pub(super) fn draw_now_playing(
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )),
-        Line::from(Span::raw(format!("歌手: {artist}"))),
-        Line::from(Span::raw(format!("专辑: {album_line}"))),
+        Line::from(Span::raw(format!(
+            "{}: {artist}",
+            i18n.t("metadata.artist_label")
+        ))),
+        Line::from(Span::raw(format!(
+            "{}: {album_line}",
+            i18n.t("metadata.album_label")
+        ))),
         Line::from(Span::styled(tech, Style::default().fg(tech_color))),
     ];
     // 在第一行行首插入播放状态标记，让用户一眼看到播放/暂停
     let playing = engine.as_ref().is_some_and(|e| e.is_playing());
     let mut lines = lines;
     if let Some(first) = lines.first_mut() {
-        let status = if playing { "[播] " } else { "[停] " };
+        let status = if playing {
+            format!("{} ", i18n.t("status.playing"))
+        } else {
+            format!("{} ", i18n.t("status.stopped"))
+        };
         let color = if playing {
             Color::Green
         } else {
@@ -141,13 +158,14 @@ pub(super) fn draw_status_bar(
     area: Rect,
     metadata: &Option<metadata::TrackMetadata>,
     engine: &Option<audio::Engine>,
-    repeat: config::RepeatMode,
+    repeat_label: &str,
     shuffle: bool,
     last_error: Option<&str>,
     cue: Option<&playlist::CueRef>,
+    i18n: &tuneux_commonx::I18n,
 ) {
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
-        " 状态 ",
+        format!(" {} ", i18n.t("panel.status")),
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -177,7 +195,8 @@ pub(super) fn draw_status_bar(
         Some(e) => e,
         None => {
             frame.render_widget(
-                Paragraph::new("音频引擎未就绪").style(Style::default().fg(Color::Red)),
+                Paragraph::new(i18n.t("msg.engine_not_ready").into_owned())
+                    .style(Style::default().fg(Color::Red)),
                 row_chunks[1],
             );
             return;
@@ -186,7 +205,11 @@ pub(super) fn draw_status_bar(
 
     // 播放状态：[播] 绿 / [停] 暗灰，整行文字也用此色
     let playing = eng.is_playing();
-    let status_icon = if playing { "[播]" } else { "[停]" };
+    let status_icon = if playing {
+        i18n.t("status.playing")
+    } else {
+        i18n.t("status.stopped")
+    };
     let status_color = if playing {
         Color::Green
     } else {
@@ -213,13 +236,18 @@ pub(super) fn draw_status_bar(
     } else {
         "??:??".to_string()
     };
+    let shuffle_s = if shuffle {
+        i18n.t("status.shuffle")
+    } else {
+        "".into()
+    };
     let right_text = format!(
         "{}/{}  {:3.0}%  {}{}",
         pos_label,
         dur_label,
         eng.volume() * 100.0,
-        crate::config::repeat_label(repeat),
-        if shuffle { "+随机" } else { "" },
+        repeat_label,
+        shuffle_s,
     );
     let left_text = status_icon.to_string();
     let left_w = left_text.width() as u16 + 2; // +2 留分隔空格
@@ -280,9 +308,14 @@ fn draw_progress_chars(ratio: f64, width: usize) -> String {
 }
 
 /// 帮助栏：按焦点动态显示快捷键。
-pub(super) fn draw_help_bar(frame: &mut ratatui::Frame, area: Rect, focus: playlist::Panel) {
+pub(super) fn draw_help_bar(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    focus: playlist::Panel,
+    i18n: &tuneux_commonx::I18n,
+) {
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
-        " 帮助 ",
+        format!(" {} ", i18n.t("panel.help")),
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -291,12 +324,8 @@ pub(super) fn draw_help_bar(frame: &mut ratatui::Frame, area: Rect, focus: playl
     frame.render_widget(block, area);
 
     let help = match focus {
-        playlist::Panel::Browser => {
-            " ↑↓ 浏览 · Enter 进入/播放 · a 加入列表 · / 搜索(Esc退) · b 关闭浏览器 · Backspace 上级 · ←→ ±5s · 空格 暂停 · +/- 音量 · v 频谱 · c 封面 · m 介质 · ? 关于 · q 退出 "
-        }
-        playlist::Panel::Playlist => {
-            " ↑↓ 选曲 · Enter 播放/折叠 · g 分组 · a 加入 · d 删除 · x 清空 · r 循环 · s 随机 · n/p 上下首 · ←→ ±5s · / 搜索(Esc退) · b 浏览器 · 空格 暂停 · v 频谱 · l 歌词 · c 封面 · m 介质 · ? 关于 · q 退出 "
-        }
+        playlist::Panel::Browser => i18n.t("help.browser"),
+        playlist::Panel::Playlist => i18n.t("help.playlist"),
     };
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),

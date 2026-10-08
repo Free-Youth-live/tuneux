@@ -40,13 +40,14 @@
 //! `[1024..1024+len)` = UTF-8 文本（行以 \n 分隔）；宿主经 `read_visual`
 //! 读回并贴上插件面板。插件只产文本、不碰渲染。
 //!
-//! 演进走版本化（插件头声明 interface_version / minimum_runtime_version），
-//! 不破坏已冻结面。fs / net 永不注册（能力默认拒绝）。
+//! 演进走版本化（`interface_version` / `minimum_runtime_version` 为 v2 计划：
+//! 当前 ABI v1/v2 以「新增函数向后兼容」演进，插件清单尚未携带版本字段，
+//! 解析 / 校验待 ABI 对外开放前补实装）。fs / net 永不注册（能力默认拒绝）。
 
 use std::sync::Arc;
 
 use crate::caps::{arbitrate, Capability};
-use crate::verify::{classify, Tristate, TrustList};
+use crate::verify::{classify, LoadPolicy, Tristate, TrustList};
 use tuneux_corex::{CompressorParams, EqParams, COMP_SLOTS, EQ_SLOTS};
 use wasmi::{Caller, Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
 
@@ -153,6 +154,8 @@ pub enum HostError {
     Trap(String),
     /// 能力仲裁失败（网络互斥 / 网络不可用等）。
     Cap(String),
+    /// 信任策略未达要求：`load_enforced` 的 API 级强制点拦截降级加载。
+    PolicyDenied(String),
 }
 
 /// WASM 宿主：持有 wasmi 引擎（解释器），可反复装载插件。
@@ -191,22 +194,63 @@ impl WasmHost {
         }
     }
 
+    /// 编译并装载插件，且要求信任三态至少达到 `min_policy`（API 级强制点）。
+    ///
+    /// 与 [`WasmHost::load`] 的差别只在最后一步：装载成功后检查
+    /// `plugin.tristate.load_policy() <= min_policy`，不达标返回
+    /// [`HostError::PolicyDenied`]——让「未签名 / 未信任插件不得静默加载」
+    /// 成为运行时事实，而非依赖发行版自觉。
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_enforced(
+        &self,
+        wasm_bytes: &[u8],
+        plugin_id: &str,
+        manifest_bytes: &[u8],
+        signature: Option<(&[u8; 32], &[u8; 64])>,
+        trust: &TrustList,
+        requested: &[Capability],
+        allowed: &[Capability],
+        min_policy: LoadPolicy,
+    ) -> Result<LoadedPlugin, HostError> {
+        let plugin = self.load(
+            wasm_bytes,
+            plugin_id,
+            manifest_bytes,
+            signature,
+            trust,
+            requested,
+            allowed,
+        )?;
+        if plugin.tristate.load_policy() > min_policy {
+            return Err(HostError::PolicyDenied(format!(
+                "插件 {plugin_id} 信任三态 {}（策略 {:?}）未达要求 {:?}",
+                plugin.tristate.name(),
+                plugin.tristate.load_policy(),
+                min_policy,
+            )));
+        }
+        Ok(plugin)
+    }
+
     /// 编译并装载插件：能力求交 → 按授予面注入宿主函数 → 实例化。
     ///
     /// `requested` 为插件声明申请的能力（清单），`allowed` 为宿主侧允许集；
     /// 实际授予 = 求交（见 [`arbitrate`]）。未授予的能力对应宿主函数不注册，
     /// 插件 import 即实例化失败（能力默认拒绝）。
+    #[allow(clippy::too_many_arguments)]
     pub fn load(
         &self,
         wasm_bytes: &[u8],
         plugin_id: &str,
+        manifest_bytes: &[u8],
         signature: Option<(&[u8; 32], &[u8; 64])>,
         trust: &TrustList,
         requested: &[Capability],
         allowed: &[Capability],
     ) -> Result<LoadedPlugin, HostError> {
         // 验签 → 信任三态（身份标签；不拒绝加载，三态随插件返回供发行版呈现）。
-        let tristate = classify(plugin_id, wasm_bytes, signature, trust);
+        // v2：签名消息 = id ‖ manifest ‖ wasm（能力清单纳入签名面）。
+        let tristate = classify(plugin_id, manifest_bytes, wasm_bytes, signature, trust);
         let granted =
             arbitrate(requested, allowed).map_err(|e| HostError::Cap(format!("{e:?}")))?;
         let module =
@@ -536,6 +580,7 @@ mod tests {
             .load(
                 &wasm,
                 "tuneux-eq",
+                b"",
                 Some((&pubkey, &sig)),
                 &trust,
                 &[Capability::AudioDsp],
@@ -586,6 +631,7 @@ mod tests {
             .load(
                 &wasm,
                 "skin",
+                b"",
                 None,
                 &TrustList::default(),
                 &[Capability::Theme],
@@ -621,7 +667,15 @@ mod tests {
         let comp_slots: [Arc<CompressorParams>; COMP_SLOTS] =
             std::array::from_fn(|_| Arc::new(CompressorParams::new()));
         let host = WasmHost::new(100_000, 4, eq_slots, comp_slots);
-        let err = match host.load(&wasm, "multi-mem", None, &TrustList::default(), &[], &[]) {
+        let err = match host.load(
+            &wasm,
+            "multi-mem",
+            b"",
+            None,
+            &TrustList::default(),
+            &[],
+            &[],
+        ) {
             Err(e) => e,
             Ok(_) => panic!("跨内存合计 8 页 > 上限 4 页，应被拒"),
         };
@@ -646,7 +700,7 @@ mod tests {
         let comp_slots: [Arc<CompressorParams>; COMP_SLOTS] =
             std::array::from_fn(|_| Arc::new(CompressorParams::new()));
         let host = WasmHost::new(100_000, 4, eq_slots, comp_slots);
-        host.load(&wasm, "one-mem", None, &TrustList::default(), &[], &[])
+        host.load(&wasm, "one-mem", b"", None, &TrustList::default(), &[], &[])
             .expect("单个 4 页内存正好等于上限，应放行");
     }
 
@@ -665,7 +719,15 @@ mod tests {
         let comp_slots: [Arc<CompressorParams>; COMP_SLOTS] =
             std::array::from_fn(|_| Arc::new(CompressorParams::new()));
         let host = WasmHost::new(100_000, 4, eq_slots, comp_slots);
-        let err = match host.load(&wasm, "giant-table", None, &TrustList::default(), &[], &[]) {
+        let err = match host.load(
+            &wasm,
+            "giant-table",
+            b"",
+            None,
+            &TrustList::default(),
+            &[],
+            &[],
+        ) {
             Err(e) => e,
             Ok(_) => panic!("巨型表应被配额拒绝"),
         };
@@ -691,7 +753,15 @@ mod tests {
             std::array::from_fn(|_| Arc::new(CompressorParams::new()));
         let host = WasmHost::new(100_000, 4, eq_slots, comp_slots);
         let mut plugin = host
-            .load(&wasm, "small-table", None, &TrustList::default(), &[], &[])
+            .load(
+                &wasm,
+                "small-table",
+                b"",
+                None,
+                &TrustList::default(),
+                &[],
+                &[],
+            )
             .expect("配额内的表应正常装载");
         assert_eq!(plugin.call_init(0).expect("init"), 0);
     }
@@ -732,7 +802,15 @@ mod tests {
         // 燃料放大：填页循环（65536 次 store）超出默认单次预算。
         let host = WasmHost::new(10_000_000, 4, eq_slots, comp_slots);
         let mut plugin = host
-            .load(&wasm, "log-quota", None, &TrustList::default(), &[], &[])
+            .load(
+                &wasm,
+                "log-quota",
+                b"",
+                None,
+                &TrustList::default(),
+                &[],
+                &[],
+            )
             .expect("插件应加载成功");
         let ok = plugin.call_init(0).expect("init 应执行成功");
         assert_eq!(ok, 16, "配额内应成功 16 次（16 × 64KiB = 1MiB）");
@@ -759,6 +837,7 @@ mod tests {
                 host.load(
                     &wasm,
                     "x",
+                    b"",
                     None,
                     &TrustList::default(),
                     &[Capability::AudioDsp],
@@ -790,6 +869,7 @@ mod tests {
                 host.load(
                     &wasm,
                     "x",
+                    b"",
                     None,
                     &TrustList::default(),
                     &[],
@@ -829,6 +909,7 @@ mod tests {
             .load(
                 &wasm,
                 "tuneux-eq",
+                b"",
                 Some((&pubkey, &sig)),
                 &trust,
                 &[Capability::AudioDsp],
@@ -879,6 +960,7 @@ mod tests {
             .load(
                 &wasm,
                 "tuneux-meter",
+                b"",
                 Some((&pubkey, &sig)),
                 &trust,
                 &[Capability::MeterRead],
@@ -903,6 +985,7 @@ mod tests {
             .load(
                 &wasm,
                 "tuneux-meter",
+                b"",
                 Some((&pubkey, &sig)),
                 &trust,
                 &[Capability::MeterRead],
@@ -934,6 +1017,7 @@ mod tests {
         let result = host.load(
             &wasm,
             "tuneux-meter",
+            b"",
             Some((&pubkey, &sig)),
             &trust,
             &[Capability::MeterRead],
@@ -961,6 +1045,7 @@ mod tests {
             .load(
                 &wasm,
                 "tuneux-eq",
+                b"",
                 Some((&pubkey, &sig)),
                 &trust,
                 &[Capability::AudioDsp],
@@ -997,7 +1082,15 @@ mod tests {
         let sig = signing.sign(&message).to_bytes();
         let trust = TrustList::from_parts(vec![pubkey]);
         let mut plugin = host
-            .load(&wasm, "tuneux-vis", Some((&pubkey, &sig)), &trust, &[], &[])
+            .load(
+                &wasm,
+                "tuneux-vis",
+                b"",
+                Some((&pubkey, &sig)),
+                &trust,
+                &[],
+                &[],
+            )
             .expect("应加载（零能力需求）");
         plugin.call_init(0).expect("init");
         // 未 tick 前：约定区长度为 0 → None。
@@ -1037,6 +1130,7 @@ mod tests {
             .load(
                 &wasm,
                 "tuneux-vis",
+                b"",
                 Some((&pubkey, &sig)),
                 &trust,
                 &[Capability::MeterRead],
@@ -1109,6 +1203,7 @@ mod tests {
             .load(
                 &wasm,
                 "tuneux-vis",
+                b"",
                 Some((&pubkey, &sig)),
                 &trust,
                 &[Capability::MeterRead],

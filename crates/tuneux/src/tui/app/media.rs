@@ -103,7 +103,10 @@ impl App {
             std::collections::HashSet::new();
         let mut albums: Vec<(String, std::path::PathBuf)> = Vec::new();
         for item in self.playlist.items() {
-            let album = item.album.clone().unwrap_or_else(|| "未知专辑".to_string());
+            let album = item
+                .album
+                .clone()
+                .unwrap_or_else(|| self.i18n.t("msg.bm_unknown_album").into_owned().to_string());
             let dir = item.path.parent().map(|p| p.to_path_buf());
             if seen.insert((album.clone(), dir)) {
                 albums.push((album, item.path.clone()));
@@ -137,7 +140,8 @@ impl App {
             None => {
                 // 解码失败：记入负缓存（本曲不再重试），并经 UI 提示一次（自动过期）。
                 self.cover_failed_path = Some(path);
-                self.flash_message("封面解码失败（已跳过）");
+                let msg = self.i18n.t("msg.cover_fail").into_owned();
+                self.flash_message(&msg);
                 None
             }
         }
