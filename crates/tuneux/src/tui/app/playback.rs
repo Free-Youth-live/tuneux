@@ -21,6 +21,41 @@ pub(crate) fn preload_target_of(item: &playlist::PlaylistItem) -> audio::Preload
     }
 }
 
+/// 重播当前曲（到结尾后）：排空残留事件 + 取走滞留增益 + 发 Play/PlayRange + 归档增益。
+/// 自由函数（不持 `&mut self`）：避免与 `self.engine` 的借用冲突；只碰 disjoint 字段。
+fn replay_current(
+    engine: &audio::Engine,
+    current_path: Option<&std::path::Path>,
+    replay_gain_cache: &mut std::collections::BTreeMap<std::path::PathBuf, f64>,
+    decision: &tuneux_mediax::PlaybackDecision,
+) {
+    let stale_gain = engine.take_measured_gain_db();
+    while engine.poll_track_switched().is_some() {}
+    while engine.poll_finished().is_some() {}
+    while engine.poll_failed().is_some() {}
+    if let Some(path) = current_path {
+        match decision {
+            tuneux_mediax::PlaybackDecision::Play => {
+                engine.send(audio::AudioCmd::Play(path.to_path_buf()));
+            }
+            tuneux_mediax::PlaybackDecision::PlayRange {
+                start_secs,
+                end_secs,
+            } => {
+                engine.send(audio::AudioCmd::PlayRange {
+                    path: path.to_path_buf(),
+                    start_secs: *start_secs,
+                    end_secs: *end_secs,
+                });
+            }
+            _ => {}
+        }
+    }
+    if let (Some(db), Some(path)) = (stale_gain, current_path) {
+        replay_gain_cache.insert(path.to_path_buf(), db);
+    }
+}
+
 impl App {
     /// 当前条目的 CUE 引用（克隆；普通曲目为 None）。
     fn current_cue(&self) -> Option<playlist::CueRef> {
@@ -138,15 +173,10 @@ impl App {
                 });
             } else {
                 // 断点续播：距结尾 5 秒内视为已听完，从头播；否则接着上次。
+                // 判定为纯函数（mediax::resume_secs），双端共用、可单测。
                 let saved_secs = self.playlist_state.get_position(&path);
-                let is_already_finished = match (
-                    saved_secs,
-                    self.current_metadata.as_ref().and_then(|m| m.duration),
-                ) {
-                    (Some(s), Some(dur)) => s >= dur - 5.0,
-                    _ => false,
-                };
-                let resume_secs = saved_secs.filter(|&s| s > 0.5 && !is_already_finished);
+                let duration = self.current_metadata.as_ref().and_then(|m| m.duration);
+                let resume_secs = tuneux_mediax::resume_secs(saved_secs, duration);
                 match resume_secs {
                     Some(secs) => engine.send(audio::AudioCmd::PlayResume {
                         path: path.clone(),
@@ -263,6 +293,7 @@ impl App {
             }
             playlist::NavOutcome::Repeat => {
                 // 单曲循环：重新发 Play 让流再起（CUE 分轨从片段起点起播）。
+                // 决策在 mediax 纯函数 single_repeat_decision，副作用在此执行。
                 let path_cue = self.playlist.current_index().and_then(|curr| {
                     self.playlist
                         .items()
@@ -278,22 +309,32 @@ impl App {
                         while engine.poll_track_switched().is_some() {}
                         while engine.poll_finished().is_some() {}
                         while engine.poll_failed().is_some() {}
-                        if let Some(c) = cue {
-                            if engine.is_playing() {
+                        let decision = tuneux_mediax::single_repeat_decision(
+                            engine.is_playing(),
+                            cue.as_ref(),
+                        );
+                        match decision {
+                            tuneux_mediax::PlaybackDecision::Seek { secs } => {
                                 // 播放中的 CUE 单曲循环：回片段起点走文件内 Seek——
                                 // 不重开文件（免周期性卡顿），响度分析器连续。
-                                engine.send(audio::AudioCmd::Seek(c.start_ms as f64 / 1000.0));
-                            } else {
-                                // 非播放态的 CUE 单曲循环：用 PlayRange 带回终点（fx 同口径），
+                                engine.send(audio::AudioCmd::Seek(secs));
+                            }
+                            tuneux_mediax::PlaybackDecision::PlayRange {
+                                start_secs,
+                                end_secs,
+                            } => {
+                                // 非播放态的 CUE 单曲循环：PlayRange 带回终点，
                                 // 否则丢分轨 end_secs、循环时可能越界到整轨其它分轨。
                                 engine.send(audio::AudioCmd::PlayRange {
                                     path: path.clone(),
-                                    start_secs: c.start_ms as f64 / 1000.0,
-                                    end_secs: c.end_ms.map(|e| e as f64 / 1000.0),
+                                    start_secs,
+                                    end_secs,
                                 });
                             }
-                        } else {
-                            engine.send(audio::AudioCmd::Play(path.clone()));
+                            tuneux_mediax::PlaybackDecision::Play => {
+                                engine.send(audio::AudioCmd::Play(path.clone()));
+                            }
+                            _ => {}
                         }
                         // 单曲循环无"下一曲"：显式取消残留预载。
                         engine.send(audio::AudioCmd::PreloadNext(None));
@@ -342,6 +383,8 @@ impl App {
     /// 播放/暂停切换：正在播放则暂停（暂停前保存进度供断点续播），否则恢复。
     ///
     /// 从硬编码空格键分支提取，供默认键与自定义键复用同一逻辑。
+    /// 决策（暂停/恢复/重播）在 mediax 纯函数 [`tuneux_mediax::toggle_decision`]，
+    /// 副作用在此执行（FCIS：功能核心-命令外壳）。
     pub(crate) fn toggle_play(&mut self) {
         // 无曲目时忽略：避免向空闲引擎发 Resume 造成"playing=true 却无流"的脏状态。
         if self.current_path.is_none() {
@@ -351,51 +394,40 @@ impl App {
         let is_cue = self.current_item_is_cue();
         let cue = self.current_cue();
         if let Some(engine) = &self.engine {
-            if engine.is_playing() {
-                // CUE 分轨不写断点：整轨位置会覆盖该文件普通播放的续播点。
-                if !is_cue {
-                    if let Some(path) = &self.current_path {
-                        let pos = engine.position();
-                        self.playlist_state.save_position(path, pos);
-                    }
-                }
-                engine.send(audio::AudioCmd::Pause);
-            } else {
-                // 已播到结尾（EOF/单曲播完）：从头重播当前曲，而非无效 Resume。
-                let end_secs = match cue.as_ref().and_then(|c| c.end_ms) {
-                    Some(ms) => ms as f64 / 1000.0,
-                    None => engine.duration(),
-                };
-                // 末尾态双判据：进度判定（有时长曲目）∪ 引擎末尾标志——
-                // 无时长曲目（Opus / FFmpeg 后端 duration=0）进度判定永假，
-                // EOF 后靠标志重播，而非无效 Resume（只解暂停、不出声）。
-                let at_end =
-                    engine.at_eof() || (end_secs > 0.0 && engine.position() >= end_secs - 0.1);
-                if at_end {
-                    let mut stale_gain = None;
-                    if self.current_path.is_some() {
-                        // 重播前先排空残留的结束/切曲事件，并取走滞留的测量增益。
-                        stale_gain = engine.take_measured_gain_db();
-                        while engine.poll_track_switched().is_some() {}
-                        while engine.poll_finished().is_some() {}
-                        while engine.poll_failed().is_some() {}
+            let is_playing = engine.is_playing();
+            let end_secs = match cue.as_ref().and_then(|c| c.end_ms) {
+                Some(ms) => ms as f64 / 1000.0,
+                None => engine.duration(),
+            };
+            // 末尾态双判据：进度判定（有时长曲目）∪ 引擎末尾标志——
+            // 无时长曲目（Opus / FFmpeg 后端 duration=0）进度判定永假，
+            // EOF 后靠标志重播，而非无效 Resume（只解暂停、不出声）。
+            let at_end = engine.at_eof() || (end_secs > 0.0 && engine.position() >= end_secs - 0.1);
+            let decision = tuneux_mediax::toggle_decision(is_playing, at_end, cue.as_ref());
+            match decision {
+                tuneux_mediax::PlaybackDecision::Pause => {
+                    // CUE 分轨不写断点：整轨位置会覆盖该文件普通播放的续播点。
+                    if !is_cue {
                         if let Some(path) = &self.current_path {
-                            match cue.as_ref() {
-                                Some(c) => engine.send(audio::AudioCmd::PlayRange {
-                                    path: path.clone(),
-                                    start_secs: c.start_ms as f64 / 1000.0,
-                                    end_secs: c.end_ms.map(|e| e as f64 / 1000.0),
-                                }),
-                                None => engine.send(audio::AudioCmd::Play(path.clone())),
-                            }
+                            let pos = engine.position();
+                            self.playlist_state.save_position(path, pos);
                         }
                     }
-                    if let (Some(db), Some(path)) = (stale_gain, self.current_path.clone()) {
-                        self.replay_gain_cache.insert(path, db);
-                    }
-                } else {
+                    engine.send(audio::AudioCmd::Pause);
+                }
+                tuneux_mediax::PlaybackDecision::Resume => {
                     engine.send(audio::AudioCmd::Resume);
                 }
+                tuneux_mediax::PlaybackDecision::Play
+                | tuneux_mediax::PlaybackDecision::PlayRange { .. } => {
+                    replay_current(
+                        engine,
+                        self.current_path.as_deref(),
+                        &mut self.replay_gain_cache,
+                        &decision,
+                    );
+                }
+                _ => {}
             }
         }
     }

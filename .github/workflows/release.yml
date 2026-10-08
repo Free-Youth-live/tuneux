@@ -6,8 +6,24 @@
 #       Windows x86_64 / Windows arm64。
 #
 # 每个平台产出两个压缩包：
-# - tuneux-<ver>-<平台>    ：基础版二进制 + 使用手册-tuneux；
-# - tuneux-fx-<ver>-<平台> ：插件版二进制 + 使用手册-tuneux-fx + 插件开发指南 + plugins/ 插件目录。
+# - tuneux-<ver>-<平台>    ：基础版二进制 + 使用手册-tuneux + locales/ 语言表；
+# - tuneux-fx-<ver>-<平台> ：插件版二进制 + 使用手册-tuneux-fx + 插件开发指南 + plugins/ 插件目录 + locales/ 语言表。
+# max 首发收敛四平台（mac 双架构 / win x64 / linux x64，见 003 批 B 口径），产出：
+# - tuneux-max-<ver>-<平台>：mac = 可双击的 tuneux-max.app bundle（zip 封装）；
+#   win = exe（GUI 子系统，双击无控制台窗）；linux = 二进制 + .desktop 模板；
+#   均含 locales/ 语言表与手册/第三方许可。
+# **max 仅随 v0.6+ 标签构建**（版本线裁决 2026-10-08：0.5.x 线为双 TUI 维护版，
+#   max 不随发，产物 6×2 = 12 个；v0.6+ 起为 6×2 + 4 = 16 个）。
+#
+# 发布关卡（任一不过整单不发）：checks（格式/静态检查/测试/分层守卫）+
+# deny（依赖四项核查）+ build（六平台编译），release 需三者全部通过。
+#
+# —— Linux 构建基线 ——
+# ubuntu-latest（24.04，glibc 2.39）上直接构建的产物要求新版 glibc，
+# 在旧系统（UOS 20 专业版 / Debian 10 = glibc 2.28、Raspberry Pi OS 等）
+# 报 "version `GLIBC_2.29' not found"。两个 Linux 目标统一用 cargo-zigbuild
+# 以 glibc 2.17 基线（manylinux2014 标准）链接，覆盖 Debian 9+ /
+# Ubuntu 16.04+ / UOS 20 / 全系 RPi OS。
 # =============================================================================
 
 name: 发布构建
@@ -29,6 +45,26 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  checks:
+    # 质量关卡：格式 / 静态检查（零告警）/ 测试 / 分层守卫（依赖红线 +
+    # API 面断言 + i18n key 完整性 + 重复棘轮），任一不过则整单不发。
+    # 与 build / deny 并行执行，不增加发布串行时长。
+    name: 质量检查
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      - name: 安装系统依赖（ALSA 开发库，cpal 编译需要）
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: 格式检查
+        run: cargo fmt --check
+      - name: 静态检查（零告警）
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: 测试
+        run: cargo test --workspace
+      - name: 分层守卫（依赖红线 / API 面 / i18n key / 重复棘轮）
+        run: bash tools/guard.sh
+
   deny:
     # 依赖核查关卡：四项（漏洞公告/禁用依赖/许可/源）任一不过则整单不发。
     # 与构建并行执行，不增加发布串行时长；工具从官方源安装并锁定版本。
@@ -84,33 +120,43 @@ jobs:
       - name: 安装构建目标
         run: rustup target add ${{ matrix.target }}
 
-      - name: 安装 Linux x86_64 依赖
+      - name: 安装 Linux x86_64 工具链（zig + zigbuild）
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+        run: |
+          sudo apt-get update && sudo apt-get install -y libasound2-dev
+          curl -sL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | tar -xJ -C "$HOME"
+          echo "$HOME/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
+          cargo install cargo-zigbuild --locked
 
-      - name: 安装 Linux arm64 交叉编译环境
+      # arm64 交叉：zig 自带目标 glibc 桩，无需 gcc-aarch64 交叉链；ALSA 用
+      # Debian buster 的 1.1.8 arm64 包（与 UOS 20 / Debian 10 同源，运行时符号
+      # 完全兼容；1.1.7 起含 cpal 所需的 snd_pcm_sw_params_set_tstamp_type）。
+      - name: 安装 Linux arm64 工具链（zig + zigbuild + buster ALSA sysroot）
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
-          sudo dpkg --add-architecture arm64
-          # 添加 Ubuntu ports 源（提供 arm64 的包）
-          echo 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble main universe restricted multiverse' | sudo tee /etc/apt/sources.list.d/ports-arm64.list
-          echo 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble-updates main universe restricted multiverse' | sudo tee -a /etc/apt/sources.list.d/ports-arm64.list
-          echo 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble-security main universe restricted multiverse' | sudo tee -a /etc/apt/sources.list.d/ports-arm64.list
-          # 限制默认源只取 amd64（关键：避免默认源尝试 arm64 导致 404）
-          sudo sed -i '/^Types: deb$/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu libasound2-dev:arm64
+          set -eux
+          curl -sL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | tar -xJ -C "$HOME"
+          echo "$HOME/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
+          cargo install cargo-zigbuild --locked
+          mkdir -p sysroot/run sysroot/dev
+          curl -sL --retry 3 -o run.deb http://archive.debian.org/debian/pool/main/a/alsa-lib/libasound2_1.1.8-1_arm64.deb
+          curl -sL --retry 3 -o dev.deb http://archive.debian.org/debian/pool/main/a/alsa-lib/libasound2-dev_1.1.8-1_arm64.deb
+          (cd sysroot/run && ar x ../../run.deb && tar xf data.tar.xz)
+          (cd sysroot/dev && ar x ../../dev.deb && tar xf data.tar.xz)
+          # dev 包的 libasound.so 是指向运行包的悬空符号链接，补齐目标文件
+          cp sysroot/run/usr/lib/aarch64-linux-gnu/libasound.so.2.0.0 sysroot/dev/usr/lib/aarch64-linux-gnu/
+          # dev 包自带的 alsa.pc prefix=/usr，重写为 sysroot 绝对路径
+          sed -i "s|^prefix=.*|prefix=$PWD/sysroot/dev/usr|" sysroot/dev/usr/lib/aarch64-linux-gnu/pkgconfig/alsa.pc
 
-      - name: 编译（Linux arm64 交叉）
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cargo build --release --locked --target ${{ matrix.target }} -p tuneux -p tuneux-fx
+      - name: 编译（Linux zigbuild，glibc 2.17 基线）
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }}.2.17 -p tuneux -p tuneux-fx
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           PKG_CONFIG_ALLOW_CROSS: '1'
-          PKG_CONFIG_LIBDIR: /usr/lib/aarch64-linux-gnu/pkgconfig
+          PKG_CONFIG_PATH: ${{ github.workspace }}/sysroot/dev/usr/lib/aarch64-linux-gnu/pkgconfig
 
       - name: 编译
-        if: matrix.target != 'aarch64-unknown-linux-gnu'
+        if: matrix.os != 'ubuntu-latest'
         run: cargo build --release --locked --target ${{ matrix.target }} -p tuneux -p tuneux-fx
 
       - name: 打包（Linux / macOS）
@@ -127,6 +173,8 @@ jobs:
           cp "$BIN/tuneux" pkg/tuneux/
           cp 使用手册-tuneux.txt pkg/tuneux/
           cp THIRD-PARTY-LICENSES.txt pkg/tuneux/
+          # 官方英文语言表（配置 lang = "en" 启用；文件缺失自动回退中文）
+          cp -R locales pkg/tuneux/locales
           # 手册标题行注入版本号：__VERSION__ → 实际版本（来自 tag）
           sed -i.bak "s/__VERSION__/${VER}/" "pkg/tuneux/使用手册-tuneux.txt" && rm -f "pkg/tuneux/使用手册-tuneux.txt.bak"
           tar -czf "tuneux-${VER}-${{ matrix.name }}.tar.gz" -C pkg/tuneux .
@@ -139,6 +187,8 @@ jobs:
           cp 插件开发指南.txt pkg/tuneux-fx/
           cp THIRD-PARTY-LICENSES.txt pkg/tuneux-fx/
           cp -R plugins pkg/tuneux-fx/plugins
+          # 官方英文语言表（菜单「设置 → 语言」切换，即时生效）
+          cp -R locales pkg/tuneux-fx/locales
           tar -czf "tuneux-fx-${VER}-${{ matrix.name }}.tar.gz" -C pkg/tuneux-fx .
 
       - name: 打包（Windows）
@@ -154,6 +204,8 @@ jobs:
           Copy-Item "$bin/tuneux.exe" pkg/tuneux/
           Copy-Item 使用手册-tuneux.txt pkg/tuneux/
           Copy-Item THIRD-PARTY-LICENSES.txt pkg/tuneux/
+          # 官方英文语言表（配置 lang = "en" 启用；文件缺失自动回退中文）
+          Copy-Item -Recurse locales pkg/tuneux/locales
           $m = Get-Content "pkg/tuneux/使用手册-tuneux.txt" -Raw
           Set-Content "pkg/tuneux/使用手册-tuneux.txt" -Value ($m -replace '__VERSION__', $ver) -NoNewline -Encoding UTF8
           Compress-Archive -Path pkg/tuneux/* -DestinationPath "tuneux-$ver-${{ matrix.name }}.zip"
@@ -167,6 +219,8 @@ jobs:
           Copy-Item 插件开发指南.txt pkg/tuneux-fx/
           Copy-Item THIRD-PARTY-LICENSES.txt pkg/tuneux-fx/
           Copy-Item -Recurse plugins pkg/tuneux-fx/plugins
+          # 官方英文语言表（菜单「设置 → 语言」切换，即时生效）
+          Copy-Item -Recurse locales pkg/tuneux-fx/locales
           Compress-Archive -Path pkg/tuneux-fx/* -DestinationPath "tuneux-fx-$ver-${{ matrix.name }}.zip"
 
       - name: 上传产物
@@ -180,9 +234,108 @@ jobs:
             tuneux-fx-*.zip
           if-no-files-found: error
 
+  build-max:
+    # tuneux-max 首发收敛四平台（003 批 B 口径）：mac 双架构 / win x64 /
+    # linux x64。ARM64 与老驱动上的 wgpu/Vulkan 兼容待真机验证后再开。
+    # linux 用 ubuntu 原生构建（winit/x11 交叉编译是深坑，不赌）；
+    # mac x86_64 在 ARM runner 上交叉（wgpu/metal 纯 Rust 绑定）。
+    # 0.5.x 线不随发（2026-10-08 版本线裁决）：仅 v0.6+ 标签构建；
+    # 手动触发按输入 tag 同样判定。
+    if: ${{ !startsWith(github.ref, 'refs/tags/v0.5.') && !startsWith(github.event.inputs.tag, 'v0.5.') }}
+    name: max-${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            name: linux-x86_64
+            ext: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            name: macos-arm64
+            ext: tar.gz
+          - os: macos-14
+            target: x86_64-apple-darwin
+            name: macos-x86_64
+            ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: windows-x86_64
+            ext: zip
+
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装构建目标
+        run: rustup target add ${{ matrix.target }}
+
+      - name: 编译
+        run: cargo build --release --locked --target ${{ matrix.target }} -p tuneux-max
+
+      - name: 打包（Linux：二进制 + desktop 模板）
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          VER="${TAG#v}"
+          VER="${VER%%-*}"
+          BIN="target/${{ matrix.target }}/release"
+          mkdir -p pkg/tuneux-max
+          cp "$BIN/tuneux-max" pkg/tuneux-max/
+          cp 使用手册-tuneux-max.txt pkg/tuneux-max/
+          sed -i "s/__VERSION__/${VER}/" "pkg/tuneux-max/使用手册-tuneux-max.txt"
+          cp THIRD-PARTY-LICENSES.txt pkg/tuneux-max/
+          cp -R locales pkg/tuneux-max/locales
+          # 桌面集成模板：用户改 Exec 为实际路径后放 ~/.local/share/applications/
+          cp tools/tuneux-max.desktop pkg/tuneux-max/
+          tar -czf "tuneux-max-${VER}-${{ matrix.name }}.tar.gz" -C pkg/tuneux-max .
+
+      - name: 打包（macOS .app bundle，双击启动）
+        if: matrix.os == 'macos-14'
+        shell: bash
+        run: |
+          VER="${TAG#v}"
+          VER="${VER%%-*}"
+          BIN="target/${{ matrix.target }}/release/tuneux-max"
+          bash tools/package-macos-app.sh "$BIN" "$VER" pkg
+          sed -i '' "s/__VERSION__/${VER}/" "pkg/tuneux-max.app/Contents/Resources/使用手册-tuneux-max.txt"
+          ditto -c -k --keepParent "pkg/tuneux-max.app" "tuneux-max-${VER}-${{ matrix.name }}.zip"
+
+      - name: 打包（Windows）
+        if: matrix.ext == 'zip'
+        shell: pwsh
+        run: |
+          $ver = $env:TAG -replace '^v', '' -replace '-.*$', ''
+          $bin = "target/${{ matrix.target }}/release"
+          New-Item -ItemType Directory -Force -Path pkg/tuneux-max | Out-Null
+          Copy-Item "$bin/tuneux-max.exe" pkg/tuneux-max/
+          Copy-Item 使用手册-tuneux-max.txt pkg/tuneux-max/
+          $m = Get-Content "pkg/tuneux-max/使用手册-tuneux-max.txt" -Raw
+          Set-Content "pkg/tuneux-max/使用手册-tuneux-max.txt" -Value ($m -replace '__VERSION__', $ver) -NoNewline -Encoding UTF8
+          Copy-Item THIRD-PARTY-LICENSES.txt pkg/tuneux-max/
+          Copy-Item -Recurse locales pkg/tuneux-max/locales
+          Compress-Archive -Path pkg/tuneux-max/* -DestinationPath "tuneux-max-$ver-${{ matrix.name }}.zip"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: max-${{ matrix.name }}
+          path: |
+            tuneux-max-*.tar.gz
+            tuneux-max-*.zip
+          if-no-files-found: error
+
   release:
     name: 发布
-    needs: [build, deny]
+    needs: [build, deny, checks, build-max]
+    # build-max 在 0.5.x 标签下被主动跳过（skipped）：其余关卡全绿即可发布；
+    # 0.6+ 标签下 build-max 必须成功。
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.deny.result == 'success' && needs.checks.result == 'success' && (needs.build-max.result == 'success' || needs.build-max.result == 'skipped') }}
     runs-on: ubuntu-latest
     env:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
@@ -191,6 +344,17 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist
+
+      - name: 提取发布注记（CHANGELOG 对应版本段，去占位文案）
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          VER="${TAG#v}"
+          awk -v v="$VER" 'index($0, "## [" v "]") == 1 {f=1; next} /^## \[/ {f=0} f' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "CHANGELOG 未找到对应段，回退默认注记"
+            echo "这是一个重要的版本更新，详见仓库 CHANGELOG。" > release-notes.md
+          fi
 
       - name: 创建发布并上传
         env:
@@ -202,7 +366,6 @@ jobs:
           else
             gh release create "$TAG" \
               --title "不羁的青春（FreeYouth）" \
-              --notes "这是一个重要的版本更新"
+              --notes-file release-notes.md
           fi
           gh release upload "$TAG" dist/*/* --clobber
-

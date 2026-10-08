@@ -32,6 +32,39 @@ use std::path::Path;
 
 use tuneux_corex::{probe_metadata, AudioParams};
 
+/// 采样率显示标签（语义枚举，产品本地化）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SampleRateDisplay {
+    /// 采样率（kHz，如 44.1）。
+    KHz(f64),
+    /// 未知。
+    Unknown,
+}
+
+/// 位深显示标签。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitsDisplay {
+    /// 确定位深（如 16、24）。
+    Bits(u32),
+    /// 有损格式（MP3/AAC/Vorbis/Opus 等位深无意义，比"未知"更准确）。
+    Lossy,
+    /// 未知（探测失败或格式无法判定）。
+    Unknown,
+}
+
+/// 通道数显示标签。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelsDisplay {
+    /// 单声道。
+    Mono,
+    /// 立体声。
+    Stereo,
+    /// 多声道（具体数量）。
+    Multi(u16),
+    /// 未知。
+    Unknown,
+}
+
 /// 一首曲目的完整元数据（标签 + 技术参数）。
 ///
 /// 字符串字段用 `Option<String>`：None 表示该标签缺失（如现场录音可能无专辑名），
@@ -278,6 +311,43 @@ impl TrackMetadata {
             Some(2) => "立体声".to_string(),
             Some(n) => format!("{n} 声道"),
             None => "未知".to_string(),
+        }
+    }
+
+    /// 采样率语义标签（产品据此本地化，替代 *_label 的中文硬编码）。
+    pub fn sample_rate_display(&self) -> SampleRateDisplay {
+        match self.sample_rate {
+            Some(sr) => SampleRateDisplay::KHz(sr as f64 / 1000.0),
+            None => SampleRateDisplay::Unknown,
+        }
+    }
+
+    /// 位深语义标签。
+    pub fn bits_display(&self) -> BitsDisplay {
+        match self.bits_per_sample {
+            Some(b) => BitsDisplay::Bits(b),
+            None => {
+                if self.codec.as_deref().is_some_and(|c| {
+                    c.eq_ignore_ascii_case("mp3")
+                        || c.eq_ignore_ascii_case("aac")
+                        || c.eq_ignore_ascii_case("vorbis")
+                        || c.eq_ignore_ascii_case("opus")
+                }) {
+                    BitsDisplay::Lossy
+                } else {
+                    BitsDisplay::Unknown
+                }
+            }
+        }
+    }
+
+    /// 通道数语义标签。
+    pub fn channels_display(&self) -> ChannelsDisplay {
+        match self.channels {
+            Some(1) => ChannelsDisplay::Mono,
+            Some(2) => ChannelsDisplay::Stereo,
+            Some(n) => ChannelsDisplay::Multi(n),
+            None => ChannelsDisplay::Unknown,
         }
     }
 

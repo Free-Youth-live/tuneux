@@ -78,8 +78,11 @@ impl App {
                     match super::cue::cue_items_from_cue_file(&path) {
                         Some((items, skipped, _)) => {
                             if skipped > 0 {
-                                self.last_error =
-                                    Some(format!("已跳过 {skipped} 条数据轨（不可播放）"));
+                                self.last_error = Some(
+                                    self.i18n
+                                        .t("msg.skipped_data")
+                                        .replace("{}", &skipped.to_string()),
+                                );
                                 self.last_error_at = Some(std::time::Instant::now());
                             }
                             if config.dedup_on_add {
@@ -89,8 +92,7 @@ impl App {
                             }
                         }
                         None => {
-                            self.last_error =
-                                Some("cue 解析失败或 FILE 引用的音频文件不存在".to_string());
+                            self.last_error = Some(self.i18n.t("msg.cue_fail").into_owned());
                             self.last_error_at = Some(std::time::Instant::now());
                             return;
                         }
@@ -100,7 +102,12 @@ impl App {
                 // 整轨 + 同名 .cue → 展开为多首 CUE 曲目；否则按普通文件加入
                 let (expanded, skipped) = self.cue_items_for(&path);
                 if skipped > 0 {
-                    self.flash_message(&format!("已跳过 {skipped} 条数据轨（不可播放）"));
+                    self.flash_message(
+                        &self
+                            .i18n
+                            .t("msg.skipped_data")
+                            .replace("{}", &skipped.to_string()),
+                    );
                 }
                 if !expanded.is_empty() {
                     // 按配置决定是否去重（CUE 分轨按 (path, cue.index) 判定唯一性）
@@ -145,16 +152,31 @@ impl App {
     /// 元数据缓存优先——与同步路径同口径），结果由主循环轮询后经
     /// [`App::apply_dir_add`] 批量合入。大目录加入不再卡 UI。
     pub(crate) fn add_dir_async(&mut self, dir: PathBuf) {
+        let msg = format!("{}：{}", self.i18n.t("msg.scan_dir"), dir.display());
+        self.flash_message(&msg);
+        self.scan_pool.submit(dir);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn add_dir_async_old(&mut self, dir: PathBuf) {
         // 快照当前元数据缓存给后台线程（命中免探测）；只读不写，无竞争。
         let cache = self.metadata_cache.clone();
         let tx = self.add_load_tx.clone();
-        self.flash_message(&format!("正在扫描目录：{}", dir.display()));
+        self.flash_message(&format!(
+            "{}：{}",
+            self.i18n.t("msg.scan_dir"),
+            dir.display()
+        ));
         // 优雅降级：线程启动失败（极罕见）时提示而非 panic。
         if std::thread::Builder::new()
             .name("tuneux-dir-add".to_string())
             .spawn(move || {
                 let mut paths = Vec::new();
-                fs_browser::FsBrowser::collect_music_recursive(&dir, &mut paths);
+                fs_browser::FsBrowser::collect_music_recursive(
+                    &dir,
+                    &mut paths,
+                    fs_browser::browser_config(),
+                );
                 let (mut items, mds, skipped) = super::cue::build_items_for_paths(&paths, &cache);
                 // 按"专辑-曲序"预排序：让新增批次的插入序 = 显示序，
                 // 添加目录后自动播放/选中的第一首就是专辑-曲序的第一首。
@@ -163,7 +185,8 @@ impl App {
             })
             .is_err()
         {
-            self.flash_message("目录加入线程启动失败");
+            let msg = self.i18n.t("msg.thread_fail").into_owned();
+            self.flash_message(&msg);
         }
     }
 
@@ -179,9 +202,11 @@ impl App {
         config: &Config,
     ) {
         if skipped_data_tracks > 0 {
-            self.flash_message(&format!(
-                "已跳过 {skipped_data_tracks} 条数据轨（不可播放）"
-            ));
+            let msg = self
+                .i18n
+                .t("msg.skipped_data")
+                .replace("{}", &skipped_data_tracks.to_string());
+            self.flash_message(&msg);
         }
         let was_empty = self.playlist.is_empty();
         let before = self.playlist.len();
@@ -197,11 +222,19 @@ impl App {
         }
         let added = self.playlist.len() - before;
         if empty_dir || self.playlist.is_empty() {
-            self.flash_message(&format!("目录中无音乐文件：{}", dir.display()));
+            self.flash_message(&format!(
+                "{}：{}",
+                self.i18n.t("msg.no_music"),
+                dir.display()
+            ));
             return;
         }
         if added == 0 {
-            self.flash_message(&format!("未加入新曲目（均已存在）：{}", dir.display()));
+            self.flash_message(&format!(
+                "{}：{}",
+                self.i18n.t("msg.all_dup"),
+                dir.display()
+            ));
             return;
         }
         if was_empty {
@@ -210,7 +243,11 @@ impl App {
             self.playlist.set_selected(first);
             self.play_and_update_current(first, config);
         }
-        self.flash_message(&format!("已加入 {added} 首：{}", dir.display()));
+        self.flash_message(&format!(
+            "{}：{}",
+            self.i18n.t("msg.added").replace("{}", &added.to_string()),
+            dir.display()
+        ));
     }
 
     /// 异步收集当前目录树（浏览器搜索 `/` 用）：后台线程递归收集，
@@ -230,7 +267,8 @@ impl App {
             })
             .is_err()
         {
-            self.flash_message("搜索收集线程启动失败");
+            let msg = self.i18n.t("msg.thread_fail").into_owned();
+            self.flash_message(&msg);
         }
     }
 
@@ -251,7 +289,8 @@ impl App {
                     })
                     .is_err()
                 {
-                    self.flash_message("目录载入线程启动失败");
+                    let msg = self.i18n.t("msg.thread_fail").into_owned();
+                    self.flash_message(&msg);
                 }
             }
             Err(e) => {
@@ -276,8 +315,11 @@ impl App {
                 match super::cue::cue_items_from_cue_file(&path) {
                     Some((items, skipped, audio_path)) => {
                         if skipped > 0 {
-                            self.last_error =
-                                Some(format!("已跳过 {skipped} 条数据轨（不可播放）"));
+                            self.last_error = Some(
+                                self.i18n
+                                    .t("msg.skipped_data")
+                                    .replace("{}", &skipped.to_string()),
+                            );
                             self.last_error_at = Some(std::time::Instant::now());
                         }
                         // 记下第一轨起点：去重全命中时据此定位「第一曲」
@@ -310,8 +352,7 @@ impl App {
                         self.play_and_update_current(play_idx, config);
                     }
                     None => {
-                        self.last_error =
-                            Some("cue 解析失败或 FILE 引用的音频文件不存在".to_string());
+                        self.last_error = Some(self.i18n.t("msg.cue_fail").into_owned());
                         self.last_error_at = Some(std::time::Instant::now());
                     }
                 }
@@ -327,7 +368,12 @@ impl App {
             // 整轨 + 同名 .cue → 展开为多首 CUE 曲目，加入并播放本整轨第一曲。
             let (expanded, skipped) = self.cue_items_for(&path);
             if skipped > 0 {
-                self.flash_message(&format!("已跳过 {skipped} 条数据轨（不可播放）"));
+                self.flash_message(
+                    &self
+                        .i18n
+                        .t("msg.skipped_data")
+                        .replace("{}", &skipped.to_string()),
+                );
             }
             if !expanded.is_empty() {
                 // 记下第一轨起点：去重全命中时据此定位「第一曲」（同 path 多分轨）。

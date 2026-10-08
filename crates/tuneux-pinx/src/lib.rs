@@ -13,7 +13,8 @@
 //! 当前包含的策略层（均可独立测试）：
 //! - [`caps`]：能力枚举、求交授予、互斥规则（网络 ⟂ 内容读取）；
 //! - [`verify`]：插件信任三态（已认证 / 已签名·作者未知 / 未签名）与加载口径；
-//! - [`net`]：网络代发钩子——意图三元组、域名白名单、传输层接口与离线拒绝；
+//! - [`net`]：网络代发钩子——意图仲裁（身份带外绑定 / 限额钳制 / 用途取
+//!   签名 manifest）、URL 预检与域名白名单（解析后主机比对）、传输层接口与离线拒绝；
 //! - [`journal`]：插件加载与授权的追加式记录（核查日志，非防篡改）；
 //! - [`runtime`]：WASM 控制面运行时——wasmi 装载 / 实例化、宿主函数注入
 //!   （`eq_set` / `compressor_set` / `theme_register` / `meter_read` 等）、
@@ -25,10 +26,13 @@
 // 测试代码允许 unwrap：断言失败即测试失败，语义与生产路径不同
 //（生产路径零 unwrap 由 workspace lints 强制）。
 #![cfg_attr(test, allow(clippy::unwrap_used))]
+// 公开项必须有文档注释（与 corex / mediax / commonx 同口径；信任边界 crate 尤其需要）。
+#![deny(missing_docs)]
 pub mod caps;
 pub mod journal;
 pub mod net;
 pub mod runtime;
+pub mod skins;
 pub mod verify;
 
 pub use caps::{parse_manifest, CapError, Capability};

@@ -1,6 +1,6 @@
 //! # tuneux-fx 程序入口
 //!
-//! tuneux-fx 是插件化命令行音乐播放器（TUI）。界面组织参照 foobar2000
+//! tuneux-fx 是插件化命令行音乐播放器（TUI）。界面组织沿用经典布局
 //! （菜单栏 + 以播放列表为核心的工作区 + 状态栏 + 功能键栏）；快捷键与
 //! tuneux 统一。
 //!
@@ -25,7 +25,7 @@ use std::time::Duration;
 
 // 第三方库
 use crossterm::{
-    event::{self, Event, KeyEventKind},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -57,7 +57,7 @@ fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
         default_hook(info);
     }));
 }
@@ -65,7 +65,7 @@ fn install_panic_hook() {
 /// 初始化终端：raw 模式 + 备用屏幕，返回绑定 crossterm 后端的 Terminal。
 fn init_terminal() -> AppResult<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen)?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(io::stdout());
     Ok(Terminal::new(backend)?)
 }
@@ -196,14 +196,20 @@ fn run(
         };
         // 事件：frame_wait 超时 poll，只处理按下事件。
         if event::poll(frame_wait)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if !app.handle_key(key, config) {
                         break;
                     }
                     // 浏览器位置变化后记入配置，便于下次启动恢复。
                     config.last_dir = Some(app.browser.cwd().to_path_buf());
                 }
+                // 鼠标：单击选中 / 双击激活 / 滚轮移选中（tui/app/mouse.rs）。
+                Event::Mouse(me) => {
+                    app.handle_mouse(me, config);
+                    config.last_dir = Some(app.browser.cwd().to_path_buf());
+                }
+                _ => {}
             }
         }
 
@@ -237,7 +243,8 @@ fn run(
             app.consecutive_failures += 1;
             if app.consecutive_failures >= 10 {
                 // 连续失败达到上限：停止自动跳曲，避免列表全损坏时无限循环刷屏。
-                app.flash_message("连续 10 首无法播放，已停止自动切换");
+                let m = app.i18n.t("msg.consecutive_fail").into_owned();
+                app.flash_message(&m);
                 app.consecutive_failures = 0;
             } else {
                 // 播放失败：强制跳下一首（单曲循环按"顺序"语义，不重复失败曲）。
@@ -251,6 +258,43 @@ fn run(
                 if let NavOutcome::Switch(_) = outcome {
                     app.handle_nav_outcome(outcome, config);
                 }
+            }
+        }
+
+        // 波形包络渐进积累（与 max 同款：每帧从引擎取 128 样本峰值）
+        if let Some(engine) = &app.engine {
+            let (pos, dur) = (engine.position(), engine.duration());
+            if dur > 0.0 {
+                let [wl, wr] = engine.waveform_lr();
+                let peak = wl
+                    .iter()
+                    .chain(wr.iter())
+                    .map(|v| v.abs())
+                    .fold(0.0f32, f32::max);
+                if peak > 0.001 {
+                    let bucket = ((pos / dur) * 256.0) as usize;
+                    if bucket < app.track_envelope.len() {
+                        app.track_envelope[bucket] = app.track_envelope[bucket].max(peak);
+                    }
+                }
+            }
+        }
+
+        // 共享扫描池结果排空（每帧至多 64 条，与 max 同款）
+        {
+            let mut drained = 0;
+            while drained < 64 {
+                match app.scan_pool.try_recv() {
+                    Some(batch) => {
+                        drained += batch.len();
+                        app.playlist.add_many(batch);
+                    }
+                    None => break,
+                }
+            }
+            if app.scan_pool.pending() == 0 && drained > 0 {
+                let items = app.playlist.items_mut();
+                playlist::Playlist::sort_items(items);
             }
         }
 

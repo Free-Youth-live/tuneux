@@ -10,7 +10,7 @@
 
 [package]
 name = "tuneux-corex"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 license = "MulanPSL-2.0"
 authors = ["不羁的青春（FreeYouth）"]
@@ -30,9 +30,6 @@ crossbeam-channel.workspace = true
 rubato.workspace = true
 rustfft.workspace = true
 opus-decoder = "0.1.1"
-# cue 编码链（decode_cue_bytes：UTF-8 → BOM → GB18030）需要；与 mediax 同源
-#（许可/离线/兼容三查已随 mediax 通过）
-encoding_rs.workspace = true
 
 [dev-dependencies]
 # wavicle 仅作自研 WavPack 解码器的测试对拍参照物（生产解码已自研，

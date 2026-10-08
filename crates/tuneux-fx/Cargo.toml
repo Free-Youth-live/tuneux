@@ -8,12 +8,12 @@
 [package]
 # 包名 tuneux-fx；可执行文件名 tuneux-fx
 name = "tuneux-fx"
-version = "0.5.1"
+version = "0.5.5"
 edition = "2021"
 # 木兰宽松许可证 v2
 license = "MulanPSL-2.0"
 authors = ["不羁的青春（FreeYouth）"]
-description = "插件化命令行音乐播放器（TUI），界面参照 foobar2000 组织、快捷键与 tuneux 统一"
+description = "插件化命令行音乐播放器（TUI），经典菜单栏 + 功能键栏组织、快捷键与 tuneux 统一"
 # 最小支持 Rust 版本：与 tuneux 对齐（ratatui 0.30 要求 1.88+）
 rust-version = "1.88"
 
@@ -26,6 +26,9 @@ path = "src/main.rs"
 tuneux-corex = { path = "../tuneux-corex" }
 # 共享媒体数据层（m3u / 书签等非音频、非 UI 领域逻辑）
 tuneux-mediax = { path = "../tuneux-mediax" }
+# 发行版通用机制：键位解析 / 配置路径 / 媒体键 / 目录浏览内核
+#（media-key：fx 需要系统媒体键，显式启用）
+tuneux-commonx = { path = "../tuneux-commonx", features = ["media-key"] }
 # 插件宿主运行时（WASM 控制面 + 能力仲裁）；加载第一方均衡器插件
 tuneux-pinx = { path = "../tuneux-pinx" }
 # 依赖版本统一由 workspace 根 [workspace.dependencies] 管理
@@ -42,15 +45,6 @@ image.workspace = true
 # 系统媒体键事件通道
 crossbeam-channel.workspace = true
 
-# 系统媒体键（仅 Linux）：MPRIS D-Bus 服务（zbus 纯 safe Rust，MIT 许可）
-# 通过 target 专属依赖避免其他平台拉入 D-Bus 依赖树；版本由 workspace 统一管理
-[target.'cfg(target_os = "linux")'.dependencies]
-zbus.workspace = true
-
-# 系统媒体键（仅 Windows）：rdev 低层键盘钩子（MIT，unsafe 全在 crate 内部，
-# 我们只调 safe API；无窗口、无消息泵）；版本由 workspace 统一管理
-[target.'cfg(target_os = "windows")'.dependencies]
-rdev.workspace = true
 
 [lints]
 workspace = true

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=tuneux-max
+GenericName=Music Player
+Comment=不羁的青春（FreeYouth）· GUI 音乐播放器（纯离线）
+Exec=__EXEC__
+Icon=__ICON__
+Terminal=false
+Categories=Audio;Music;Player;
+Keywords=music;player;offline;

@@ -243,6 +243,12 @@ space / tab / enter / esc / backspace / up / down / left / right / home / end。
   保存音量、循环、随机、列宽（browser_ratio）、上次浏览目录、界面状态
   （频谱/歌词/浏览器/封面开关）、介质风格、ReplayGain、键位、媒体键开关等。
 
+【界面语言 lang】
+  lang = "zh"（默认，内置中文）或 lang = "en"（官方英文，随包
+  locales/en.txt）；自制语言文件放可执行文件同目录 locales/ 下即可被识别。
+  语言表缺失/损坏自动回退中文，绝不崩溃。基础版无菜单，语言经配置文件
+  设定、重启生效。
+
 【播放状态 playlist.toml】
   保存播放列表、每首曲目的断点续播进度、ReplayGain 缓存。
 

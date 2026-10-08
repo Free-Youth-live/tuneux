@@ -60,6 +60,7 @@ fn pool_to_columns(bands: &[f32; audio::spectrum::N_BANDS], total_w: usize) -> V
 ///
 /// `N_BANDS` 频段按显示列数做 max-pooling 降采样：每显示列取对应频段最大值，
 /// 保证任意宽度下都画满、峰值不丢。
+#[allow(clippy::too_many_arguments)]
 pub(super) fn draw_audio_panel(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -68,12 +69,14 @@ pub(super) fn draw_audio_panel(
     pal: &Palette,
     peaks: &std::cell::RefCell<audio::spectrum::SpectrumPeakHold>,
     dt: std::time::Duration,
+
+    i18n: &tuneux_commonx::I18n,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(pal.border_type)
         .border_style(panel_border(pal, false))
-        .title(" 频 谱 ")
+        .title(format!(" {} ", i18n.t("panel.spectrum")))
         .style(pal_style(None, pal.bg));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -169,17 +172,24 @@ pub(super) fn draw_audio_panel(
 
 /// 插件可视化面板：显示「可视化-*」插件 tick 产出的字符画（v 循环的
 ///「插件」态）。插件只产文本、宿主负责贴上；无插件 / 无画面时显示提示。
-pub(super) fn draw_visual_panel(frame: &mut ratatui::Frame, area: Rect, text: &str, pal: &Palette) {
+pub(super) fn draw_visual_panel(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    text: &str,
+    pal: &Palette,
+    i18n: &tuneux_commonx::I18n,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(pal.border_type)
         .border_style(panel_border(pal, false))
-        .title(" 插 件 ")
+        .title(format!(" {} ", i18n.t("panel.plugin")))
         .style(pal_style(None, pal.bg));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let fallback_msg = i18n.t("msg.no_visual");
     let body = if text.is_empty() {
-        "无可视化插件画面（plugins/ 下放「可视化-*」插件并经签名后重启）"
+        fallback_msg.as_ref()
     } else {
         text
     };
@@ -190,22 +200,33 @@ pub(super) fn draw_visual_panel(frame: &mut ratatui::Frame, area: Rect, text: &s
 /// 2 格）；非 Matrix 风格用 bar_style 风格池（与电平 / 频谱同族）。
 const BAND_MATRIX_POOL: &[&str] = &["█", "▓", "▒", "░"];
 
-/// 三桶能量竖排（顶部条中栏，内置组件）：低 / 中 / 高各一行 8 格。
+/// 三桶能量面板（顶部条中栏，独立面板）：低 / 中 / 高各一行，
+/// 柱长随面板宽度伸缩（与基础版同构）。
 ///
 /// 数据 = 引擎实时频谱（对数 256 段 ≈ 低 20-200Hz / 中 200Hz-2kHz /
 /// 高 2k-20kHz）每桶取最大值（平均会把纯音 / 稀疏频谱峰值稀释为零）。
-/// 字符池判定与电平表同口径：Matrix（默认）用方块渐进池，其余风格随
-/// bar_style 池逐格随机取用（与电平 / 频谱同观感）；颜色随
-/// band_low / band_mid / band_high（缺省回落 bar_fg 频谱柱色）。
-/// `seed` 决定随机序列（每帧不同）。
+/// 字符池判定与电平表同口径：Matrix（默认）用方块渐进池（按柱位均匀
+/// 分布，越左越实），其余风格随 bar_style 池逐格随机取用（与电平 / 频谱
+/// 同观感）；颜色随 band_low / band_mid / band_high（缺省回落 bar_fg
+/// 频谱柱色）。`seed` 决定随机序列（每帧不同）。
 pub(super) fn draw_band_column(
     frame: &mut ratatui::Frame,
     area: Rect,
     engine: &Option<audio::Engine>,
     seed: u64,
     pal: &Palette,
+    i18n: &tuneux_commonx::I18n,
 ) {
-    if area.width < 8 || area.height < 3 {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(pal.border_type)
+        .border_style(panel_border(pal, false))
+        .title(format!(" {} ", i18n.t("panel.bands")))
+        .style(pal_style(None, pal.bg));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width < 8 || inner.height < 3 {
         return;
     }
     // L/R 平均合并为单声道频谱（与频谱面板同口径）。
@@ -224,10 +245,15 @@ pub(super) fn draw_band_column(
     let n = audio::spectrum::N_BANDS;
     let b1 = n / 3;
     let b2 = n * 2 / 3;
+    let (low_name, mid_name, high_name) = (
+        i18n.t("spectrum.low"),
+        i18n.t("spectrum.mid"),
+        i18n.t("spectrum.high"),
+    );
     let buckets = [
-        ("低", bucket_max(0, b1), pal.band_low),
-        ("中", bucket_max(b1, b2), pal.band_mid),
-        ("高", bucket_max(b2, n), pal.band_high),
+        (low_name.as_ref(), bucket_max(0, b1), pal.band_low),
+        (mid_name.as_ref(), bucket_max(b1, b2), pal.band_mid),
+        (high_name.as_ref(), bucket_max(b2, n), pal.band_high),
     ];
     // Matrix（默认）= 纯方块渐进（█▓▒░ 从实到虚，每字符连占 2 格）；
     // 其余风格随 bar_style 池逐格随机取用（与电平 / 频谱同观感）。
@@ -240,19 +266,24 @@ pub(super) fn draw_band_column(
     let fallback_bar = pal.bar_fg.unwrap_or(Color::LightGreen);
     let grid = pal.grid_fg.unwrap_or(Color::DarkGray);
     let col_w = pal.bar_style.col_width();
+    // 弹性柱长（基础版同构）：标签占 2 列，柱体填满剩余宽度，
+    // 面板越宽柱越长。
+    let label_w = 2usize;
+    let bar_cols = (inner.width as usize).saturating_sub(label_w) / col_w;
+    if bar_cols == 0 {
+        return;
+    }
     let mut rng = seed;
-    // 首行留空：与右侧电平表的边框标题行对齐（低 / 中 / 高分别对齐
-    // 电平 inner 的 L / R 内容行）。
-    let mut lines: Vec<Line> = vec![Line::from("")];
+    let mut lines: Vec<Line> = Vec::with_capacity(buckets.len());
     for (name, energy, key_color) in buckets {
-        let cells = (energy * 8.0 + 0.5) as usize; // 每桶 8 格
+        let active = (energy * bar_cols as f32).ceil() as usize;
         let color = key_color.unwrap_or(fallback_bar);
         let mut spans: Vec<Span> = vec![Span::styled(name, Style::default().fg(grid))];
-        for i in 0..8 {
-            if i < cells {
-                // Matrix 池每字符连占 2 格；风格池逐格随机。
+        for i in 0..bar_cols {
+            if i < active {
+                // Matrix 池按柱位均匀渐变（越左越实）；风格池逐格随机。
                 let ch = if matrix {
-                    pool[i / 2]
+                    pool[((i * pool.len()) / bar_cols).min(pool.len() - 1)]
                 } else {
                     pool[(rng_next(&mut rng) as usize) % pool.len()]
                 };
@@ -264,7 +295,7 @@ pub(super) fn draw_band_column(
         }
         lines.push(Line::from(spans));
     }
-    frame.render_widget(Paragraph::new(lines), area);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// 实时电平柱图（L/R 上下两行水平柱）。
@@ -277,12 +308,14 @@ pub(super) fn draw_level_meter(
     engine: &Option<audio::Engine>,
     frame_tick: u64,
     pal: &Palette,
+
+    i18n: &tuneux_commonx::I18n,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(pal.border_type)
         .border_style(panel_border(pal, false))
-        .title(" 电平 ")
+        .title(format!(" {} ", i18n.t("panel.level")))
         .style(pal_style(None, pal.bg));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -379,12 +412,14 @@ pub(super) fn draw_oscilloscope(
     engine: &Option<audio::Engine>,
     pal: &Palette,
     frame_tick: u64,
+
+    i18n: &tuneux_commonx::I18n,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(pal.border_type)
         .border_style(panel_border(pal, false))
-        .title(" 示波器 ")
+        .title(format!(" {} ", i18n.t("panel.oscilloscope")))
         .style(pal_style(None, pal.bg));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -513,7 +548,14 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(backend).expect("建终端");
         terminal
             .draw(|f| {
-                super::draw_level_meter(f, f.area(), &None, 0, &Palette::default());
+                super::draw_level_meter(
+                    f,
+                    f.area(),
+                    &None,
+                    0,
+                    &Palette::default(),
+                    &tuneux_commonx::I18n::default(),
+                );
             })
             .expect("绘制");
         let text: String = terminal
@@ -527,14 +569,21 @@ mod tests {
         assert!(text.contains('R'), "R 行应在：{text:?}");
     }
 
-    /// 三桶中栏渲染守护：首行留空对齐电平边框行，低 / 中 / 高三行齐备。
+    /// 三桶中栏渲染守护：独立面板边框 + 标题在位，低 / 中 / 高三行齐备。
     #[test]
     fn band_column_renders_three_buckets() {
         let backend = ratatui::backend::TestBackend::new(24, 5);
         let mut terminal = ratatui::Terminal::new(backend).expect("建终端");
         terminal
             .draw(|f| {
-                super::draw_band_column(f, f.area(), &None, 0, &Palette::default());
+                super::draw_band_column(
+                    f,
+                    f.area(),
+                    &None,
+                    0,
+                    &Palette::default(),
+                    &crate::config::build_i18n("zh"),
+                );
             })
             .expect("绘制");
         let text: String = terminal

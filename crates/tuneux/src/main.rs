@@ -185,6 +185,24 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>, config: &mut Config) ->
         }
         // 目录递归加入的后台结果：批量合入（条目 + 新探测元数据补缓存）。
         // 多批次全部生效——加入是累积语义（与导航的「最新生效」不同）。
+        // 共享扫描池结果排空（每帧至多 64 条，与 max/fx 同款）
+        {
+            let mut drained = 0;
+            while drained < 64 {
+                match app.scan_pool.try_recv() {
+                    Some(batch) => {
+                        drained += batch.len();
+                        app.playlist.add_many(batch);
+                    }
+                    None => break,
+                }
+            }
+            // 扫描完成时按专辑-曲序排序（与旧单线程版行为一致）
+            if app.scan_pool.pending() == 0 && drained > 0 {
+                let items = app.playlist.items_mut();
+                playlist::Playlist::sort_items(items);
+            }
+        }
         if let Ok((dir, items, mds, skipped)) = app.add_load_rx.try_recv() {
             app.apply_dir_add(dir, items, mds, skipped, config);
         }
@@ -277,7 +295,8 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>, config: &mut Config) ->
             app.consecutive_failures += 1;
             if app.consecutive_failures >= 10 {
                 // 连续失败达到上限：停止自动跳曲，避免列表全损坏时无限循环刷屏。
-                app.flash_message("连续 10 首无法播放，已停止自动切换");
+                let msg = app.i18n.t("msg.consecutive_fail").into_owned();
+                app.flash_message(&msg);
                 app.consecutive_failures = 0;
             } else {
                 // 播放失败：强制跳下一首（单曲循环按"顺序"语义，不重复失败曲）。

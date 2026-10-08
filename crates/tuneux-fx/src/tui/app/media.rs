@@ -118,7 +118,8 @@ impl App {
             None => {
                 // 解码失败：记入负缓存（本曲不再重试），并经 UI 提示一次（自动过期）。
                 self.cover_failed_path = Some(path);
-                self.flash_message("封面解码失败（已跳过）");
+                let m = self.i18n.t("msg.cover_fail").into_owned();
+                self.flash_message(&m);
                 None
             }
         }

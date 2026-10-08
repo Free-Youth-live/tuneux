@@ -63,19 +63,19 @@ fn key_to_desc(key: &KeyEvent) -> Option<String> {
     Some(desc)
 }
 
-/// 介质档位中文名（状态栏提示用；与 fx 介质菜单同源措辞）。
+/// 介质档位的 i18n key（状态栏提示经语言表翻译；与 fx 介质菜单同源措辞）。
 fn medium_display_name(m: audio::PlaybackMedium) -> &'static str {
     match m {
-        audio::PlaybackMedium::None => "关闭",
-        audio::PlaybackMedium::TapeClear => "磁带·透明（高保真）",
-        audio::PlaybackMedium::TapeWhite => "磁带·白色（清新）",
-        audio::PlaybackMedium::TapeClassic => "磁带·深棕（经典）",
-        audio::PlaybackMedium::TapeAged => "磁带·红色（老化）",
-        audio::PlaybackMedium::VinylClean => "黑胶·蓝色（低噪声）",
-        audio::PlaybackMedium::VinylDynamic => "黑胶·红色（高动态）",
-        audio::PlaybackMedium::VinylStandard => "黑胶·黑色（标准）",
-        audio::PlaybackMedium::VinylAged => "黑胶·彩胶（老化）",
-        _ => "未知",
+        audio::PlaybackMedium::None => "medium.none",
+        audio::PlaybackMedium::TapeClear => "medium.tape_clear",
+        audio::PlaybackMedium::TapeWhite => "medium.tape_white",
+        audio::PlaybackMedium::TapeClassic => "medium.tape_classic",
+        audio::PlaybackMedium::TapeAged => "medium.tape_aged",
+        audio::PlaybackMedium::VinylClean => "medium.vinyl_clean",
+        audio::PlaybackMedium::VinylDynamic => "medium.vinyl_dynamic",
+        audio::PlaybackMedium::VinylStandard => "medium.vinyl_standard",
+        audio::PlaybackMedium::VinylAged => "medium.vinyl_aged",
+        _ => "medium.unknown",
     }
 }
 
@@ -91,7 +91,7 @@ impl App {
     ) -> Option<&'a str> {
         let desc = key_to_desc(key)?;
         keymap.iter().find_map(|(action, configured)| {
-            if crate::config::parse_key_desc(configured).as_deref() == Some(desc.as_str()) {
+            if tuneux_commonx::parse_key_desc(configured).as_deref() == Some(desc.as_str()) {
                 Some(action.as_str())
             } else {
                 None
@@ -411,8 +411,9 @@ impl App {
                 config.playback_medium = self.playback_medium.as_str().to_string();
                 // 界面不再显示介质，状态栏提示当前档位（声音变化不易一眼看出）。
                 self.last_error = Some(format!(
-                    "介质：{}",
-                    medium_display_name(self.playback_medium)
+                    "{}：{}",
+                    self.i18n.t("msg.medium"),
+                    self.i18n.t(medium_display_name(self.playback_medium))
                 ));
                 self.last_error_at = Some(std::time::Instant::now());
                 return true;
@@ -423,11 +424,13 @@ impl App {
                     self.clear_playlist();
                     self.pending_clear = false;
                     self.pending_clear_at = None;
-                    self.flash_message("播放列表已清空");
+                    let msg = self.i18n.t("msg.cleared").into_owned();
+                    self.flash_message(&msg);
                 } else if !self.playlist.is_empty() {
                     self.pending_clear = true;
                     self.pending_clear_at = Some(std::time::Instant::now());
-                    self.flash_message("再按一次 x 确认清空播放列表");
+                    let msg = self.i18n.t("msg.clear_confirm").into_owned();
+                    self.flash_message(&msg);
                 }
                 return true;
             }

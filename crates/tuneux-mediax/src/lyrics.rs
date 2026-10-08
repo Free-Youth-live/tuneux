@@ -282,4 +282,45 @@ mod tests {
         let gbk = [0xC4, 0xE3, 0xBA, 0xC3];
         assert_eq!(decode_bytes(&gbk), "你好");
     }
+
+    /// 模糊化烟雾测试：任意字节的歌词文本经 parse / from_embedded 不得 panic。
+    ///（歌词来自外部文件与内嵌标签，均为不可信输入；真 fuzz 用
+    /// cargo-fuzz + 消毒器，此处用确定性伪随机做「永不 panic」轻量守护。）
+    #[test]
+    fn parse_never_panics_on_garbage() {
+        let mut state: u64 = 0x5eed_2026_0927_1c51;
+        let mut rng = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 32
+        };
+        for len in 0..256usize {
+            for variant in 0..3 {
+                let bytes: Vec<u8> = (0..len).map(|_| (rng() & 0xff) as u8).collect();
+                let mut text = String::from_utf8_lossy(&bytes).into_owned();
+                // 变体：裸垃圾 / 带时间戳行 / 带元数据行，后两者走进更深分支。
+                match variant {
+                    1 => {
+                        text = format!(
+                            "[{:02}:{:02}.{:02}]\n{text}",
+                            rng() % 60,
+                            rng() % 60,
+                            rng() % 100
+                        )
+                    }
+                    2 => {
+                        text = format!(
+                            "[ti:x]\n[ar:y]\n[offset:{}]\n{text}",
+                            (rng() % 2000) as i64 - 1000
+                        )
+                    }
+                    _ => {}
+                }
+                let parsed = Lyrics::parse(&text);
+                let _ = parsed.current_line((rng() % 600) as f64 / 10.0);
+                let _ = Lyrics::from_embedded(&text);
+            }
+        }
+    }
 }

@@ -1,4 +1,4 @@
-//! # 菜单栏模型（参照 foobar2000 组织：文件 / 播放 / 视图 / 工具 / 设置 / 插件 / 帮助 + 介质）
+//! # 菜单栏模型（文件 / 播放 / 视图 / 工具 / 设置 / 插件 / 帮助 + 介质）
 //!
 //! 定义顶级菜单与各菜单项的数据结构、动作枚举，以及静态菜单表。
 //! 菜单状态（哪栏激活、下拉是否展开、选中项）在 [`super::App`]；
@@ -30,6 +30,7 @@ pub enum MenuAction {
     TogglePlaylistView,
     // —— 工具（插件工作区，未装灰显）——
     Equalizer,
+    Filter,
     Compressor,
     Dsp,
     TagEdit,
@@ -39,6 +40,7 @@ pub enum MenuAction {
     OutputDevice,
     ReplayGain,
     SkinSelect,
+    LangSelect,
     // —— 插件（插件域，清单；√ = 已加载）——
     PluginEq,
     PluginComp,
@@ -69,20 +71,20 @@ pub struct Menu {
     pub items: Vec<MenuItem>,
 }
 
-/// 介质菜单项的中文显示名（含一句音色特征；与 corex 注释同源措辞）。
+/// 介质菜单项的 i18n key（渲染 / 提示时经语言表翻译；与 corex 注释同源措辞）。
 /// `pub(super)`：供 App 在 m 键 / 菜单切换后 flash 提示当前档位。
 pub(super) fn medium_menu_label(m: PlaybackMedium) -> &'static str {
     match m {
-        PlaybackMedium::None => "关闭（原始输出）",
-        PlaybackMedium::TapeClear => "磁带·透明（高保真）",
-        PlaybackMedium::TapeWhite => "磁带·白色（清新）",
-        PlaybackMedium::TapeClassic => "磁带·深棕（经典）",
-        PlaybackMedium::TapeAged => "磁带·红色（老化）",
-        PlaybackMedium::VinylClean => "黑胶·蓝色（低噪声）",
-        PlaybackMedium::VinylDynamic => "黑胶·红色（高动态）",
-        PlaybackMedium::VinylStandard => "黑胶·黑色（标准）",
-        PlaybackMedium::VinylAged => "黑胶·彩胶（老化）",
-        _ => "未知介质",
+        PlaybackMedium::None => "medium.none",
+        PlaybackMedium::TapeClear => "medium.tape_clear",
+        PlaybackMedium::TapeWhite => "medium.tape_white",
+        PlaybackMedium::TapeClassic => "medium.tape_classic",
+        PlaybackMedium::TapeAged => "medium.tape_aged",
+        PlaybackMedium::VinylClean => "medium.vinyl_clean",
+        PlaybackMedium::VinylDynamic => "medium.vinyl_dynamic",
+        PlaybackMedium::VinylStandard => "medium.vinyl_standard",
+        PlaybackMedium::VinylAged => "medium.vinyl_aged",
+        _ => "medium.unknown",
     }
 }
 
@@ -115,75 +117,77 @@ pub fn menus() -> &'static [Menu] {
     static MENUS: std::sync::LazyLock<Vec<Menu>> = std::sync::LazyLock::new(|| {
         vec![
             Menu {
-                title: "文件",
+                title: "menu.file",
                 items: vec![
                     // 打开文件/目录已移除：文件浏览器（b 键）+ / 搜索 + a 加入
                     // 完整覆盖，命令模式不再提供路径手敲入口。
-                    MenuItem::new("退出", "q", MenuAction::Quit),
+                    MenuItem::new("menu.quit", "q", MenuAction::Quit),
                 ],
             },
             Menu {
-                title: "播放",
+                title: "menu.play",
                 items: vec![
-                    MenuItem::new("播放 / 暂停", "空格", MenuAction::TogglePlay),
-                    MenuItem::new("上一曲", "p", MenuAction::PrevTrack),
-                    MenuItem::new("下一曲", "n", MenuAction::NextTrack),
-                    MenuItem::new("循环模式", "r", MenuAction::CycleRepeat),
-                    MenuItem::new("随机播放", "s", MenuAction::ToggleShuffle),
-                    MenuItem::new("音量增大", "+", MenuAction::VolumeUp),
-                    MenuItem::new("音量减小", "-", MenuAction::VolumeDown),
+                    MenuItem::new("menu.toggle_play", "Space", MenuAction::TogglePlay),
+                    MenuItem::new("menu.prev", "p", MenuAction::PrevTrack),
+                    MenuItem::new("menu.next", "n", MenuAction::NextTrack),
+                    MenuItem::new("menu.repeat", "r", MenuAction::CycleRepeat),
+                    MenuItem::new("menu.shuffle", "s", MenuAction::ToggleShuffle),
+                    MenuItem::new("menu.vol_up", "+", MenuAction::VolumeUp),
+                    MenuItem::new("menu.vol_down", "-", MenuAction::VolumeDown),
                 ],
             },
             // 介质：9 变体随 corex ALL 自动同步（新增介质无需改此处）。
             Menu {
-                title: "介质",
+                title: "menu.medium",
                 items: PlaybackMedium::ALL
                     .iter()
                     .map(|&m| MenuItem::new(medium_menu_label(m), "", MenuAction::SetMedium(m)))
                     .collect(),
             },
             Menu {
-                title: "视图",
+                title: "menu.view",
                 items: vec![
-                    MenuItem::new("文件浏览器", "b", MenuAction::ToggleBrowser),
-                    MenuItem::new("专辑封面", "c", MenuAction::ToggleCover),
-                    MenuItem::new("歌词", "l", MenuAction::ToggleLyrics),
-                    MenuItem::new("频谱", "v", MenuAction::ToggleSpectrum),
-                    MenuItem::new("播放列表分组", "g", MenuAction::TogglePlaylistView),
+                    MenuItem::new("menu.browser", "b", MenuAction::ToggleBrowser),
+                    MenuItem::new("menu.cover", "c", MenuAction::ToggleCover),
+                    MenuItem::new("menu.lyrics", "l", MenuAction::ToggleLyrics),
+                    MenuItem::new("menu.spectrum", "v", MenuAction::ToggleSpectrum),
+                    MenuItem::new("menu.group", "g", MenuAction::TogglePlaylistView),
                 ],
             },
             Menu {
-                title: "工具",
+                title: "menu.tools",
                 items: vec![
-                    MenuItem::new("均衡器", "F9", MenuAction::Equalizer),
-                    MenuItem::new("压缩器", "", MenuAction::Compressor),
-                    MenuItem::disabled("DSP", "", MenuAction::Dsp),
-                    MenuItem::disabled("标签编辑", "", MenuAction::TagEdit),
-                    MenuItem::disabled("格式转换", "", MenuAction::Convert),
-                    MenuItem::disabled("封面管理", "", MenuAction::CoverManage),
+                    MenuItem::new("menu.eq", "F9", MenuAction::Equalizer),
+                    MenuItem::new("menu.filter", "f", MenuAction::Filter),
+                    MenuItem::new("menu.compressor", "", MenuAction::Compressor),
+                    MenuItem::disabled("menu.dsp", "", MenuAction::Dsp),
+                    MenuItem::disabled("menu.tag_edit", "", MenuAction::TagEdit),
+                    MenuItem::disabled("menu.convert", "", MenuAction::Convert),
+                    MenuItem::disabled("menu.cover_mgmt", "", MenuAction::CoverManage),
                 ],
             },
             Menu {
-                title: "设置",
+                title: "menu.settings",
                 items: vec![
-                    MenuItem::new("输出设备（自动跟随）", "", MenuAction::OutputDevice),
-                    MenuItem::new("ReplayGain 响度归一", "", MenuAction::ReplayGain),
-                    MenuItem::new("皮肤配色…", "", MenuAction::SkinSelect),
+                    MenuItem::new("menu.output_device", "", MenuAction::OutputDevice),
+                    MenuItem::new("menu.replaygain", "", MenuAction::ReplayGain),
+                    MenuItem::new("menu.skin_select", "", MenuAction::SkinSelect),
+                    MenuItem::new("menu.lang_select", "", MenuAction::LangSelect),
                 ],
             },
             Menu {
-                title: "插件",
+                title: "menu.plugins",
                 items: vec![
-                    MenuItem::new("均衡器", "", MenuAction::PluginEq),
-                    MenuItem::new("压缩器", "", MenuAction::PluginComp),
-                    MenuItem::new("可视化面板", "v", MenuAction::PluginVisual),
+                    MenuItem::new("menu.eq", "", MenuAction::PluginEq),
+                    MenuItem::new("menu.compressor", "", MenuAction::PluginComp),
+                    MenuItem::new("menu.visual", "v", MenuAction::PluginVisual),
                 ],
             },
             Menu {
-                title: "帮助",
+                title: "menu.help",
                 items: vec![
                     // 原两项（快捷键速查/关于、关于）打开的是同一个弹窗，合并为一项。
-                    MenuItem::new("关于 / 快捷键速查", "?", MenuAction::About),
+                    MenuItem::new("menu.about", "?", MenuAction::About),
                 ],
             },
         ]

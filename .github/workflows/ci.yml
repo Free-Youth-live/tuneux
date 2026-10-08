@@ -1,0 +1,43 @@
+# =============================================================================
+# tuneux · 日常检查（push / PR 触发）
+#
+# 批 0 首推后生效：日常提交的质量兜底（release.yml 只管发布标签触发）。
+# 与 release 的 checks job 同口径：fmt / clippy 零告警 / test / 分层守卫 /
+# 依赖核查，任一不过红叉。
+# =============================================================================
+
+name: 日常检查
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: 质量检查
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      - name: 安装系统依赖（ALSA 开发库，cpal 编译需要）
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: 格式检查
+        run: cargo fmt --check
+      - name: 静态检查（零告警）
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: 测试
+        run: cargo test --workspace
+      - name: 分层守卫（依赖红线 / API 面 / i18n key / 敏感词 / 文件头 / 棘轮 / 发布管线纯度）
+        run: bash tools/guard.sh
+      - name: 依赖核查（advisories / bans / licenses / sources）
+        run: |
+          cargo install cargo-deny --locked --version 0.20.2
+          cargo deny --workspace check

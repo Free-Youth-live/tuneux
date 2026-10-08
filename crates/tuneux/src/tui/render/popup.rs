@@ -18,7 +18,7 @@ use ratatui::{
 /// 由 `?` 键唤起，覆盖在主界面之上；任意键关闭（见 `App::handle_key`）。
 /// 版本号取编译期的 `CARGO_PKG_VERSION`，与 Cargo.toml 保持一致，
 /// 避免手工写死导致版本漂移。
-pub(super) fn draw_about(frame: &mut ratatui::Frame, area: Rect) {
+pub(super) fn draw_about(frame: &mut ratatui::Frame, area: Rect, i18n: &tuneux_commonx::I18n) {
     // 弹窗尺寸：宽度不超过 66 列，高度不超过 19 行（内容恰好放得下）。
     let box_w = area.width.min(66);
     let box_h = area.height.min(19);
@@ -31,7 +31,7 @@ pub(super) fn draw_about(frame: &mut ratatui::Frame, area: Rect) {
     // Clear 清空弹窗区域，避免下层的界面内容透出来造成叠字。
     frame.render_widget(ratatui::widgets::Clear, box_area);
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
-        " 关于 ",
+        format!(" {} ", i18n.t("panel.about")),
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -58,25 +58,25 @@ pub(super) fn draw_about(frame: &mut ratatui::Frame, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
-        Line::from("这是一个基于命令行的音乐播放器"),
+        Line::from(i18n.t("about.description").into_owned()),
         Line::from(""),
-        Line::from("支持 MP3 · FLAC · WAV · OGG · OPUS · WV · M4A · AAC · ALAC"),
-        Line::from("纯离线 · 不收集任何数据"),
+        Line::from(i18n.t("about.formats").into_owned()),
+        Line::from(i18n.t("about.offline").into_owned()),
         Line::from(""),
-        Line::from("本项目采用木兰宽松许可证 v2（MulanPSL-2.0）"),
-        Line::from("基于以下开源项目构建："),
-        Line::from("音频  cpal · symphonia · opus-decoder · rubato · rustfft · ringbuf"),
-        Line::from("界面  ratatui · crossterm · image · unicode-width"),
-        Line::from("通用  serde · toml · dirs · encoding_rs · crossbeam-channel"),
-        Line::from("插件  wasmi · ed25519-dalek"),
-        Line::from("平台  zbus（Linux）· rdev（Windows）"),
+        Line::from(i18n.t("about.license").into_owned()),
+        Line::from(i18n.t("about.deps").into_owned()),
+        Line::from(i18n.t("about.dep_audio").into_owned()),
+        Line::from(i18n.t("about.dep_ui").into_owned()),
+        Line::from(i18n.t("about.dep_common").into_owned()),
+        Line::from(i18n.t("about.dep_plugin").into_owned()),
+        Line::from(i18n.t("about.dep_platform").into_owned()),
         Line::from(""),
         // \u{00A9} 是普通文本版权符号（非 emoji 变体 \u{00A9}\u{FE0F}），
         // 与周围文字同号同宽，避免在部分终端上被渲染成大号 emoji 图标。
         Line::from("\u{00A9} 不羁的青春（FreeYouth）"),
         Line::from(""),
         Line::from(Span::styled(
-            "按任意键关闭",
+            i18n.t("about.close").into_owned(),
             Style::default().fg(Color::DarkGray),
         )),
     ];

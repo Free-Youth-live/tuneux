@@ -8,7 +8,7 @@
 [package]
 # 包名 tuneux；可执行文件名 tuneux
 name = "tuneux"
-version = "0.5.1"
+version = "0.5.5"
 edition = "2021"
 # 木兰宽松许可证 v2
 license = "MulanPSL-2.0"
@@ -27,6 +27,9 @@ path = "src/main.rs"
 # 共享音频内核（契约化一等 crate）
 tuneux-corex = { path = "../tuneux-corex" }
 tuneux-mediax = { path = "../tuneux-mediax" }
+# 发行版通用机制：键位解析 / 配置路径 / 媒体键 / 目录浏览内核
+#（media-key：基础版需要系统媒体键，显式启用）
+tuneux-commonx = { path = "../tuneux-commonx", features = ["media-key"] }
 # 依赖版本统一由 workspace 根 [workspace.dependencies] 管理
 crossbeam-channel.workspace = true
 ratatui.workspace = true
@@ -38,15 +41,6 @@ toml.workspace = true
 dirs.workspace = true
 encoding_rs.workspace = true
 
-# 系统媒体键（仅 Linux）：MPRIS D-Bus 服务（zbus 纯 safe Rust，MIT 许可）
-# 通过 workspace target 专属依赖避免其他平台拉入 D-Bus 依赖树
-[target.'cfg(target_os = "linux")'.dependencies]
-zbus.workspace = true
-
-# 系统媒体键（仅 Windows）：rdev 低层键盘钩子（MIT，unsafe 全在 crate 内部，
-# 我们只调 safe API；无窗口、无消息泵）
-[target.'cfg(target_os = "windows")'.dependencies]
-rdev.workspace = true
 
 [dev-dependencies]
 # 测试辅助：corex 的 set_*_for_test 方法（仅测试构建生效，release 不含）

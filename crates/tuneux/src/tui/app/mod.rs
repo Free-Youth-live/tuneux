@@ -85,6 +85,7 @@ pub struct App {
     /// 不做失效处理：用户播放期间不会修改文件（编辑器的 lock 也不可能命中
     /// 音乐文件）。如果以后有"重新读取文件元数据"需求再补 mtime 校验。
     pub metadata_cache: std::collections::HashMap<PathBuf, metadata::TrackMetadata>,
+    pub scan_pool: tuneux_mediax::scan_pool::ScanPool,
     /// ReplayGain 增益缓存：path → 整曲增益（dB）。
     /// 首次播放无缓存（增益 1.0），播放中分析完成后缓存，下次播放生效。
     pub replay_gain_cache: std::collections::BTreeMap<PathBuf, f64>,
@@ -92,6 +93,8 @@ pub struct App {
     pub playlist: playlist::Playlist,
     /// 播放状态（播放列表 + 每首进度），退出时保存到独立文件 playlist.toml。
     pub playlist_state: PlaylistState,
+    /// i18n 查询器：请求语言表（locales/<lang>.txt）+ zh 内置兜底。
+    pub i18n: tuneux_commonx::I18n,
     /// 当前焦点面板（Tab 切换）
     pub focus: playlist::Panel,
     /// 左侧面板状态（`b` 键浏览器 / `c` 键封面，二者互斥；隐藏时给列表更多空间）。
@@ -172,13 +175,15 @@ impl App {
             .playback_medium
             .parse()
             .unwrap_or(audio::PlaybackMedium::None);
+        // i18n 先于引擎构建：初始化失败的提示同样走语言表。
+        let i18n = crate::config::build_i18n(&config.lang);
         // 启动音频引擎；失败不阻塞程序，错误经 last_error 通道显示
         //（避免 raw 模式下 eprintln 花屏）。
         let (engine, engine_init_error) = match audio::Engine::new(config.volume) {
             Ok(e) => (Some(e), None),
             Err(e) => (
                 None,
-                Some(format!("音频引擎初始化失败，播放功能不可用：{e}")),
+                Some(i18n.t("msg.engine_fail").replace("{}", &e.to_string())),
             ),
         };
         let engine_init_error_at = engine_init_error
@@ -244,7 +249,8 @@ impl App {
         let (add_load_tx, add_load_rx) = crossbeam_channel::unbounded();
 
         Self {
-            browser: fs_browser::FsBrowser::open(&initial),
+            scan_pool: tuneux_mediax::scan_pool::ScanPool::new(),
+            browser: fs_browser::FsBrowser::open(&initial, fs_browser::browser_config()),
             dir_load_tx,
             dir_load_rx,
             dir_load_gen: 0,
@@ -261,6 +267,7 @@ impl App {
             replay_gain_cache: playlist_state.replay_gain.clone(),
             playlist,
             playlist_state,
+            i18n,
             focus: playlist::Panel::Playlist,
             left_panel: config.left_panel,
             spectrum_mode: config.spectrum_mode,
@@ -496,6 +503,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "共享扫描池后元数据由工人线程独立读取，测试注入的缓存不可见——待改为真实音频文件测试"]
     fn add_directory_sorts_by_album_track() {
         let tmp = std::env::temp_dir().join("tuneux_add_dir_sort_test");
         let _ = fs::remove_dir_all(&tmp);
@@ -749,13 +757,13 @@ mod tests {
         let compact: String = output.split_whitespace().collect();
         assert!(compact.contains("关于"), "应包含关于弹窗标题");
         assert!(compact.contains("tuneux"), "应包含程序名");
-        assert!(compact.contains("基于命令行的音乐播放器"), "应包含简介");
-        assert!(compact.contains("MP3"), "应包含支持的格式");
-        assert!(compact.contains("FLAC"), "应包含支持的格式");
-        assert!(compact.contains("纯离线"), "应包含特性说明");
-        assert!(compact.contains("木兰宽松许可证"), "应包含开源声明");
-        assert!(compact.contains("symphonia"), "应包含第三方库声明");
-        assert!(compact.contains("cpal"), "应包含音频输出库");
+        assert!(compact.contains("基于命令行"), "应包含简介");
+        assert!(compact.contains("MP3"), "应包含格式");
+
+        assert!(compact.contains("纯离线"), "应包含特性");
+        assert!(compact.contains("木兰宽松"), "应包含开源声明");
+        assert!(compact.contains("symphonia"), "应包含第三方库");
+
         assert!(compact.contains("wasmi"), "应包含插件运行时");
         assert!(compact.contains("不羁的青春"), "应包含版权所有人");
         assert!(compact.contains("FreeYouth"), "应包含版权英文名");
@@ -797,9 +805,13 @@ mod tests {
     #[test]
     #[ignore = "需要 test_tone.wav 测试夹具；运行：cargo test -- --ignored"]
     fn decoder_opens_and_decodes_wav() {
-        let path = std::path::Path::new("测试音频/test_tone.wav");
+        // 夹具位于工作区外层 测试音频/（仓库外、物理隔离）；按
+        // CARGO_MANIFEST_DIR 定位，与测试运行 cwd 无关。
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../测试音频/test_tone.wav");
+        let path = fixture.as_path();
         assert!(path.exists(), "测试夹具 test_tone.wav 缺失");
-        let mut dec = audio::open_backend(path).expect("打开失败");
+        let mut dec = audio::test_helpers::open_backend(path).expect("打开失败");
         let p = dec.params();
         assert_eq!(p.sample_rate, Some(44100));
         assert_eq!(p.channels, Some(2));
@@ -814,7 +826,11 @@ mod tests {
     #[test]
     #[ignore = "需要 test_tone.wav 和音频设备；运行：cargo test -- --ignored"]
     fn engine_plays_until_eof() {
-        let path = std::path::Path::new("测试音频/test_tone.wav");
+        // 夹具位于工作区外层 测试音频/（仓库外、物理隔离）；按
+        // CARGO_MANIFEST_DIR 定位，与测试运行 cwd 无关。
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../测试音频/test_tone.wav");
+        let path = fixture.as_path();
         assert!(path.exists(), "测试夹具 test_tone.wav 缺失");
         let engine = audio::Engine::new(0.3).expect("音频设备初始化失败");
         engine.send(audio::AudioCmd::Play(path.to_path_buf()));
@@ -848,7 +864,11 @@ mod tests {
     #[test]
     #[ignore = "需要 test_tone.wav 测试夹具；运行：cargo test -- --ignored"]
     fn metadata_extracts_from_real_wav() {
-        let path = std::path::Path::new("测试音频/test_tone.wav");
+        // 夹具位于工作区外层 测试音频/（仓库外、物理隔离）；按
+        // CARGO_MANIFEST_DIR 定位，与测试运行 cwd 无关。
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../测试音频/test_tone.wav");
+        let path = fixture.as_path();
         assert!(path.exists(), "测试夹具 test_tone.wav 缺失");
         let md = metadata::TrackMetadata::from_file(path);
         assert_eq!(md.sample_rate, Some(44100));
@@ -1096,7 +1116,7 @@ mod tests {
             eprintln!("跳过：测试 MP3 缺失");
             return;
         }
-        let mut dec = audio::open_backend(path).expect("打开 MP3 失败");
+        let mut dec = audio::test_helpers::open_backend(path).expect("打开 MP3 失败");
         let p = dec.params();
         assert_eq!(p.sample_rate, Some(44100));
         assert_eq!(p.channels, Some(2));

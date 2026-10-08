@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# =============================================================================
+# tuneux · pre-push 检查钩子 v3.1（源码入库：tools/hooks/pre-push）
+#
+# v3.1（2026-10-08）相对 v3 的变更：
+#   1. PATH_ALLOW 增补 ^assets/（顶层图标资源：hicolor / icns / ico，
+#      Linux 桌面集成与 .app 打包引用；按新增合法顶层路径先更新钩子的
+#      既有纪律登记）；
+#
+# v3（2026-09-27）相对 v2.1 的变更：
+#   1. T22：ref 白名单 case 补 `*)` 兜底——refs/notes/*、refs/for/* 等
+#      非常规引用类型一律拒绝（v2 可绕过分支白名单）；
+#   2. PATH_ALLOW 增补 tools/ 与 locales/（治理脚本与官方语言表入仓，
+#      按 005「新增合法顶层路径先更新钩子」纪律登记）；
+#   3. 治理接线（批 A1）：推送前跑 tools/guard.sh（依赖红线 + API 面断言
+#      + i18n key 完整性 + 重复棘轮），不过即拒推；
+#   4. 词表单一事实源：CONTENT_RE/MSG_RE/SENS_RE 改 source 仓外
+#      tools-governance/sensitive-re.sh（与 guard.sh 共享，零漂移；
+#      词表含禁用词字面量，物理隔离在仓外——入仓即自违反）；
+#   5. 源码入库：本文件住在 tools/hooks/，经 tools/hooks/install.sh 安装到
+#      .git/hooks/pre-push（字节一致）——钩子源码灭失事故（2026-09）不复现。
+#
+# 规则（发布流程内部约定的钩子章）：
+#   R1  分支白名单：唯一允许推送的分支是 main；其余一律拒绝
+#   R1b 推 tag → 目标提交必须是 main 的祖先
+#   R1c（v3/T22）非常规引用类型（notes/for/…）一律拒绝
+#   R2  推送范围内每个新提交的树内容：禁词/代号/AI 词/敏感信息零命中；
+#       扫描失败（退出码 ≥2）拒推（失败关闭）
+#   R3  推送范围内每个新提交的树路径：全部命中白名单（default-deny）
+#   R4  推送范围内 commit message：铁证词零命中
+#   R5（v3）工作树治理：tools/guard.sh 全过
+#
+# 主防线是纪律（开发分支永不推送 + squash 发布），本钩子是机器化第二道保险。
+# =============================================================================
+set -uo pipefail
+
+ZERO=0000000000000000000000000000000000000000
+
+# 钩子运行环境 PATH 不一定含 cargo（GUI 客户端启 git 时尤甚）——历史 PATH
+# bug 实测教训，显式补全。
+export PATH="$HOME/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "❌ 钩子无法定位仓库根"; exit 1;
+}
+
+# 词表单一事实源：base64 编码入仓（与 guard.sh 共享解码路径；CI/任何
+# checkout 环境可用）。仓外 tools-governance/sensitive-re.sh 为人工编辑母本。
+eval "$(base64 -d < "$ROOT/tools/sensitive-re.b64")" || { echo "❌ 词表源解码失败（sensitive-re.b64 缺失/损坏）——失败关闭"; exit 1; }
+# 解码后非空校验：防「source 静默失败 → 空词表 → 空扫描假绿」的 fail-open 类缺陷
+if [ -z "${CONTENT_RE:-}" ] || [ -z "${MSG_RE:-}" ] || [ -z "${SENS_RE:-}" ]; then
+  echo "❌ 词表源解码结果为空——失败关闭"; exit 1
+fi
+
+# —— R3 路径白名单：目录前缀不闭合、文件精确闭合、顶层 txt 兜手册 ——
+# 2026-09-27 增补：tools/（治理脚本/钩子源码）、locales/（官方语言表）。
+PATH_ALLOW='^(crates/|plugins/|tools/|locales/|assets/)|^\.github/workflows/(release|ci)\.yml$|^\.gitignore$|^Cargo\.toml$|^Cargo\.lock$|^LICENSE$|^README\.md$|^CHANGELOG\.md$|^deny\.toml$|^[^/]+\.txt$'
+
+fail=0
+
+scan_commit() { # scan_commit <sha>：R2 + R3（退出码：0=命中/违规，1=干净，≥2=扫描失败）
+  local c="$1" hits bad rc tree
+  # R2 内容黑名单（退出码 ≥2 必须拒推，不得静默放行）
+  hits=$(git -c core.quotePath=false grep -IiE "$CONTENT_RE" "$c" -- .); rc=$?
+  if [ $rc -ge 2 ]; then
+    echo "❌ [$c] 内容扫描失败（git grep 错误码 $rc）"; fail=1
+  elif [ $rc -eq 0 ]; then
+    echo "❌ [$c] 树内容含工具名/署名/AI 词/内部代号/禁用词："; echo "$hits" | head -5; fail=1
+  fi
+  # R2 敏感内容
+  hits=$(git -c core.quotePath=false grep -IiE "$SENS_RE" "$c" -- .); rc=$?
+  if [ $rc -ge 2 ]; then
+    echo "❌ [$c] 敏感内容扫描失败（git grep 错误码 $rc）"; fail=1
+  elif [ $rc -eq 0 ]; then
+    echo "❌ [$c] 树内容含敏感信息（私钥/本机路径/旧种子名）："; echo "$hits" | head -5; fail=1
+  fi
+  # R3 路径白名单（先取树再过滤：pipefail 会把 ls-tree 失败掩成「干净」，必须分开判）
+  tree=$(git -c core.quotePath=false ls-tree -r --name-only "$c"); rc=$?
+  if [ $rc -ge 2 ]; then
+    echo "❌ [$c] 路径扫描失败（ls-tree 错误码 $rc）"; fail=1
+  elif [ -n "$tree" ]; then
+    bad=$(printf '%s\n' "$tree" | grep -vE "$PATH_ALLOW"); rc=$?
+    if [ $rc -eq 0 ]; then
+      echo "❌ [$c] 含白名单之外的路径（新增合法路径请先更新本钩子）："; echo "$bad" | head -5; fail=1
+    elif [ $rc -ge 2 ]; then
+      echo "❌ [$c] 路径过滤失败（grep 错误码 $rc）"; fail=1
+    fi
+  fi
+}
+
+scan_messages() { # scan_messages <range…>：R4 commit message（铁证词，同三态退出码）
+  local hits rc
+  hits=$(git log --format='%h %B' "$@" 2>/dev/null); rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "❌ message 扫描失败（git log 错误码 $rc）"; fail=1; return
+  fi
+  [ -z "$hits" ] && return
+  hits=$(printf '%s\n' "$hits" | grep -iE "$MSG_RE"); rc=$?
+  if [ $rc -eq 0 ]; then
+    echo "❌ 推送范围内 commit message 含工具名/署名/AI 词/内部代号/禁用词："; echo "$hits" | head -5; fail=1
+  elif [ $rc -ge 2 ]; then
+    echo "❌ message 过滤失败（grep 错误码 $rc）"; fail=1
+  fi
+}
+
+# —— R5 治理接线：工作树 guard 全过才允许推送（失败关闭）——
+if [ -f "$ROOT/tools/guard.sh" ]; then
+  if ! bash "$ROOT/tools/guard.sh"; then
+    echo "❌ 分层守卫未通过（R5），拒推"; fail=1
+  fi
+else
+  echo "❌ tools/guard.sh 缺失（治理脚本必须在仓），拒推"; fail=1
+fi
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "$ZERO" ] && continue          # 删除远程引用：放行
+  case "$local_ref" in
+    refs/heads/main) ;;                            # R1 白名单：唯一允许推送的分支
+    refs/heads/*)                                  # 其余分支一律本地（含 fx-dev 及将来的新分支）
+      echo "❌ 只允许推送 main；开发分支（${local_ref}）禁止推送任何远程"; fail=1; continue ;;
+    refs/tags/*)                                   # R1b：tag 只允许指向 main 已发布的提交
+      tag_commit=$(git rev-parse "$local_sha^{commit}" 2>/dev/null) || {
+        echo "❌ 无法解析 tag 目标（${local_ref}）"; fail=1; continue; }
+      if ! git merge-base --is-ancestor "$tag_commit" refs/heads/main 2>/dev/null; then
+        echo "❌ tag 必须指向 main 已发布的提交（$local_ref 当前疑似指向开发分支历史）"; fail=1; continue
+      fi
+      ;;
+    *)                                             # R1c（T22）：非常规引用类型兜底拒绝
+      echo "❌ 不支持推送该引用类型（${local_ref}）；仅 main 与指向 main 的 tag"; fail=1; continue ;;
+  esac
+  if [ "$remote_sha" = "$ZERO" ]; then
+    range=("$local_sha" --not --remotes)           # 新远程引用
+  else
+    range=("$remote_sha..$local_sha")
+  fi
+  commits=$(git rev-list "${range[@]}") || {       # 范围解析失败必须拒推，不得静默放行
+    echo "❌ 无法解析推送范围（${local_ref}）"; fail=1; continue
+  }
+  scan_messages "${range[@]}"                      # R4：message 与树内容双层扫描
+  for c in $commits; do                            # R2/R3：逐提交扫树
+    scan_commit "$c"
+  done
+done
+
+exit $fail

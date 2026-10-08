@@ -83,12 +83,18 @@ pub fn layout_metrics(
     let playlist_panel_h = match spectrum_mode {
         SpectrumMode::Hidden => workspace_h,
         SpectrumMode::Half => workspace_h / 2,
-        SpectrumMode::Full | SpectrumMode::Oscilloscope | SpectrumMode::Plugin => 0,
+        SpectrumMode::Full
+        | SpectrumMode::Oscilloscope
+        | SpectrumMode::Plugin
+        | SpectrumMode::Gauge => 0,
     };
     let spectrum_panel_h = match spectrum_mode {
         SpectrumMode::Hidden => 0,
         SpectrumMode::Half => workspace_h - workspace_h / 2,
-        SpectrumMode::Full | SpectrumMode::Oscilloscope | SpectrumMode::Plugin => workspace_h,
+        SpectrumMode::Full
+        | SpectrumMode::Oscilloscope
+        | SpectrumMode::Plugin
+        | SpectrumMode::Gauge => workspace_h,
     };
 
     let browser_searching = search_mode && search_target == SearchTarget::Browser;

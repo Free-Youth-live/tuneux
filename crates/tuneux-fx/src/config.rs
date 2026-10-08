@@ -28,20 +28,232 @@ use serde::{Deserialize, Serialize};
 
 use crate::playlist::PlaylistItem;
 
+use tuneux_commonx::{sanitize_f32, sanitize_f64, validate_keymap};
+
 /// 配置操作结果别名。
 ///
 /// 错误聚合为 trait 对象，避免为每种底层错误（IO、TOML 解析）单独定义类型，
 /// 简化代码。配置模块的错误对用户均不致命，调用方据此回退默认值。
 pub type ConfigResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-/// 循环播放模式的中文短名（状态条显示）。
-/// 呈现归发行版：枚举本体在数据层（tuneux-mediax），文案不随之下沉。
-pub fn repeat_label(mode: RepeatMode) -> &'static str {
+/// 循环播放模式的 i18n key（状态条显示）。
+/// 呈现归发行版：枚举本体在数据层（tuneux-mediax），文案走 i18n 表。
+pub fn repeat_key(mode: RepeatMode) -> &'static str {
     match mode {
-        RepeatMode::Off => "顺序",
-        RepeatMode::Single => "单曲",
-        RepeatMode::List => "循环",
+        RepeatMode::Off => "repeat.off",
+        RepeatMode::Single => "repeat.single",
+        RepeatMode::List => "repeat.list",
     }
+}
+
+/// 中文内置表（i18n 的「锚」与最终回退）：key → 中文文案。
+/// 注意：新增 UI 文案时在此追加 key，并同步 `locales/en.txt`（官方英文）。
+pub(crate) fn zh_table() -> tuneux_commonx::LangTable {
+    tuneux_commonx::LangTable::parse(
+        "\
+# —— 面板标题 ——\n\
+panel.current_track = \"当前曲目\"\n\
+panel.status = \"状态\"\n\
+panel.browser = \"文件浏览器\"\n\
+panel.playlist = \"播放列表\"\n\
+panel.lyrics = \"歌词\"\n\
+panel.cover = \"专辑封面\"\n\
+panel.cover_browser = \"封面浏览\"\n\
+panel.spectrum = \"频 谱\"\n\
+panel.oscilloscope = \"示波器\"\n\
+panel.gauge = \"指针表\"\n\
+panel.level = \"电平\"\n\
+panel.bands = \"频段\"\n\
+panel.about = \"关于\"\n\
+panel.skin = \"皮肤配色\"\n\
+panel.eq = \"均衡器\"\n\
+panel.compressor = \"压缩器\"\n\
+panel.plugin = \"插 件\"\n\
+# —— 状态栏 ——\n\
+status.playing = \"[播]\"\n\
+status.stopped = \"[停]\"\n\
+status.shuffle = \" 随机\"\n\
+status.volume = \"音量\"\n\
+# —— 元数据展示 ——\n\
+metadata.unknown_title = \"未知曲目\"\n\
+metadata.unknown_artist = \"未知艺人\"\n\
+metadata.unknown_album = \"未知专辑\"\n\
+metadata.artist_label = \"歌手\"\n\
+metadata.album_label = \"专辑\"\n\
+metadata.track_label = \"曲目\"\n\
+# —— 循环模式 ——\n\
+repeat.off = \"顺序\"\n\
+repeat.single = \"单曲\"\n\
+repeat.list = \"循环\"\n\
+# —— 功能键栏 ——\n\
+fkey.menu = \"菜单\"\n\
+fkey.panels = \"面板\"\n\
+fkey.eq = \"均衡器\"\n\
+fkey.help = \"帮助\"\n\
+# —— 菜单 ——\n\
+menu.file = \"文件\"\n\
+menu.play = \"播放\"\n\
+menu.medium = \"介质\"\n\
+menu.view = \"视图\"\n\
+menu.tools = \"工具\"\n\
+menu.settings = \"设置\"\n\
+menu.plugins = \"插件\"\n\
+menu.help = \"帮助\"\n\
+menu.quit = \"退出\"\n\
+menu.toggle_play = \"播放 / 暂停\"\n\
+menu.prev = \"上一曲\"\n\
+menu.next = \"下一曲\"\n\
+menu.repeat = \"循环模式\"\n\
+menu.shuffle = \"随机播放\"\n\
+menu.vol_up = \"音量增大\"\n\
+menu.vol_down = \"音量减小\"\n\
+menu.browser = \"文件浏览器\"\n\
+menu.cover = \"专辑封面\"\n\
+menu.lyrics = \"歌词\"\n\
+menu.spectrum = \"频谱\"\n\
+menu.group = \"播放列表分组\"\n\
+menu.eq = \"均衡器\"\n\
+menu.compressor = \"压缩器\"\n\
+menu.dsp = \"DSP\"\n\
+menu.tag_edit = \"标签编辑\"\n\
+menu.convert = \"格式转换\"\n\
+menu.cover_mgmt = \"封面管理\"\n\
+menu.output_device = \"输出设备（自动跟随）\"\n\
+menu.replaygain = \"ReplayGain 响度归一\"\n\
+msg.cover_fail = \"封面解码失败（已跳过）\"\n\
+msg.unknown_format = \"未知格式\"\n\
+msg.consecutive_fail = \"连续 10 首无法播放，已停止自动切换\"\n\
+msg.quit_hint = \"退出请按 q 或 Ctrl+C\"\n\
+msg.usage_vol = \"用法：volume <0-100>\"\n\
+msg.repeat_off = \"循环：关闭\"\n\
+msg.repeat_list = \"循环：列表\"\n\
+msg.repeat_single = \"循环：单曲\"\n\
+msg.usage_bm_jump = \"用法：bookmark-jump <序号>\"\n\
+msg.m3u_empty = \"m3u 中无有效路径\"\n\
+msg.no_current = \"无当前曲目\"\n\
+msg.bm_empty = \"暂无书签\"\n\
+msg.bm_not_found = \"无此书签\"\n\
+msg.bm_no_file = \"书签文件不存在\"\n\
+msg.plugin_eq_missing = \"均衡器插件未加载 · 按 u 加载\"\n\
+msg.plugin_comp_missing = \"压缩器插件未加载 · 按 u 加载\"\n\
+msg.eq_enabled = \"已启用 · e 旁路\"\n\
+msg.eq_bypassed = \"已旁路 · e 恢复\"\n\
+msg.eq_hint = \"↑↓ ±1dB · ←→ 切段 · e 旁路 · r 恢复默认 · u 卸载 · Esc 关闭\"\n\
+msg.eq_hint_load = \"u 加载插件 · Esc 关闭\"\n\
+msg.comp_hint = \"↑↓ 调 · ←→ 切 · e 旁路 · r 恢复默认 · u 卸载 · Esc 关闭\"\n\
+msg.comp_threshold = \"阈值\"\n\
+msg.comp_ratio = \"压缩比\"\n\
+msg.comp_attack = \"启动\"\n\
+msg.comp_release = \"释放\"\n\
+panel.filter = \"滤波器\"\n\
+filter.hint = \"上下调·左右切·e旁路·r重置·Esc关闭\"\n\
+msg.comp_makeup = \"补偿\"\n\
+filter.on = \"开\"\n\
+menu.filter = \"滤波器\"\n\
+filter.cutoff = \"截止\"\n\
+filter.resonance = \"谐振\"\n\
+filter.off = \"关\"\n\
+msg.no_visual = \"无可视化插件画面（plugins/ 下放「可视化-*」插件并经签名后重启）\"\n\
+msg.output_device_info = \"输出设备：自动跟随系统默认输出——插拔耳机/连断蓝牙约 2 秒内自动切换续播；手动指定设备暂未提供\"\n\
+msg.feature_na = \"该功能暂未提供（随插件/后续版本开放）\"\n\
+msg.rg_on = \"已开启\"\n\
+msg.rg_off = \"已关闭\"\n\
+msg.lang_switched = \"已切换为{}\"\n\
+msg.engine_fail = \"音频引擎初始化失败，播放功能不可用：{}\"\n\
+msg.medium = \"介质\"\n\
+msg.bm_jump = \"跳到书签：{}\"\n\
+msg.bm_deleted = \"已删书签：{}\"\n\
+msg.no_visual_pick = \"无可视化插件（plugins/ 下放「可视化-*」插件并重启）\"\n\
+empty.playlist = \"（空）按 b 打开浏览器，a 加入列表\"\n\
+group.unknown_album = \"未知专辑\"\n\
+group.track_count = \"{}首\"\n\
+spectrum.low = \"低\"\n\
+spectrum.mid = \"中\"\n\
+spectrum.high = \"高\"\n\
+medium.none = \"关闭（原始输出）\"\n\
+medium.tape_clear = \"磁带·透明（高保真）\"\n\
+medium.tape_white = \"磁带·白色（清新）\"\n\
+medium.tape_classic = \"磁带·深棕（经典）\"\n\
+medium.tape_aged = \"磁带·红色（老化）\"\n\
+medium.vinyl_clean = \"黑胶·蓝色（低噪声）\"\n\
+medium.vinyl_dynamic = \"黑胶·红色（高动态）\"\n\
+medium.vinyl_standard = \"黑胶·黑色（标准）\"\n\
+medium.vinyl_aged = \"黑胶·彩胶（老化）\"\n\
+medium.unknown = \"未知介质\"\n\
+# —— 关于弹窗 ——\n\
+about.brand = \"tuneux-fx · FreeYouth\"\n\
+about.tagline = \"插件化命令行音乐播放器\"\n\
+about.plugins_cat = \"插件\"\n\
+about.formats = \"支持 MP3 · FLAC · WAV · OGG · OPUS · WV · M4A · AAC · ALAC\"\n\
+about.keys1 = \"空格 播放/暂停 · n/p 下一曲/上一曲 · ←→ ±5秒 · +/- 音量\"\n\
+about.keys2 = \"b 浏览器 · c 封面 · l 歌词 · v 频谱 · g 分组 · a 加入\"\n\
+about.keys3 = \"F10 菜单 · : 命令 · m 介质 · ? 关于 · q 退出\"\n\
+about.deps = \"基于以下开源项目构建：\"\n\
+about.dep_audio = \"音频  cpal · symphonia · opus-decoder · rubato · rustfft · ringbuf\"\n\
+about.dep_ui = \"界面  ratatui · crossterm · image · unicode-width\"\n\
+about.dep_common = \"通用  serde · toml · dirs · encoding_rs · crossbeam-channel\"\n\
+about.dep_plugin = \"插件  wasmi · ed25519-dalek\"\n\
+about.dep_platform = \"平台  zbus（Linux）· rdev（Windows）\"\n\
+about.license = \"本项目采用木兰宽松许可证 v2（MulanPSL-2.0）\"\n\
+about.copyright = \"© 不羁的青春（FreeYouth）\"\n\
+about.close = \"按任意键关闭\"\n\
+search.esc_exit_search = \"（无匹配）Esc 退出搜索\"\n\
+menu.lang_select = \"语言…\"\n\
+menu.skin_select = \"皮肤配色…\"\n\
+menu.visual = \"可视化面板\"\n\
+menu.about = \"关于 / 快捷键速查\"\n\
+fkey.bar = \"1-8菜单  F5-F8面板  F9均衡器  F10菜单  ?帮助\"\n\
+empty.cover = \"（无封面）\n按 c 隐藏\"\n\
+empty.dir = \"（空目录）\"\n\
+empty.lyrics = \"（无歌词）\n放置同名 .lrc 或在标签内嵌歌词（USLT/LYRICS）可显示\"\n\
+empty.playlist_short = \"（播放列表为空）\n按 c 隐藏\"\n\
+msg.added = \"已加入 {} 首\"\n\
+msg.all_dup = \"未加入新曲目（均已存在）\"\n\
+msg.bm_unknown_album = \"未知专辑\"\n\
+msg.clear_confirm = \"再按一次 x 确认清空播放列表\"\n\
+msg.cleared = \"播放列表已清空\"\n\
+msg.cue_fail = \"cue 解析失败或 FILE 引用的音频文件不存在\"\n\
+msg.empty = \"（未播放）\"\n\
+msg.no_music = \"目录中无音乐文件\"\n\
+msg.scan_dir = \"正在扫描目录\"\n\
+msg.skipped_data = \"已跳过 {} 条数据轨（不可播放）\"\n\
+msg.thread_fail = \"线程启动失败\"\n\
+search.esc_exit = \"Esc 退出\"\n\
+search.truncated = \"目录过大，仅搜索前 2 万条\"\n\
+cmd.execute = \"回车执行 · Esc 取消\"\n\
+msg.bm_added = \"书签已添加：{} @ {}s\"\n\
+msg.bm_updated = \"书签已更新：{} @ {}s\"\n\
+msg.error = \"错误\"\n\
+msg.load_fail = \"加载失败\"\n\
+msg.loaded = \"已加载 {} 首\"\n\
+msg.lyrics_offset = \"歌词偏移\"\n\
+msg.rg_state = \"ReplayGain\"\n\
+msg.save_fail = \"保存失败\"\n\
+msg.saved_m3u = \"已保存 {} 首到 {}\"\n\
+msg.unknown_cmd = \"未知命令：{}（输入 help）\"\n\
+msg.usage_bm_del = \"用法：bookmark-del <索引>\"\n\
+msg.usage_repeat = \"用法：repeat <off|list|single>\"\n\
+msg.vol_set = \"音量已设为 {}%\"\n\
+skin.default_dos = \"默认（DOS）\"\n\
+skin.hint = \"↑↓ 预览 · Enter 确认 · Esc 取消\"\n\
+skin.terminal_native = \"终端原生\"\n\
+",
+    )
+}
+
+/// 构建 i18n 查询器：请求语言表（`locales/<lang>.txt`，exe 同目录）+ zh 内置兜底。
+/// `lang == "zh"` 或文件缺失时 primary 为空表，走 zh 兜底；绝不 panic。
+pub(crate) fn build_i18n(lang: &str) -> tuneux_commonx::I18n {
+    // 加载机制已下沉 commonx（唯一实现）；zh 表留在本 crate（完整性校验守护）。
+    tuneux_commonx::build_i18n(lang, zh_table())
+}
+
+/// 扫描可用语言：内置 zh + exe 同目录 locales/*.txt。
+/// 返回 (lang_id, display_name) 列表，按字母排序（zh 始终第一）。
+/// display_name 取 .txt 首行 `# display: xxx` 注释；无注释时用文件名。
+pub(crate) fn scan_langs() -> Vec<(String, String)> {
+    // 语言扫描机制已下沉 commonx（唯一实现，三产品同源）。
+    tuneux_commonx::scan_langs()
 }
 
 // 循环播放模式（三态：Off / Single / List）下沉在数据层共享，
@@ -49,20 +261,18 @@ pub fn repeat_label(mode: RepeatMode) -> &'static str {
 // `crate::config::RepeatMode` 既有引用路径不变。
 pub use tuneux_mediax::RepeatMode;
 
-/// 播放列表的显示模式。
-///
-/// `g` 键切换，存入配置，下次启动恢复。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum PlaylistView {
-    /// 按专辑分组显示。
-    ByAlbum,
-    /// 平铺多列大排行（曲名/艺术家/时长，参照 foobar2000，fx 默认）。
-    #[default]
-    Flat,
+// 播放列表显示模式（Flat/ByAlbum）下沉在数据层（tuneux-mediax），
+// serde 表示（"flat"/"by_album"）已冻结；此处重导出保持
+// `crate::config::PlaylistView` 既有引用路径不变。
+pub use tuneux_mediax::PlaylistView;
+
+/// 播放列表显示模式的默认值（fx：平铺大排行）。
+fn default_playlist_view() -> PlaylistView {
+    PlaylistView::Flat
 }
 
-/// 可视化面板的显示模式（`v` 键切换：关 → 频谱半屏 → 频谱全屏 → 示波器 → 插件面板 → 关）。
+/// 可视化面板的显示模式（`v` 键切换：关 → 频谱半屏 → 频谱全屏 → 示波器 →
+/// 插件面板 → 指针表 → 关）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SpectrumMode {
@@ -77,17 +287,20 @@ pub enum SpectrumMode {
     Oscilloscope,
     /// 插件可视化面板（「可视化-*」插件输出的字符画）占满整个主区。
     Plugin,
+    /// 指针表（灰阶 2.5D 字符网格的仿真 VU 指针表，L/R 双表）。
+    Gauge,
 }
 
 impl SpectrumMode {
-    /// 循环到下一模式：Hidden → Half → Full → Oscilloscope → Plugin → Hidden。
+    /// 循环到下一模式：Hidden → Half → Full → Oscilloscope → Plugin → Gauge → Hidden。
     pub fn next(self) -> Self {
         match self {
             SpectrumMode::Hidden => SpectrumMode::Half,
             SpectrumMode::Half => SpectrumMode::Full,
             SpectrumMode::Full => SpectrumMode::Oscilloscope,
             SpectrumMode::Oscilloscope => SpectrumMode::Plugin,
-            SpectrumMode::Plugin => SpectrumMode::Hidden,
+            SpectrumMode::Plugin => SpectrumMode::Gauge,
+            SpectrumMode::Gauge => SpectrumMode::Hidden,
         }
     }
 }
@@ -162,7 +375,7 @@ pub struct Config {
     pub shuffle: bool,
 
     /// 播放列表显示模式（平铺 / 按专辑分组）。
-    #[serde(default)]
+    #[serde(default = "default_playlist_view")]
     pub playlist_view: PlaylistView,
 
     /// 频谱显示模式（关 / 半屏 / 全屏 / 示波器 / 插件面板），退出时保留。
@@ -230,6 +443,12 @@ pub struct Config {
     /// 可能与其他播放器冲突——用户可设 `media_keys_enabled = false` 关闭。
     #[serde(default = "default_media_keys_enabled")]
     pub media_keys_enabled: bool,
+
+    /// 界面语言：`"zh"` 默认（内置中文表）；其它语言读 `locales/<lang>.txt`。
+    /// 自由字符串（非封闭枚举），空串回落 `"zh"`；fx 经菜单「设置 → 语言」
+    /// 切换就地重建语言表、立即生效（基础版启动时读取）。
+    #[serde(default = "default_lang")]
+    pub lang: String,
 }
 
 /// 默认音量：1.0（满音量）。
@@ -258,121 +477,9 @@ fn default_media_keys_enabled() -> bool {
     true
 }
 
-/// 解析并规范化一条自定义键描述（`keymap` 的值），返回规范形式；非法返回 None。
-///
-/// # 语法
-///
-/// 键描述 = `[shift+][ctrl+][alt+]<键名>`。修饰符大小写不敏感、顺序不敏感
-/// （输出统一为 shift → ctrl → alt），段间可含空白。`<键名>` 为：
-///
-/// - **单个字符**：直接写字符本身，如 `"n"`、`"+"`、`"-"`、`"="`。
-///   `" "`（单空格）等价于 `"space"`。
-/// - **具名键**（小写、别名见下）：`"space"`、`"tab"`、`"enter"`（别名
-///   `"return"`）、`"esc"`（别名 `"escape"`）、`"backspace"`（别名 `"delete"`）、
-///   `"up"`、`"down"`、`"left"`、`"right"`、`"home"`、`"end"`。
-///
-/// 修饰符 **shift 仅对字母键有意义**（如 `"shift+n"`）：符号键的 Shift 是
-/// 打出符号本身所需，键描述里不写 shift（`"+"` 即代表加号键）。
-///
-/// 示例：`"n"` → `"n"`；`"space"` → `"space"`；`"Shift+N"` → `"shift+n"`；
-/// `"ctrl+c"` → `"ctrl+c"`；`"+"` → `"+"`。
-///
-/// # 返回 None（该映射被忽略，回退内置默认键）的情形
-///
-/// 空串、纯修饰符（如 `"shift+"`）、多个键名（如 `"ab"`）、未知键名
-/// （如 `"f1"`、`"foo"`）。
-pub fn parse_key_desc(desc: &str) -> Option<String> {
-    // 单空格直接代表空格键
-    if desc == " " {
-        return Some("space".to_string());
-    }
-
-    // 单字符键（含 '+'、'-' 等会被 split('+') 拆散的特殊字符）直接规范化；
-    // 单字符不可能携带修饰符。
-    let trimmed = desc.trim();
-    if trimmed.chars().count() == 1 {
-        return canonical_key_name(trimmed, false);
-    }
-
-    let mut shift = false;
-    let mut ctrl = false;
-    let mut alt = false;
-    let mut base: Option<&str> = None;
-
-    // 按 '+' 拆分修饰符与键名；'+' 键本身已在上面的单字符分支处理。
-    for part in trimmed.split('+') {
-        let p = part.trim();
-        if p.is_empty() {
-            return None; // 空段（如 "shift++n"）
-        }
-        match p.to_ascii_lowercase().as_str() {
-            "shift" => shift = true,
-            "ctrl" | "control" => ctrl = true,
-            "alt" | "option" | "meta" => alt = true,
-            _ => {
-                // 非修饰符段即键名；键名只能出现一次
-                if base.is_some() {
-                    return None;
-                }
-                base = Some(p);
-            }
-        }
-    }
-
-    let base = base?; // 纯修饰符（无键名）
-    let canonical = canonical_key_name(base, shift)?;
-
-    // 按固定顺序拼出规范形式
-    let mut out = String::new();
-    if shift {
-        out.push_str("shift+");
-    }
-    if ctrl {
-        out.push_str("ctrl+");
-    }
-    if alt {
-        out.push_str("alt+");
-    }
-    out.push_str(&canonical);
-    Some(out)
-}
-
-/// 把键名部分规范化为小写具名键或单字符（字母 + shift 时统一小写）。
-///
-/// 输出格式与按键事件侧的规范键描述保持同一格式，二者对齐后才能
-/// 命中映射（自定义键位接入按键处理后生效，见 Config.keymap 字段说明）。
-fn canonical_key_name(name: &str, shift: bool) -> Option<String> {
-    // 具名键：大小写不敏感
-    let named = match name.to_ascii_lowercase().as_str() {
-        "space" => Some("space"),
-        "tab" => Some("tab"),
-        "enter" | "return" => Some("enter"),
-        "esc" | "escape" => Some("esc"),
-        "backspace" | "delete" => Some("backspace"),
-        "up" => Some("up"),
-        "down" => Some("down"),
-        "left" => Some("left"),
-        "right" => Some("right"),
-        "home" => Some("home"),
-        "end" => Some("end"),
-        _ => None,
-    };
-    if let Some(n) = named {
-        return Some(n.to_string());
-    }
-
-    // 单字符键：字母 + shift 时统一小写（与 key_to_desc 一致），其余原样
-    let mut chars = name.chars();
-    let c = chars.next()?;
-    if chars.next().is_some() {
-        return None; // 多字符且非具名键 → 未知
-    }
-    let c = if shift && c.is_ascii_alphabetic() {
-        c.to_ascii_lowercase()
-    } else {
-        c
-    };
-    Some(c.to_string())
+/// 界面语言默认值：中文。
+fn default_lang() -> String {
+    "zh".to_string()
 }
 
 /// 手动实现 Default：音量默认满音量 1.0（而非 f32 派生的 0.0 静音），
@@ -385,7 +492,7 @@ impl Default for Config {
             repeat: RepeatMode::default(),
             skin: String::new(),
             shuffle: false,
-            playlist_view: PlaylistView::Flat,
+            playlist_view: default_playlist_view(),
             spectrum_mode: SpectrumMode::Hidden,
             lyrics_mode: LyricsMode::Hidden,
             lyrics_offset: 0.0,
@@ -397,6 +504,7 @@ impl Default for Config {
             dedup_on_add: default_dedup_on_add(),
             keymap: HashMap::new(),
             media_keys_enabled: default_media_keys_enabled(),
+            lang: default_lang(),
         }
     }
 }
@@ -468,45 +576,14 @@ impl PlaylistState {
     }
 }
 
-/// 计算"exe 同目录优先、系统目录回退"的某文件路径。
-///
-/// 处理逻辑：
-/// 1. 取 exe 所在目录，若该目录下已存在该文件（说明此前用过便携模式），
-///    或该目录可写（尝试创建临时探测文件验证），则使用 `exe_dir/文件`。
-/// 2. 否则回退到系统配置目录 `config_dir/tuneux-fx/文件`，并自动创建中间目录。
-///
-/// 注：探测可写性而非依赖权限判断，是因为跨平台权限模型差异大
-/// （Windows ACL、Unix umask），实测最可靠。
-fn portable_path(filename: &str) -> PathBuf {
-    // 尝试路径 1：exe 同目录
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join(filename);
-            // 文件已存在 → 沿用便携模式（即使目录现变为只读，也尊重既有文件）
-            // 文件不存在但目录可写 → 新建便携文件
-            if candidate.exists() || is_writable(dir) {
-                return candidate;
-            }
-        }
-    }
-
-    // 回退路径 2：系统配置目录（tuneux-fx 独立目录，与基础版隔离）
-    let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-    path.push("tuneux-fx");
-    // 回退目录不存在时自动创建（首次运行），失败忽略——save 时再处理错误
-    let _ = std::fs::create_dir_all(&path);
-    path.push(filename);
-    path
-}
-
 /// 配置文件 `tuneux-fx.toml` 的存储路径。
 pub fn config_path() -> PathBuf {
-    portable_path("tuneux-fx.toml")
+    tuneux_commonx::portable_path("tuneux-fx.toml", "tuneux-fx")
 }
 
 /// 播放状态文件 `tuneux-fx-playlist.toml` 的存储路径（与基础版分离，避免互覆盖）。
 pub fn playlist_state_path() -> PathBuf {
-    portable_path("tuneux-fx-playlist.toml")
+    tuneux_commonx::portable_path("tuneux-fx-playlist.toml", "tuneux-fx")
 }
 
 /// 插件目录解析（只读：加载 .wasm / .manifest / .sig）。
@@ -542,26 +619,7 @@ pub fn plugins_dir() -> PathBuf {
 
 /// 插件加载核查日志文件 `tuneux-fx-plugins.log` 的存储路径（追加式核查记录）。
 pub fn plugin_log_path() -> PathBuf {
-    portable_path("tuneux-fx-plugins.log")
-}
-
-/// 探测目录是否可写：尝试创建并删除一个临时探测文件。
-///
-/// 返回 true 表示可写。任何 IO 错误（权限不足、只读文件系统、路径不存在）
-/// 均视为不可写，返回 false。
-fn is_writable(dir: &Path) -> bool {
-    let probe = dir.join(".tuneux_write_probe");
-    let writable = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&probe)
-        .is_ok();
-    // 探测成功后清理临时文件；失败也无妨，下次启动会覆盖
-    if writable {
-        let _ = std::fs::remove_file(&probe);
-    }
-    writable
+    tuneux_commonx::portable_path("tuneux-fx-plugins.log", "tuneux-fx")
 }
 
 /// keymap 合法动作名白名单（与 tui/app/mod.rs 键处理支持的动作一致）。
@@ -575,33 +633,6 @@ const KEYMAP_ACTIONS: &[&str] = &["toggle_play", "next", "prev", "volume_up", "v
 /// 退出路径是安全底线——q / Ctrl+C 被映射走后，用户配置失误将无法退出
 /// 程序（手册「q / Ctrl+C 不可重映射」的承诺由本清单兑现）。
 const RESERVED_KEYS: &[&str] = &["q", "ctrl+c"];
-
-pub(crate) fn validate_keymap(keymap: &mut HashMap<String, String>) {
-    keymap.retain(|action, desc| {
-        let action_ok = KEYMAP_ACTIONS.contains(&action.as_str());
-        // 键描述必须可解析：加载期即拒绝，而非运行期静默不生效。
-        let parsed = parse_key_desc(desc);
-        if !action_ok || parsed.is_none() {
-            eprintln!(
-                "[配置] 忽略非法快捷键映射：动作 {action}（描述 {desc}）——合法动作：{}",
-                KEYMAP_ACTIONS.join(" / ")
-            );
-            return false;
-        }
-        // 保留键拒绝（q / Ctrl+C 退出底线，不可重映射；大小写不敏感——
-        // 规范化对 ctrl+字母保留原大小写，"Ctrl+C" 规范为 "ctrl+C"）。
-        if parsed
-            .as_deref()
-            .is_some_and(|d| RESERVED_KEYS.iter().any(|r| r.eq_ignore_ascii_case(d)))
-        {
-            eprintln!(
-                "[配置] 忽略保留键映射：动作 {action}（描述 {desc}）——q / Ctrl+C 为退出键，不可重映射"
-            );
-            return false;
-        }
-        true
-    });
-}
 
 /// 前代同名产品（tuneux）同名文件的候选路径：exe 同目录 → 系统配置目录。
 /// 仅供首次启动继承使用（本产品自身配置文件不存在时）。
@@ -658,17 +689,15 @@ pub fn load() -> Config {
         Config::default()
     };
     // 校验并清理自定义快捷键（剔除非法动作，避免静默失效）
-    validate_keymap(&mut cfg.keymap);
+    validate_keymap(&mut cfg.keymap, KEYMAP_ACTIONS, RESERVED_KEYS);
     // 浮点字段净化：手写成 nan/inf 时 clamp 失效（NaN 比较全 false），
     // 会导致 0 宽度浏览器不可见 / 音量归零等，回退默认值。
-    if !cfg.browser_ratio.is_finite() {
-        cfg.browser_ratio = default_browser_ratio();
-    }
-    if !cfg.lyrics_offset.is_finite() {
-        cfg.lyrics_offset = 0.0;
-    }
-    if !cfg.volume.is_finite() {
-        cfg.volume = default_volume();
+    cfg.browser_ratio = sanitize_f32(cfg.browser_ratio, default_browser_ratio());
+    cfg.lyrics_offset = sanitize_f64(cfg.lyrics_offset, 0.0);
+    cfg.volume = sanitize_f32(cfg.volume, default_volume());
+    // 语言字段净化：空串/纯空白回落 zh。
+    if cfg.lang.trim().is_empty() {
+        cfg.lang = default_lang();
     }
     cfg
 }
@@ -760,6 +789,7 @@ fn atomic_write(path: &Path, content: &str) -> ConfigResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tuneux_commonx::parse_key_desc;
 
     /// 循环模式切换顺序正确：Off → Single → List → Off。
     #[test]
@@ -767,6 +797,27 @@ mod tests {
         assert_eq!(RepeatMode::Off.next(), RepeatMode::Single);
         assert_eq!(RepeatMode::Single.next(), RepeatMode::List);
         assert_eq!(RepeatMode::List.next(), RepeatMode::Off);
+    }
+
+    /// zh_table key 卫生：每个 key 都是干净的 `[a-z][a-z0-9_.]*` 形态。
+    ///
+    /// 守护内嵌字符串的续行符写法（`\n\` 多写一个反斜杠会把字面 `\n`
+    /// 粘到下一个 key 前面——源码级 grep 看不到，只有运行时才暴露，
+    /// 污染后的 key 查不到、中文界面会直接显示原始 key）。
+    #[test]
+    fn zh_table_keys_are_clean() {
+        let zh = zh_table();
+        assert!(
+            zh.len() >= 170,
+            "zh_table 应至少 170 条（当前 {}）",
+            zh.len()
+        );
+        for k in zh.keys() {
+            let shaped = k.starts_with(|c: char| c.is_ascii_lowercase())
+                && k.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_');
+            assert!(shaped, "key 形态异常: {k:?}");
+        }
     }
 
     /// 旧配置兼容：repeat 字段沿用冻结表示（"off"/"single"/"list"）解析。
@@ -808,6 +859,7 @@ mod tests {
                 ("volume_up".to_string(), "+".to_string()),
             ]),
             media_keys_enabled: true,
+            lang: default_lang(),
         };
         save_to(&tmp, &original).expect("保存应成功");
         let loaded = load_from(&tmp).expect("加载应成功");
@@ -1228,7 +1280,7 @@ mod tests {
             ("volume_up".to_string(), "f5".to_string()),  // 非法：F 键不可自定义
             ("volume_down".to_string(), "bogus key".to_string()), // 非法：无法解析
         ]);
-        validate_keymap(&mut map);
+        validate_keymap(&mut map, KEYMAP_ACTIONS, RESERVED_KEYS);
         assert!(!map.contains_key("toggle_play"), "q 映射应被拒绝");
         assert!(
             !map.contains_key("next"),
