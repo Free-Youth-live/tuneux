@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
-# tuneux · pre-push 检查钩子 v3.1（源码入库：tools/hooks/pre-push）
+# tuneux · pre-push 检查钩子 v3.2（源码入库：tools/hooks/pre-push）
+#
+# v3.2（2026-10-09）相对 v3.1 的变更：
+#   1. R2b 二进制资产冻结：ttf/otf/woff(2)/icns/ico 禁就地修改（M），
+#      只许首入(A)与删除(D)——换版本=新文件名+删旧文件（纪律见 006 二进制资产冻结节）；
 #
 # v3.1（2026-10-08）相对 v3 的变更：
 #   1. PATH_ALLOW 增补 ^assets/（顶层图标资源：hicolor / icns / ico，
@@ -58,7 +62,7 @@ PATH_ALLOW='^(crates/|plugins/|tools/|locales/|assets/)|^\.github/workflows/(rel
 
 fail=0
 
-scan_commit() { # scan_commit <sha>：R2 + R3（退出码：0=命中/违规，1=干净，≥2=扫描失败）
+scan_commit() { # scan_commit <sha>：R2 + R2b + R3（退出码：0=命中/违规，1=干净，≥2=扫描失败）
   local c="$1" hits bad rc tree
   # R2 内容黑名单（退出码 ≥2 必须拒推，不得静默放行）
   hits=$(git -c core.quotePath=false grep -IiE "$CONTENT_RE" "$c" -- .); rc=$?
@@ -73,6 +77,15 @@ scan_commit() { # scan_commit <sha>：R2 + R3（退出码：0=命中/违规，1=
     echo "❌ [$c] 敏感内容扫描失败（git grep 错误码 $rc）"; fail=1
   elif [ $rc -eq 0 ]; then
     echo "❌ [$c] 树内容含敏感信息（私钥/本机路径/旧种子名）："; echo "$hits" | head -5; fail=1
+  fi
+  # R2b（2026-10-09）二进制资产冻结：ttf/otf/woff(2)/icns/ico 只许首入(A)与
+  # 删除(D)，禁就地修改(M)——git 对二进制无增量，每改一次全量进历史。
+  # 换版本 = 新文件名（建议含版本号）+ 删旧文件；纪律细则见 006 二进制资产冻结节。
+  hits=$(git diff-tree --no-commit-id --name-status -r "$c" -- \
+    '*.ttf' '*.otf' '*.woff' '*.woff2' '*.icns' '*.ico' 2>/dev/null | grep -E '^M' || true)
+  if [ -n "$hits" ]; then
+    echo "❌ [$c] 就地修改了已入库的二进制资产（冻结纪律：换版本=新文件名+删旧文件）："
+    echo "$hits" | head -5; fail=1
   fi
   # R3 路径白名单（先取树再过滤：pipefail 会把 ls-tree 失败掩成「干净」，必须分开判）
   tree=$(git -c core.quotePath=false ls-tree -r --name-only "$c"); rc=$?
