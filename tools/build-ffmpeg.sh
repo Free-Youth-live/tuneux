@@ -102,12 +102,19 @@ SRC="$WORK/ffmpeg-$FF_VERSION"
 
 # —— 第 3 步：configure + make（LGPL 规格） ——
 echo "· configure（$FF_CONFIGURE_ARGS ${FFMPEG_CROSS_OPTS}）"
-( cd "$BUILD" && "$SRC/configure" \
+# 失败留末 30 行（configure 输出上百行，真正的错误行不在末 3 行——
+# tail -3 只剩通用求助文本，CI 上无从判断病因，白搭一轮往返）。
+if ! ( cd "$BUILD" && "$SRC/configure" \
     --cc="$CC_BIN" \
     $FF_CONFIGURE_ARGS \
     ${FFMPEG_CROSS_OPTS:-} \
     ${FFMPEG_EXTRA_CFLAGS:+--extra-cflags="$FFMPEG_EXTRA_CFLAGS"} \
-    2>&1 | tail -3 )
+    ) > "$OUT/configure.log" 2>&1; then
+  echo "❌ configure 失败，末 30 行："
+  tail -30 "$OUT/configure.log"
+  exit 1
+fi
+tail -3 "$OUT/configure.log"
 echo "· make -j$JOBS"
 # 成功时保持静默（FFmpeg 构建输出上万行，会淹没 CI 日志）；失败时留末 40 行。
 # 交叉编译（zig cc / msys2 mingw64 / mac x86_64 交叉）是本脚本最易失败处，
