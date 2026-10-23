@@ -129,6 +129,24 @@ tuneux-max 使用手册（速查版）__VERSION__
   · 大目录导入：多线程并行读标签（目录遍历+标签工人池），
     UI 全程不卡
 
+【FFmpeg 扩展格式】
+  核心格式纯 Rust 解码；APE / WMA / FLV / TAK / AC3 / DTS / DSD 等
+  检测到 FFmpeg 组件（随包附带或系统自装）时自动调用其解码。
+  FFmpeg 为进程外独立组件（不链接），随包附带的是官方源码未修改
+  LGPL 构建，义务文本见包内 ffmpeg/ 目录与 THIRD-PARTY-LICENSES.txt。
+  · 开箱即播（无需任何配置）：APE / WMA / FLV / TAK / AC3 / DTS /
+    DSD（DSF、DFF）等长尾格式，以及视频文件的音轨（mkv / avi / ts
+    等容器，只出声音不出画面）
+  · 随包组件位置（启动时自动探测，不需配置）：
+    macOS   —— .app 内 Contents/Resources/ffmpeg/
+    Windows —— 解压后与 tuneux-max.exe 同层的 ffmpeg/
+  · 组件缺失时：核心格式与其余全部功能不受影响；打开上述扩展格式
+    会提示不支持，不崩溃、不需配置
+  · 自装（组件缺失或精简包时）：装好系统 ffmpeg 并置于 PATH 即可
+    被自动探测——Windows `winget install ffmpeg`、macOS
+    `brew install ffmpeg`、Linux `sudo apt install ffmpeg`；
+    许可与合规细节见 README「关于 FFmpeg」
+
 【数据与持久化】
   配置/布局/书签/预设/断点/增益缓存 随配置文件持久化；
   播放列表状态（曲目/选中/循环/随机）重启恢复。

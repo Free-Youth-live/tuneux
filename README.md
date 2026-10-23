@@ -2,7 +2,7 @@
 
 # **不羁的青春**® **FreeYouth**®
 
-> 一个音乐播放器系列，含三个产品：TUI 的 tuneux（基础版）与 tuneux-fx（插件版），以及 GUI 的 tuneux-max（以应用程序形态交付，双击启动、不提供命令行入口）。
+> 一个音乐播放器系列，含三个产品：TUI 的 tuneux（基础版）与 tuneux-fx（插件版），以及 GUI 的 tuneux-max。
 > 用 Rust 编写，跨平台。
 
 ## 特性
@@ -215,33 +215,33 @@ cargo run --release -p tuneux-max
 
 ## 下载与首次运行
 
-| 系统      | CPU 架构              | 文件（以 v0.6.0 为例）                     |
-| ------- | ------------------- | ----------------------------------- |
-| Windows | x86_64（多数 PC）       | `tuneux-0.6.0-windows-x86_64.zip`   |
-| Windows | arm64               | `tuneux-0.6.0-windows-arm64.zip`    |
-| macOS   | Apple Silicon（M 系列） | `tuneux-0.6.0-macos-arm64.tar.gz`   |
-| macOS   | Intel               | `tuneux-0.6.0-macos-x86_64.tar.gz`  |
-| Linux   | x86_64              | `tuneux-0.6.0-linux-x86_64.tar.gz`  |
-| Linux   | arm64               | `tuneux-0.6.0-linux-arm64.tar.gz`   |
+| 系统      | CPU 架构              | 文件（以 v0.6.0 为例）                    |
+| ------- | ------------------- | ---------------------------------- |
+| Windows | x86_64（多数 PC）       | `tuneux-0.6.0-windows-x86_64.zip`  |
+| Windows | arm64               | `tuneux-0.6.0-windows-arm64.zip`   |
+| macOS   | Apple Silicon（M 系列） | `tuneux-0.6.0-macos-arm64.tar.gz`  |
+| macOS   | Intel               | `tuneux-0.6.0-macos-x86_64.tar.gz` |
+| Linux   | x86_64              | `tuneux-0.6.0-linux-x86_64.tar.gz` |
+| Linux   | arm64               | `tuneux-0.6.0-linux-arm64.tar.gz`  |
 
 插件版 **tuneux-fx** 另有一套下载包（以 v0.6.0 为例），压缩包内额外含 `plugins/` 插件目录（均衡器 / 压缩器 / 皮肤「Norton 蓝」「午夜蓝」）与《插件开发指南.txt》：
 
-| 系统      | CPU 架构              | 文件                                     |
-| ------- | ------------------- | -------------------------------------- |
-| Windows | x86_64（多数 PC）       | `tuneux-fx-0.6.0-windows-x86_64.zip`   |
-| Windows | arm64               | `tuneux-fx-0.6.0-windows-arm64.zip`    |
-| macOS   | Apple Silicon（M 系列） | `tuneux-fx-0.6.0-macos-arm64.tar.gz`   |
-| macOS   | Intel               | `tuneux-fx-0.6.0-macos-x86_64.tar.gz`  |
-| Linux   | x86_64              | `tuneux-fx-0.6.0-linux-x86_64.tar.gz`  |
-| Linux   | arm64               | `tuneux-fx-0.6.0-linux-arm64.tar.gz`   |
+| 系统      | CPU 架构              | 文件                                    |
+| ------- | ------------------- | ------------------------------------- |
+| Windows | x86_64（多数 PC）       | `tuneux-fx-0.6.0-windows-x86_64.zip`  |
+| Windows | arm64               | `tuneux-fx-0.6.0-windows-arm64.zip`   |
+| macOS   | Apple Silicon（M 系列） | `tuneux-fx-0.6.0-macos-arm64.tar.gz`  |
+| macOS   | Intel               | `tuneux-fx-0.6.0-macos-x86_64.tar.gz` |
+| Linux   | x86_64              | `tuneux-fx-0.6.0-linux-x86_64.tar.gz` |
+| Linux   | arm64               | `tuneux-fx-0.6.0-linux-arm64.tar.gz`  |
 
-GUI 版 **tuneux-max** 以平台原生应用包交付（双击启动，不提供命令行入口）：
+GUI 版 **tuneux-max** 以平台原生应用包交付：
 
-| 系统      | CPU 架构              | 文件（以 v0.6.0 为例）                                              |
-| ------- | ------------------- | ------------------------------------------------------------ |
-| macOS   | Apple Silicon（M 系列） | `tuneux-max-0.6.0-macos-arm64.zip`（内含 `tuneux-max.app`）      |
-| macOS   | Intel               | `tuneux-max-0.6.0-macos-x86_64.zip`（内含 `tuneux-max.app`）     |
-| Windows | x86_64              | `tuneux-max-0.6.0-windows-x86_64.zip`                        |
+| 系统      | CPU 架构              | 文件（以 v0.6.0 为例）                                          |
+| ------- | ------------------- | -------------------------------------------------------- |
+| macOS   | Apple Silicon（M 系列） | `tuneux-max-0.6.0-macos-arm64.zip`（内含 `tuneux-max.app`）  |
+| macOS   | Intel               | `tuneux-max-0.6.0-macos-x86_64.zip`（内含 `tuneux-max.app`） |
+| Windows | x86_64              | `tuneux-max-0.6.0-windows-x86_64.zip`                    |
 
 > macOS 包解压后外层还有一层版本文件夹，里面是 `tuneux-max.app` 与《使用手册-tuneux-max.txt》（同级）；
 > 首次打开见下面的「macOS 首次运行（tuneux-max）」。
