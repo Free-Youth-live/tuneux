@@ -173,9 +173,13 @@ impl ScanPool {
 
 /// 音频扩展名判断（与 corex KNOWN_AUDIO_EXTS 同源）。
 fn is_audio_ext(ext: &str) -> bool {
+    // 注："ts" 会命中 TypeScript 同名扩展——支持 MPEG-TS 视频容器取音轨
+    //（视频容器取音轨为既定功能）的已知取舍；仅影响用户显式选中的目录
+    //（浏览器工厂层会过滤不可播项），不单独排除。
     const AUDIO_EXTS: &[&str] = &[
         "flac", "wav", "mp3", "ogg", "opus", "wv", "m4a", "aiff", "aif", "aac", "alac", "mp4",
-        "wma", "ape", "dsf", "dff",
+        "wma", "ape", "dsf", "dff", "mkv", "avi", "ts", "m2ts", "wmv", "mpg", "mpeg", "vob", "mov",
+        "rmvb", "flv", "tak", "mpc", "shn", "ac3", "dts", "tta",
     ];
     AUDIO_EXTS.contains(&ext)
 }

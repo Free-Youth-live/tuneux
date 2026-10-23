@@ -3,6 +3,8 @@ tuneux · 第三方开源许可声明（THIRD-PARTY-LICENSES）
 
 本文件随 tuneux / tuneux-fx 发布包分发，列出二进制直接链接（直接依赖）的
 第三方开源组件及其许可，履行各许可证的署名与文本保留义务。
+（2026-10 起另含「进程外独立组件」一节：FFmpeg 不链接进 tuneux 二进制，
+义务与声明见该节。）
 
 一、直接依赖组件清单
 ------------------------------------------------------------
@@ -52,21 +54,43 @@ GUI（tuneux-max）
                             (MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0
                             （内嵌字体：Hack / Ubuntu Light / Noto Emoji /
                             emoji-icon-font；随二进制分发，许可全文见附录 E–H）
-  wqy-microhei 0.2.0-beta（Mono 面）
-                            Apache-2.0（三重许可 Apache-2.0 / GPL-3.0 /
-                            GPL+字体嵌入例外 中**选用 Apache-2.0**：字体 name 表
-                            自证 + 发行版包元数据口径；不选 GPL 族，与禁 GPL
-                            口径零冲突）
-                            （内嵌字体资产，非 cargo 依赖；Digitized data
-                            copyright (c) 2007 Google Corporation；Copyright
-                            (c) 2008-2009 WenQuanYi Board of Trustees and
-                            Qianqian Fang；随 tuneux-max 二进制分发）
+
+===============================================================================
+进程外独立组件（不链接进 tuneux 二进制；随发布包附带或调用系统已安装版本）
+===============================================================================
+
+FFmpeg 9.0.2
+  Copyright (c) 2000-2026 the FFmpeg developers
+  许可：LGPL-2.1-or-later（GNU Lesser General Public License v2.1 或更新版）
+  许可文本：随包 ffmpeg/licenses/COPYING.LGPLv2.1（不可删改）
+
+  用途：长尾音频格式（APE / WMA / FLV / TAK / MPC / SHN / AC3 / DTS /
+  TTA / DSF / DFF 等）与视频容器音轨的解码。tuneux 以独立子进程方式
+  调用 ffmpeg 命令行（经管道读写 PCM 数据），不链接其任何库，不构成
+  衍生作品意义上的链接；tuneux 本体仍为木兰宽松许可证 v2。
+
+  合规义务履行（随包附带形态）：
+    · 随包二进制为 FFmpeg 官方源码的**未修改** LGPL 构建（未启用
+      --enable-gpl / --enable-nonfree），构建配置串可用
+      `ffmpeg -version` 查看核对；
+    · 版本 / 来源 / SHA-256 / 未修改声明与源码指引：随包
+      ffmpeg/VERSIONS.txt；
+    · 对应源码（书面要约）：上述哈希的官方源码包随本软件各版本在
+      GitHub 与 Gitee 的 Release 页提供——
+        https://github.com/Free-Youth-live/tuneux/releases
+        https://gitee.com/Free_Youth_live/tuneux/releases
+      自本版本发布起三年内，可向 support@tuneux.studio 索取该完整
+      对应源码，仅收介质工本费（随包 ffmpeg/VERSIONS.txt 同文登记）。
+    · 名义性使用声明：FFmpeg 是独立开源项目，与 tuneux 无从属关系；
+      此处以其本名作描述性使用，不暗示 FFmpeg 项目对本产品的背书。
+
+  （系统自装形态：用户系统里已安装的 ffmpeg 由其自身分发渠道承担许可
+  义务；tuneux 仅以子进程调用之，不涉及再分发。）
 
 二、许可全文
 ------------------------------------------------------------
 
 附录 A：MIT License（标准文本；各组件版权行见第一节清单）
-
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights
@@ -913,19 +937,21 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ===============================================================================
-Fonts bundled with tuneux-max (assets/fonts/, copied into the .app bundle)
+Fonts embedded/bundled with tuneux-max
 ===============================================================================
 
-WenQuanYi Micro Hei Mono (embedded default UI font)
-  Copyright (c) 2008-2009, WenQuanYi Board of Trustees.
-  Licensed under the Apache License, Version 2.0.
-
-Sarasa Gothic / Sarasa Mono SC (optional UI font: 更纱黑体等宽)
+Sarasa Mono SC (embedded default UI font, 更纱黑体·等宽简体)
+  官方发布原件：Sarasa Gothic v1.0.42 / SarasaMonoSC-Regular.ttf
+  （25,612,020 bytes；未子集化、未修改）。
   Copyright (c) 2015-2025, Renzhi Li (aka. Belleve Invis).
   Licensed under the SIL Open Font License, Version 1.1.
-  Full license text: Resources/LICENSE-sarasa-OFL.txt in the app bundle.
+  许可全文随包：macOS 在 .app 的 Contents/Resources/LICENSE-SarasaMonoSC-OFL.txt，
+  Linux / Windows 在包根目录同名文件（三平台同源同版）。
 
-Fusion Pixel Font 12px Monospaced (optional UI font: 缝合像素12)
-  Copyright (c) 2022-2026, TakWolf.
-  Licensed under the SIL Open Font License, Version 1.1.
-  Full license text: Resources/LICENSE-fusion-pixel-OFL.txt in the app bundle.
+  依据 OFL 1.1 分发：随包附许可文本；原件未修改故保留原名
+  "Sarasa Mono SC"；不作为独立字体产品销售。
+
+  SHA-256: 82e09460f6f55010296f670b85e346ddeaf91b967724840d2bf5514137f68a83
+
+历史变更：v0.6.0 前曾内置 WenQuanYi Micro Hei Mono（Apache 2.0）与
+随包 Fusion Pixel 12（OFL），已随字体收口移除。

@@ -79,12 +79,15 @@ pub(super) fn draw_now_playing(
         (None, Some(n)) => format!("{track_label} {n}"),
         (None, None) => i18n.t("metadata.unknown_album").into_owned(),
     };
-    let tech = format!(
-        "{} · {} · {} · {}",
-        md.codec.as_deref().unwrap_or(&i18n.t("msg.unknown_format")),
-        md.bitrate_label(),
-        md.sample_rate_label(),
-        md.bits_label(),
+    let eng_status = engine.as_ref().map(|e| e.status());
+    let eng_codec = engine.as_ref().and_then(|e| e.src_codec());
+    // 技术参数行：元数据优先，缺失段回落引擎实测源参数（FFmpeg 长尾
+    // 格式文件探测返回兜底记录时仍有真实参数；与 fx / max 同口径）。
+    let tech = md.tech_line_with_engine(
+        eng_codec.as_deref(),
+        eng_status.and_then(|s| s.src_sample_rate),
+        eng_status.and_then(|s| s.src_bits),
+        &i18n.t("msg.unknown_format"),
     );
 
     // 技术参数行颜色按直通状态：直通（bit-perfect @ 文件采样率）用亮色，

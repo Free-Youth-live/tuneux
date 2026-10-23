@@ -33,7 +33,7 @@ pub use cue::{
 pub use playback_decision::{
     resume_secs, single_repeat_decision, toggle_decision, PlaybackDecision,
 };
-pub use playlist::{PlaylistCore, PlaylistView, SplitMix64};
+pub use playlist::{PlaylistCore, PlaylistView, ShuffleMode, SplitMix64};
 pub use playlist_item::{clamp_seek_to_cue, CueRef, NavOutcome, PlaylistItem};
 pub use playlist_state::{PlaylistState, SavedList};
 pub use repeat::RepeatMode;

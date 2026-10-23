@@ -97,9 +97,13 @@ pub(super) fn try_load(
                 if let Some(dur) = dec.params().duration {
                     state.set_duration(dur);
                 } else {
-                    // 无时长元数据（如 Opus / FFmpeg 后端）：清零，避免残留上一曲时长。
+                    // 无时长元数据（如 Opus 后端，或 FFmpeg 探测失败的回退路径）：
+                    // 清零，避免残留上一曲时长。
                     state.set_duration(0.0);
                 }
+                // 源参数快照前传：UI 技术参数行在元数据探测缺失时回落显示
+                //（FFmpeg 长尾格式在文件探测层返回 None）。
+                state.set_src_params(Some(dec.params().clone()));
                 *current = Some(dec);
                 true
             } else {
@@ -111,6 +115,7 @@ pub(super) fn try_load(
                 // decode 分支读到——虽然 current=None 使其不可达，
                 // 但保持显式清理更不易出错）。
                 *resampler = None;
+                state.set_src_params(None);
                 // 错误信息用实际生效的设备采样率（直通后可能与初始值不同），
                 // 与上方 effective_device_sr 的取值口径一致。
                 state.set_last_error(format!(
@@ -124,8 +129,9 @@ pub(super) fn try_load(
         Err(e) => {
             *current = None;
             *resampler = None; // 同上：失败即清空
-                               // 把错误暴露给 UI：让用户知道"刚才那首被跳过了"，
-                               // 而不是默默下一首。path 用 file_name() 截短避免整路径刷屏。
+            state.set_src_params(None); // 同上：源参数快照一并清空
+                                        // 把错误暴露给 UI：让用户知道"刚才那首被跳过了"，
+                                        // 而不是默默下一首。path 用 file_name() 截短避免整路径刷屏。
             let fname = path
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())

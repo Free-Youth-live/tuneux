@@ -1,17 +1,15 @@
-//! # 指针表模块（GUI 仿 TUI）
+//! # 指针表模块（GUI 版 TUI 观感）
 //!
 //! 与 fx 终端版共用 [`tuneux_commonx::gauge`] 的几何与针物理——同一块
 //! 字符画布（单线制框 / ▒ 盘壁 / · 弧刻度 / ▪ 红区 / 一条线指针 /
 //! ▄█▀▀ 针帽），在 egui 里以等宽字符网格渲染（与经典频谱的字符路径
-//! 同款手法）。
-//! 经典模式：tui_box 包裹；现代模式：卡片内直接渲染（内容本身即 TUI 风）。
+//! 同款手法），内容本身即 TUI 风格。
 
 use super::*;
-use egui::CornerRadius;
 use tuneux_commonx::gauge::{gauge_cells, GaugeKind, GAUGE_MIN_H, GAUGE_MIN_W};
 
 impl MaxAppV2 {
-    /// 指针表模块入口（经典 + 现代两路 dispatch 汇到此处）。
+    /// 指针表模块入口。
     pub(super) fn render_gauge_module(&mut self, ui: &mut Ui) {
         let pal = self.palette.clone();
         let title = self.i18n.t("panel.gauge").into_owned();
@@ -51,18 +49,10 @@ impl MaxAppV2 {
             }
         };
 
-        if self.config.modern {
-            // 现代：卡片底 + 网格（内容即 TUI 风，无需 tui_box 框饰）
+        Self::tui_box(ui, &pal, &title, false, |ui| {
             let area = ui.max_rect();
-            let p0 = ui.painter_at(area);
-            p0.rect_filled(area, CornerRadius::same(4), pal.bg);
             self.draw_gauge_pair(ui, &pal, area, (lv_l, lv_r), fracs, db_txt);
-        } else {
-            Self::tui_box(ui, &pal, &title, false, |ui| {
-                let area = ui.max_rect();
-                self.draw_gauge_pair(ui, &pal, area, (lv_l, lv_r), fracs, db_txt);
-            });
-        }
+        });
     }
 
     /// L/R 双表 + 读数（闭包内零 &mut self——状态已在入口推进完）。

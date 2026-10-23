@@ -40,11 +40,21 @@ impl App {
                 if self.menu_active && self.menu_dropdown && me.row >= 1 {
                     self.menu_dropdown = false;
                     self.menu_active = false;
-                    // 点击下拉项：执行对应菜单动作（与 Enter 键同路径）
+                    self.menu_sub = None;
+                    // 点击下拉项：执行对应菜单动作（与 Enter 键同路径，灰显项
+                    // 在执行器内给"暂未提供"提示）；子菜单父项只展开不执行
+                    //（子项暂不支持鼠标点选，用键盘）。
                     if let Some(menu) = crate::tui::app::menu::menus().get(self.menu_top) {
                         let idx = (me.row - 1) as usize;
                         if let Some(item) = menu.items.get(idx) {
-                            self.execute_menu_action(item.action, config);
+                            if item.children.is_some() {
+                                self.menu_active = true;
+                                self.menu_dropdown = true;
+                                self.menu_sub = Some(idx);
+                                self.menu_sub_item = 0;
+                            } else {
+                                self.execute_menu_action(item.action, config);
+                            }
                         }
                     }
                     return;

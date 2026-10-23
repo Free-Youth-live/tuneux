@@ -4,9 +4,9 @@
 //! 配色主题、面板焦点、面板开合（浏览器/封面/歌词/频谱）、搜索、关于弹窗等。
 //! 所有键盘输入在此分派。
 //!
-//! 键位与 tuneux 统一：基础层与 tuneux 完全一致，-fx 只做加法（F 键 / 菜单
-//! 等扩展层）。提供面板开合（b/c/v/l）、搜索（/）、关于（?）、清空二次确认
-//! （x x）、菜单栏与命令模式。
+//! 键位与 tuneux 统一：基础层与 tuneux 完全一致，-fx 只做加法（菜单栏 /
+//! 命令模式 / 效果器面板等扩展层）。提供面板开合（b/c/v/l）、搜索（/）、
+//! 关于（?）、清空二次确认（x x）、均衡器（e）、滤波器（f）、菜单栏（数字 1-8）。
 //!
 //! 本目录按领域拆分子模块（每个子模块一个 `impl App` 扩展块）：
 //! - [`cue`]：CUE 分轨的列表展开与起播偏移
@@ -66,7 +66,7 @@ pub struct App {
     /// 打开选择器前的生效皮肤（Esc 取消时恢复）。
     skin_prev: Option<Palette>,
     /// 已装载的可视化面板插件清单（「可视化-*」前缀扫描，验签 Trusted）。
-    pub visual_plugins: Vec<tuneux_pinx::LoadedPlugin>,
+    pub visual_plugins: Vec<LoadedVisual>,
     /// 插件面板当前画面（每帧由插件 tick 产出；无插件 / 无画面时为空）。
     pub visual_text: String,
     /// 音频引擎（后台解码 + 播放线程）。初始化失败为 None（播放不可用）。
@@ -90,7 +90,7 @@ pub struct App {
     pub playlist: Playlist,
     /// 播放列表持久化状态（退出/定时落盘，下次启动恢复）。
     pub playlist_state: PlaylistState,
-    /// i18n 查询器：请求语言表（locales/<lang>.txt）+ zh 内置兜底。
+    /// i18n 查询器：请求语言表（`locales/<lang>.txt`）+ zh 内置兜底。
     pub i18n: tuneux_commonx::I18n,
     /// ReplayGain 增益缓存：path → 整曲增益（dB）。首次播放无缓存（增益 1.0），
     /// 播放中引擎测量完成后缓存，下次播放该曲生效。随 playlist.toml 落盘。
@@ -156,7 +156,7 @@ pub struct App {
     /// 共享扫描池（mediax 下沉：1 walker + N 工人，替代单线程 add_dir_async）。
     pub scan_pool: tuneux_mediax::scan_pool::ScanPool,
     pub track_envelope: Vec<f32>,
-    /// 菜单栏是否激活（数字 1-8 / F10 唤起，方向键/Enter 导航）。
+    /// 菜单栏是否激活（数字 1-8 唤起，方向键/Enter 导航）。
     pub menu_active: bool,
     /// 激活的顶级菜单下标（0-7）。
     pub menu_top: usize,
@@ -164,6 +164,10 @@ pub struct App {
     pub menu_dropdown: bool,
     /// 展开下拉中的选中项下标。
     pub menu_item: usize,
+    /// 展开的子菜单：值为父项在当前下拉中的下标（None = 未展开）。
+    pub menu_sub: Option<usize>,
+    /// 子菜单中的选中项下标。
+    pub menu_sub_item: usize,
     /// 引擎最近一次错误（短暂显示后自动清除）。
     pub last_error: Option<String>,
     /// 错误产生时刻（用于到期清除）。
@@ -177,9 +181,26 @@ pub struct App {
     pub gauge_needles: std::cell::RefCell<[tuneux_commonx::gauge::NeedlePhys; 2]>,
     /// "关于"弹窗是否可见（`?` 键切换，任意键关闭）。
     pub about_visible: bool,
-    /// 均衡器面板是否可见（「工具 › 均衡器」/ F9 打开，Esc 关闭）。
+    /// 快捷键一览弹窗（内容从菜单静态表生成；任意键关闭）。
+    pub shortcuts_visible: bool,
+    /// 书签列表弹窗（Enter 跳转、d 删除、Esc 关闭）。
+    pub bookmark_popup: bool,
+    /// 书签弹窗当前选中下标。
+    pub bookmark_sel: usize,
+    /// 插件管理页是否可见（只读列表；页内 u 重载已装插件、Esc 关闭）。
+    pub plugins_visible: bool,
+    /// 插件管理页的行缓存（打开页 / 重载后刷新，渲染不做 IO）。
+    pub plugin_rows: Vec<PluginRow>,
+    /// 插件目录的展示文本（与 plugin_rows 同批刷新）。
+    pub plugin_dir_text: String,
+    /// 退出请求标志：菜单「文件 › 退出」经鼠标路径触发时置位，主循环据此退出
+    ///（键盘路径由 handle_menu_key 直接返回 false）。
+    pub quit_requested: bool,
+    /// 当前曲目属性弹窗（i / Alt+Enter）。
+    pub properties_visible: bool,
+    /// 均衡器面板是否可见（「音效 › 均衡器」/ e 键打开，Esc 关闭）。
     pub eq_visible: bool,
-    /// 滤波器面板可见性（F10 菜单或键切换）。
+    /// 滤波器面板可见性（「音效 › 滤波器」/ f 键切换）。
     pub filter_visible: bool,
     /// 滤波器参数选中索引（0=截止，1=谐振）。
     pub filter_sel: usize,
@@ -398,15 +419,35 @@ fn load_comp_plugin(
 pub struct LoadedSkin {
     /// 皮肤名（皮肤文本 `name=` 键；缺省用文件名去前缀）。
     pub name: String,
+    /// 插件文件主名（不含扩展名）：插件管理页据此核对加载状态。
+    pub stem: String,
     /// 解析出的调色板。
     pub palette: Palette,
+}
+
+/// 一份已加载的可视化面板插件（名称 + 实例）。
+pub struct LoadedVisual {
+    /// 插件文件主名（「可视化-*」前缀 stem）。
+    pub name: String,
+    /// 已装载的 WASM 实例。
+    pub plugin: tuneux_pinx::LoadedPlugin,
+}
+
+/// 插件管理页的一行（plugins/ 目录扫描结果 + 加载状态）。
+pub struct PluginRow {
+    /// 插件文件主名。
+    pub name: String,
+    /// 类型列的 i18n key（效果器 / 皮肤 / 可视化 / 未知）。
+    pub kind_key: &'static str,
+    /// 当前是否已加载。
+    pub loaded: bool,
 }
 
 /// 加载全部第一方可视化面板插件（能力 `meter_read`）：扫描 plugins/ 下
 ///「可视化-*」前缀的全部 .wasm，逐份验签（仅 Trusted 入清单）、init。
 /// 与皮肤同口径：文件缺失 / 验签非 Trusted / 解析失败 → 跳过（记核查日志）。
 /// 可视化插件不占效果器槽位（init 传 0）；tick 为可选导出。
-fn load_visual_plugins(engine: &audio::Engine) -> Vec<tuneux_pinx::LoadedPlugin> {
+fn load_visual_plugins(engine: &audio::Engine) -> Vec<LoadedVisual> {
     let allowed = [tuneux_pinx::Capability::MeterRead];
     let dir = config::plugins_dir();
     let mut names: Vec<String> = std::fs::read_dir(&dir)
@@ -434,7 +475,10 @@ fn load_visual_plugins(engine: &audio::Engine) -> Vec<tuneux_pinx::LoadedPlugin>
         }
         // 日志键带文件名（签名 id 仍是 "tuneux-vis"，见 record_plugin_load 说明）。
         record_plugin_load(&format!("tuneux-vis:{file_stem}"), plugin.tristate, granted);
-        out.push(plugin);
+        out.push(LoadedVisual {
+            name: file_stem,
+            plugin,
+        });
     }
     out
 }
@@ -490,7 +534,11 @@ fn load_skin_palettes(engine: &audio::Engine) -> Vec<LoadedSkin> {
         // 皮肤名：文本 name= 键优先，文件名去「皮肤-」前缀兜底。
         let fallback = file_stem.trim_start_matches("皮肤-").to_string();
         let name = crate::tui::theme::skin_name(text).unwrap_or(fallback);
-        out.push(LoadedSkin { name, palette });
+        out.push(LoadedSkin {
+            name,
+            stem: file_stem,
+            palette,
+        });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
@@ -516,7 +564,6 @@ impl App {
                 Some(i18n.t("msg.engine_fail").replace("{}", &e.to_string())),
             ),
         };
-        let engine_init_error_at = engine_init_error.as_ref().map(|_| Instant::now());
         // 启动即下发介质风格，避免配置与声音不一致（介质纯声音修饰、无画面）。
         // 一并下发 ReplayGain 开关（默认关）。
         if let Some(e) = &engine {
@@ -561,7 +608,15 @@ impl App {
             i => skins.get(i - 2).map(|s| s.palette),
         };
         // 恢复播放列表持久化状态（独立文件）。
-        let playlist_state = config::load_playlist_state();
+        let (playlist_state, playlist_status) = config::load_playlist_state_with_status();
+        // 文件损坏：走 UI 通道提示（此处已在 raw 模式，eprintln 会弄脏备用屏）；
+        // 备份与停写锁已在加载函数内完成，本次会话不会覆写原文件。
+        // 文案构造用 commonx 统一口径（备份成败两分支，含单元测试）。
+        let playlist_corrupt_msg = tuneux_commonx::config_status::corrupt_flash_msg(
+            &playlist_status,
+            &i18n.t("msg.state_corrupt"),
+            &i18n.t("msg.state_corrupt_nobackup"),
+        );
 
         let mut playlist = Playlist::new();
         playlist.set_shuffle(config.shuffle);
@@ -608,6 +663,15 @@ impl App {
         let (dir_load_tx, dir_load_rx) = crossbeam_channel::unbounded();
         // 浏览器搜索收集与目录加入的后台通道（同机制，见对应字段说明）。
         let (search_load_tx, search_load_rx) = crossbeam_channel::unbounded();
+
+        // 启动期错误合并展示：引擎失败与播放列表损坏共用 last_error 通道。
+        let startup_error = match (engine_init_error, playlist_corrupt_msg) {
+            (Some(a), Some(b)) => Some(format!("{a}；{b}")),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let startup_error_at = startup_error.as_ref().map(|_| Instant::now());
 
         Self {
             skin,
@@ -672,8 +736,10 @@ impl App {
             menu_top: 0,
             menu_dropdown: false,
             menu_item: 0,
-            last_error: engine_init_error,
-            last_error_at: engine_init_error_at,
+            menu_sub: None,
+            menu_sub_item: 0,
+            last_error: startup_error,
+            last_error_at: startup_error_at,
             frame_tick: 0,
             spectrum_peaks: std::cell::RefCell::new(audio::spectrum::SpectrumPeakHold::default()),
             gauge_needles: std::cell::RefCell::new([
@@ -681,6 +747,14 @@ impl App {
                 tuneux_commonx::gauge::NeedlePhys::default(),
             ]),
             about_visible: false,
+            shortcuts_visible: false,
+            bookmark_popup: false,
+            bookmark_sel: 0,
+            plugins_visible: false,
+            plugin_rows: Vec::new(),
+            plugin_dir_text: String::new(),
+            quit_requested: false,
+            properties_visible: false,
             eq_visible: false,
             filter_visible: false,
             filter_sel: 0,
@@ -727,6 +801,59 @@ impl App {
             .retain(|k, _| keep.contains(k.as_path()));
     }
 
+    fn action_cycle_cover(&mut self, config: &mut Config) {
+        self.toggle_cover_panel(config);
+    }
+
+    fn action_cycle_medium(&mut self, config: &mut Config) {
+        // m：循环播放介质风格（无 → 4 磁带 → 4 黑胶 → 无），只改声音，
+        // 用 corex 的 ALL 单一真源，新增介质无需改此处。
+        let all = audio::PlaybackMedium::ALL;
+        let idx = all
+            .iter()
+            .position(|&m| m == self.playback_medium)
+            .unwrap_or(0);
+        self.apply_medium(all[(idx + 1) % all.len()], config);
+    }
+
+    fn action_cycle_repeat(&mut self, config: &mut Config) {
+        config.repeat = config.repeat.next();
+        self.refresh_preload(config);
+    }
+
+    fn action_cycle_visual(&mut self, config: &mut Config) {
+        self.toggle_spectrum_panel(config);
+    }
+
+    fn action_toggle_browser(&mut self, config: &mut Config) {
+        self.toggle_browser_panel(config);
+    }
+
+    fn action_toggle_group_view(&mut self, config: &mut Config) {
+        self.playlist.toggle_view();
+        config.playlist_view = self.playlist.view();
+    }
+
+    fn action_toggle_lyrics(&mut self, config: &mut Config) {
+        self.toggle_lyrics_panel(config);
+    }
+
+    fn action_toggle_shuffle(&mut self, config: &mut Config) {
+        let mode = self.playlist.shuffle_mode().next();
+        self.playlist.set_shuffle_mode(mode);
+        config.shuffle = mode.is_on();
+        config.shuffle_mode = mode.as_str().to_string();
+        let name = match mode {
+            tuneux_mediax::ShuffleMode::Off => "shuffle.off",
+            tuneux_mediax::ShuffleMode::Tracks => "shuffle.tracks",
+            tuneux_mediax::ShuffleMode::TrueRandom => "shuffle.true_random",
+            tuneux_mediax::ShuffleMode::Albums => "shuffle.albums",
+        };
+        let msg = self.i18n.t(name).into_owned();
+        self.flash_message(&msg);
+        self.refresh_preload(config);
+    }
+
     /// 执行一个自定义动作，返回 true 表示按键已被消费。
     ///
     /// 未知动作名返回 false，调用方据此回退到硬编码默认键。
@@ -755,6 +882,38 @@ impl App {
                 self.volume_down();
                 true
             }
+            "cycle_repeat" => {
+                self.action_cycle_repeat(config);
+                true
+            }
+            "toggle_shuffle" => {
+                self.action_toggle_shuffle(config);
+                true
+            }
+            "cycle_medium" => {
+                self.action_cycle_medium(config);
+                true
+            }
+            "cycle_visual" => {
+                self.action_cycle_visual(config);
+                true
+            }
+            "toggle_group_view" => {
+                self.action_toggle_group_view(config);
+                true
+            }
+            "toggle_lyrics" => {
+                self.action_toggle_lyrics(config);
+                true
+            }
+            "cycle_cover" => {
+                self.action_cycle_cover(config);
+                true
+            }
+            "toggle_browser" => {
+                self.action_toggle_browser(config);
+                true
+            }
             // 未知动作名：忽略，回退默认键
             _ => false,
         }
@@ -773,6 +932,59 @@ impl App {
         // —— 关于弹窗（最优先：任意键关闭并吃掉，避免误触发其它操作）——
         if self.about_visible {
             self.about_visible = false;
+            return true;
+        }
+        if self.properties_visible {
+            self.properties_visible = false;
+            return true;
+        }
+        // 快捷键一览：同款任意键关闭（内容为菜单表生成的只读清单）。
+        if self.shortcuts_visible {
+            self.shortcuts_visible = false;
+            return true;
+        }
+
+        // —— 书签列表弹窗（↑/↓ 选中、Enter 跳转、d 删除、Esc 关闭）——
+        if self.bookmark_popup {
+            let count = self.playlist_state.bookmarks.items.len();
+            match key.code {
+                KeyCode::Esc => self.bookmark_popup = false,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.bookmark_sel = self.bookmark_sel.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.bookmark_sel + 1 < count {
+                        self.bookmark_sel += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    self.bookmark_popup = false;
+                    if count > 0 {
+                        let sel = self.bookmark_sel.min(count - 1);
+                        self.jump_bookmark(sel, config);
+                    }
+                }
+                KeyCode::Char('d') if count > 0 => {
+                    let sel = self.bookmark_sel.min(count - 1);
+                    self.remove_bookmark(sel);
+                    // 删除后选中项保持合法（删尾项时回退一格）。
+                    let n = self.playlist_state.bookmarks.items.len();
+                    if self.bookmark_sel >= n {
+                        self.bookmark_sel = n.saturating_sub(1);
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
+
+        // —— 插件管理页（只读列表；u 重载已装插件、Esc 关闭）——
+        if self.plugins_visible {
+            match key.code {
+                KeyCode::Esc => self.plugins_visible = false,
+                KeyCode::Char('u') => self.reload_loaded_plugins(),
+                _ => {}
+            }
             return true;
         }
 
@@ -894,14 +1106,6 @@ impl App {
             return true;
         }
 
-        // —— 菜单唤起：F10 打开第一栏（F10 不在 keymap 可配置键内，恒保留）——
-        if key.code == KeyCode::F(10) {
-            self.menu_active = true;
-            self.menu_top = 0;
-            self.menu_dropdown = false;
-            return true;
-        }
-
         // —— 自定义键映射层（配置驱动，优先于下方硬编码默认键与数字菜单）——
         // KeyEvent → 键描述 → 反查 keymap：命中且为已知动作则执行并返回；
         // 未命中或动作未知则回退到下方默认键逻辑。
@@ -917,7 +1121,7 @@ impl App {
         }
 
         // —— 菜单唤起：数字 1-8 直接打开对应栏下拉 ——
-        // （macOS 的 F 键被系统占用需按 Fn，数字键三平台直接可用）
+        // （菜单唤起只有数字键一条路径：F 键不做任何功能的绑定）
         // 与其他字符键同规则：带 CTRL/ALT 修饰不响应（Alt+数字在部分终端
         // 是 ESC 序列；Ctrl+数字不应触发界面动作）。
         if let KeyCode::Char(c) = key.code {
@@ -933,6 +1137,7 @@ impl App {
                     self.menu_top = idx;
                     self.menu_dropdown = true;
                     self.menu_item = 0;
+                    self.menu_sub = None;
                     return true;
                 }
             }
@@ -967,14 +1172,11 @@ impl App {
                 return true;
             }
             KeyCode::Char('r') => {
-                config.repeat = config.repeat.next();
-                self.refresh_preload(config);
+                self.action_cycle_repeat(config);
                 return true;
             }
             KeyCode::Char('s') => {
-                config.shuffle = !config.shuffle;
-                self.playlist.set_shuffle(config.shuffle);
-                self.refresh_preload(config);
+                self.action_toggle_shuffle(config);
                 return true;
             }
             KeyCode::Char('n') => {
@@ -1031,42 +1233,24 @@ impl App {
                 return true;
             }
             KeyCode::Char('b') => {
-                self.toggle_browser_panel(config);
+                self.action_toggle_browser(config);
                 return true;
             }
             KeyCode::Char('v') => {
-                self.toggle_spectrum_panel(config);
+                self.action_cycle_visual(config);
                 return true;
             }
             KeyCode::Char('l') => {
-                self.toggle_lyrics_panel(config);
+                self.action_toggle_lyrics(config);
                 return true;
             }
             KeyCode::Char('m') => {
-                // m：循环播放介质风格（无 → 4 磁带 → 4 黑胶 → 无），只改声音，
-                // 用 corex 的 ALL 单一真源，新增介质无需改此处。
-                let all = audio::PlaybackMedium::ALL;
-                let idx = all
-                    .iter()
-                    .position(|&m| m == self.playback_medium)
-                    .unwrap_or(0);
-                self.apply_medium(all[(idx + 1) % all.len()], config);
+                self.action_cycle_medium(config);
                 return true;
             }
             KeyCode::Char('x') => {
                 // x：清空播放列表（两次确认，防误触）。
-                if self.pending_clear {
-                    self.clear_playlist();
-                    self.pending_clear = false;
-                    self.pending_clear_at = None;
-                    let m = self.i18n.t("msg.cleared").into_owned();
-                    self.flash_message(&m);
-                } else if !self.playlist.is_empty() {
-                    self.pending_clear = true;
-                    self.pending_clear_at = Some(Instant::now());
-                    let msg = self.i18n.t("msg.clear_confirm").into_owned();
-                    self.flash_message(&msg);
-                }
+                self.request_clear_playlist();
                 return true;
             }
             KeyCode::Char('d') => {
@@ -1074,43 +1258,41 @@ impl App {
                 return true;
             }
             KeyCode::Char('g') => {
-                self.playlist.toggle_view();
-                config.playlist_view = self.playlist.view();
+                self.action_toggle_group_view(config);
                 return true;
             }
             KeyCode::Char('c') => {
-                self.toggle_cover_panel(config);
+                self.action_cycle_cover(config);
                 return true;
             }
             KeyCode::Char('?') => {
                 self.about_visible = !self.about_visible;
                 return true;
             }
-            // —— fx 扩展层：命令模式与功能键（只加法，不占基础层）——
+            KeyCode::Char('i') => {
+                // 当前曲目属性弹窗（i 主键；Alt+Enter 为辅助别名，三平台考量同基础版）
+                self.properties_visible = !self.properties_visible;
+                return true;
+            }
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.properties_visible = !self.properties_visible;
+                return true;
+            }
+            // —— fx 扩展层：命令模式与效果器面板（只加法，不占基础层）——
             KeyCode::Char(':') => {
                 self.command_mode = true;
                 self.command_query.clear();
                 return true;
             }
-            // F5-F8：面板开合兜底（对应 b/c/l/v）。F10 菜单见菜单分支。
-            KeyCode::F(5) => {
-                self.toggle_browser_panel(config);
-                return true;
-            }
-            KeyCode::F(6) => {
-                self.toggle_cover_panel(config);
-                return true;
-            }
-            KeyCode::F(7) => {
-                self.toggle_lyrics_panel(config);
-                return true;
-            }
-            KeyCode::F(8) => {
-                self.toggle_spectrum_panel(config);
-                return true;
-            }
-            KeyCode::F(9) => {
+            // e：均衡器面板（双重身份——面板未开时全局 e 开面板；面板已开时
+            // e 归面板模态键（切换启用），见 handle_eq_key；关面板用 Esc）。
+            KeyCode::Char('e') => {
                 self.eq_visible = !self.eq_visible;
+                return true;
+            }
+            // f：滤波器面板（菜单标注的全局绑定，与 e 同规则）。
+            KeyCode::Char('f') => {
+                self.filter_visible = !self.filter_visible;
                 return true;
             }
             _ => {}
@@ -1229,7 +1411,7 @@ impl App {
         self.last_error_at = Some(Instant::now());
     }
 
-    /// b / F5：Hidden ↔ Browser（互斥：开浏览器会关掉封面）。
+    /// b：Hidden ↔ Browser（互斥：开浏览器会关掉封面）。
     fn toggle_browser_panel(&mut self, config: &mut Config) {
         if self.left_panel == LeftPanel::Browser {
             self.left_panel = LeftPanel::Hidden;
@@ -1241,7 +1423,7 @@ impl App {
         config.left_panel = self.left_panel;
     }
 
-    /// c / F6：Hidden → Cover → CoverBrowser → Hidden（互斥：开封面会关掉浏览器）。
+    /// c：Hidden → Cover → CoverBrowser → Hidden（互斥：开封面会关掉浏览器）。
     /// 封面/封面浏览不可聚焦（焦点始终在播放列表）。
     fn toggle_cover_panel(&mut self, config: &mut Config) {
         self.left_panel = match self.left_panel {
@@ -1309,13 +1491,13 @@ impl App {
         }
         self.cover_browser_scroll = self.cover_browser_scroll.min(count - 1);
     }
-    /// l / F7：切换歌词（显示/隐藏），可与频谱共存。
+    /// l：切换歌词（显示/隐藏），可与频谱共存。
     fn toggle_lyrics_panel(&mut self, config: &mut Config) {
         self.lyrics_mode = self.lyrics_mode.next();
         config.lyrics_mode = self.lyrics_mode;
     }
 
-    /// v / F8：循环频谱模式（关 → 半屏 → 全屏 → 示波器 → 插件面板 → 关）。
+    /// v：循环频谱模式（关 → 半屏 → 全屏 → 示波器 → 插件面板 → 关）。
     fn toggle_spectrum_panel(&mut self, config: &mut Config) {
         self.spectrum_mode = self.spectrum_mode.next();
         config.spectrum_mode = self.spectrum_mode;
@@ -1410,15 +1592,7 @@ impl App {
                 }
             },
             "save-m3u" | "m3u-save" => {
-                let path = self.browser.cwd().join("playlist.m3u");
-                match self.save_m3u(&path) {
-                    Ok(n) => self.flash_message(&format!(
-                        "{} {}",
-                        self.i18n.t("msg.saved_m3u").replace("{}", &n.to_string()),
-                        path.display()
-                    )),
-                    Err(e) => self.flash_message(&format!("{}：{e}", self.i18n.t("msg.save_fail"))),
-                }
+                self.save_playlist_m3u();
             }
             "load-m3u" | "m3u-load" => {
                 // 可选路径参数；缺省用浏览器当前目录下的 playlist.m3u。
@@ -1426,12 +1600,7 @@ impl App {
                     Some(p) => PathBuf::from(p),
                     None => self.browser.cwd().join("playlist.m3u"),
                 };
-                match self.load_m3u(&path, config) {
-                    Ok(n) => {
-                        self.flash_message(&self.i18n.t("msg.loaded").replace("{}", &n.to_string()))
-                    }
-                    Err(e) => self.flash_message(&format!("{}：{e}", self.i18n.t("msg.load_fail"))),
-                }
+                self.load_playlist_m3u(&path, config);
             }
             "bookmark" | "bm" => self.add_bookmark(),
             "bookmarks" | "bm-list" => self.list_bookmarks(),
@@ -1475,14 +1644,21 @@ impl App {
         self.flash_message(&m);
     }
 
-    /// 菜单栏激活态按键分派：←/→ 切菜单、↑/↓ 选项、Enter 执行、Esc 收起/退出。
+    /// 菜单栏激活态按键分派：←/→ 切菜单或进出子菜单、↑/↓ 选项、Enter 执行
+    /// 或展开子菜单、Esc 逐级收起（子菜单 → 下拉 → 菜单栏）。
     /// 返回 false 表示请求退出（选中"文件→退出"）。
     fn handle_menu_key(&mut self, key: KeyEvent, config: &mut Config) -> bool {
         let ms = menus();
+        // 当前展开的子菜单项列表（父项下标 + 子项切片）。
+        let submenu = self
+            .menu_sub
+            .and_then(|i| ms[self.menu_top].items.get(i))
+            .and_then(|it| it.children.as_deref());
         match key.code {
-            // F10 再按一次关闭菜单（与 Esc 等价），避免"只能 Esc 退出"。
-            KeyCode::Esc | KeyCode::F(10) => {
-                if self.menu_dropdown {
+            KeyCode::Esc => {
+                if self.menu_sub.is_some() {
+                    self.menu_sub = None; // 收起子菜单
+                } else if self.menu_dropdown {
                     self.menu_dropdown = false; // 收起下拉，仍停在菜单栏
                 } else {
                     self.menu_active = false; // 退出菜单栏
@@ -1502,22 +1678,46 @@ impl App {
                     self.menu_top = idx;
                     self.menu_dropdown = true;
                     self.menu_item = 0;
+                    self.menu_sub = None;
                 }
             }
             KeyCode::Left => {
-                self.menu_top = (self.menu_top + ms.len() - 1) % ms.len();
-                if self.menu_dropdown {
-                    self.menu_item = 0;
+                if self.menu_sub.is_some() {
+                    self.menu_sub = None; // 子菜单展开时：← 先收回子菜单
+                } else {
+                    self.menu_top = (self.menu_top + ms.len() - 1) % ms.len();
+                    if self.menu_dropdown {
+                        self.menu_item = 0;
+                    }
                 }
             }
             KeyCode::Right => {
-                self.menu_top = (self.menu_top + 1) % ms.len();
-                if self.menu_dropdown {
-                    self.menu_item = 0;
+                if submenu.is_some() {
+                    // 子菜单已展开：→ 不再切栏（子菜单内 ← 收回）。
+                } else if self.menu_dropdown
+                    && ms[self.menu_top]
+                        .items
+                        .get(self.menu_item)
+                        .is_some_and(|it| it.children.is_some())
+                {
+                    // 当前项有子菜单：→ 展开。
+                    self.menu_sub = Some(self.menu_item);
+                    self.menu_sub_item = 0;
+                } else {
+                    self.menu_top = (self.menu_top + 1) % ms.len();
+                    self.menu_sub = None;
+                    if self.menu_dropdown {
+                        self.menu_item = 0;
+                    }
                 }
             }
             KeyCode::Down => {
-                if !self.menu_dropdown {
+                if let Some(children) = submenu {
+                    let n = children.len();
+                    if n > 0 {
+                        self.menu_sub_item = (self.menu_sub_item + 1) % n;
+                    }
+                } else if !self.menu_dropdown {
                     self.menu_dropdown = true;
                     self.menu_item = 0;
                 } else {
@@ -1528,7 +1728,12 @@ impl App {
                 }
             }
             KeyCode::Up => {
-                if self.menu_dropdown {
+                if let Some(children) = submenu {
+                    let n = children.len();
+                    if n > 0 {
+                        self.menu_sub_item = (self.menu_sub_item + n - 1) % n;
+                    }
+                } else if self.menu_dropdown {
                     let n = ms[self.menu_top].items.len();
                     if n > 0 {
                         self.menu_item = (self.menu_item + n - 1) % n;
@@ -1536,15 +1741,39 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                // F10 唤起菜单栏但未展开下拉时，Enter 不应执行任何动作
-                //（menu_item 初始为 0 且 F10/←→ 不复位——旧缺陷：F10 → Enter
-                // 直接盲执行第 0 项，而文件菜单第 0 项就是「退出」）。
+                // 菜单栏激活但未展开下拉时，Enter 只展开不执行
+                //（menu_item 初始为 0 且 ←→ 不复位——旧缺陷：激活后直接 Enter
+                // 盲执行第 0 项，而文件菜单的末项是「退出」）。
                 if !self.menu_dropdown {
                     self.menu_dropdown = true;
                     self.menu_item = 0;
                     return true;
                 }
+                // 子菜单已展开：Enter 执行子项。
+                if let Some(children) = submenu {
+                    let item = children.get(self.menu_sub_item).cloned();
+                    self.menu_active = false;
+                    self.menu_dropdown = false;
+                    self.menu_sub = None;
+                    match item {
+                        Some(mi) if mi.enabled => self.execute_menu_action(mi.action, config),
+                        Some(_) => {
+                            let m = self.i18n.t("msg.feature_na").into_owned();
+                            self.flash_message(&m)
+                        }
+                        None => {}
+                    }
+                    return true;
+                }
                 let item = ms[self.menu_top].items.get(self.menu_item).cloned();
+                // 子菜单父项：Enter 展开（与 → 等价），不关闭菜单。
+                if let Some(mi) = &item {
+                    if mi.children.is_some() {
+                        self.menu_sub = Some(self.menu_item);
+                        self.menu_sub_item = 0;
+                        return true;
+                    }
+                }
                 self.menu_active = false;
                 self.menu_dropdown = false;
                 match item {
@@ -1566,39 +1795,70 @@ impl App {
         true
     }
 
-    /// 执行菜单动作（"退出"在 handle_menu_key 内直接返回退出，不在此）。
+    /// 执行菜单动作。match 无通配臂：新增动作变体时编译器强制在此落地分支，
+    /// 保证"菜单表里的动作都有执行路径"（menu.rs 测试覆盖反向：执行器有的
+    /// 动作菜单里都能点到）。「文件 › 退出」的键盘路径在 handle_menu_key 内
+    /// 直接返回退出；鼠标路径经 quit_requested 标志（见 Quit 臂）。
     fn execute_menu_action(&mut self, action: MenuAction, config: &mut Config) {
         match action {
+            // 子菜单父项不直接执行（键盘 Enter/→ 在 handle_menu_key 展开；
+            // 鼠标点击父项同样只展开，见 mouse.rs）。
+            MenuAction::Submenu => {}
+            // 退出：键盘路径已被 handle_menu_key 拦截；此处服务鼠标路径。
+            MenuAction::Quit => self.quit_requested = true,
+            // —— 文件 ——
+            MenuAction::AddBrowserDir => {
+                let dir = self.browser.cwd().to_path_buf();
+                self.add_dir_async(dir);
+            }
+            MenuAction::AddBrowserSelection => self.add_current_browser_to_playlist(config),
+            MenuAction::SavePlaylist => self.save_playlist_m3u(),
+            MenuAction::LoadPlaylist => {
+                let path = self.browser.cwd().join("playlist.m3u");
+                self.load_playlist_m3u(&path, config);
+            }
+            // —— 编辑 ——
+            MenuAction::RemoveSelected => self.remove_selected_track(),
+            MenuAction::ClearPlaylist => self.request_clear_playlist(),
+            MenuAction::Search => self.open_search_for_focus(),
+            MenuAction::Properties => self.properties_visible = true,
+            // —— 播放 ——
             MenuAction::TogglePlay => self.toggle_play(),
             MenuAction::PrevTrack => self.advance_to_prev_track(config),
             MenuAction::NextTrack => self.advance_to_next_track(config),
-            MenuAction::CycleRepeat => {
-                config.repeat = config.repeat.next();
+            MenuAction::SeekBack => self.seek_by(-5.0),
+            MenuAction::SeekForward => self.seek_by(5.0),
+            // 播放顺序：写入定值 (repeat, shuffle) 组合（r/s 键循环不受影响）。
+            MenuAction::SetPlayOrder(ord) => {
+                let (repeat, shuffle) = ord.write_combo();
+                config.repeat = repeat;
+                self.playlist.set_shuffle_mode(shuffle);
+                config.shuffle = shuffle.is_on();
+                config.shuffle_mode = shuffle.as_str().to_string();
                 self.refresh_preload(config);
-            }
-            MenuAction::ToggleShuffle => {
-                config.shuffle = !config.shuffle;
-                self.playlist.set_shuffle(config.shuffle);
-                self.refresh_preload(config);
+                let m = format!(
+                    "{}：{}",
+                    self.i18n.t("menu.play_order"),
+                    self.i18n.t(ord.label_key())
+                );
+                self.flash_message(&m);
             }
             MenuAction::VolumeUp => self.volume_up(),
             MenuAction::VolumeDown => self.volume_down(),
-            MenuAction::ToggleBrowser => self.toggle_browser_panel(config),
-            MenuAction::ToggleCover => self.toggle_cover_panel(config),
-            MenuAction::ToggleLyrics => self.toggle_lyrics_panel(config),
-            MenuAction::ToggleSpectrum => self.toggle_spectrum_panel(config),
-            MenuAction::TogglePlaylistView => {
-                self.playlist.toggle_view();
-                config.playlist_view = self.playlist.view();
+            MenuAction::BookmarkAdd => self.add_bookmark(),
+            // 列表…与删除…都打开书签弹窗（弹窗内 Enter 跳转、d 删除）。
+            MenuAction::BookmarkList | MenuAction::BookmarkDelete => {
+                self.bookmark_sel = 0;
+                self.bookmark_popup = true;
             }
-            MenuAction::About => {
-                self.about_visible = true;
-            }
-            // 输出设备：corex 已自动跟随系统默认输出（无需手动），这里给出说明。
-            MenuAction::OutputDevice => {
-                let m = self.i18n.t("msg.output_device_info").into_owned();
-                self.flash_message(&m);
-            }
+            // —— 音效 ——
+            // 介质：菜单显式选择（与 m 键循环同一落地函数）。
+            MenuAction::SetMedium(m) => self.apply_medium(m, config),
+            // 均衡器：切换面板（Esc 关闭）。插件加载失败时面板内提示。
+            MenuAction::Equalizer => self.eq_visible = !self.eq_visible,
+            MenuAction::Filter => self.filter_visible = !self.filter_visible,
+            // 压缩器：切换面板（Esc 关闭）。
+            MenuAction::Compressor => self.comp_visible = !self.comp_visible,
             // ReplayGain：响度归一开关（默认关），切换后立即下发引擎。
             MenuAction::ReplayGain => {
                 config.replay_gain = !config.replay_gain;
@@ -1613,6 +1873,53 @@ impl App {
                 };
                 self.flash_message(&format!("{}：{state}", self.i18n.t("msg.rg_state")));
             }
+            // 输出设备：corex 已自动跟随系统默认输出（无需手动），这里给出说明。
+            MenuAction::OutputDevice => {
+                let m = self.i18n.t("msg.output_device_info").into_owned();
+                self.flash_message(&m);
+            }
+            // —— 视图 ——
+            MenuAction::ToggleBrowser => self.toggle_browser_panel(config),
+            MenuAction::ToggleLyrics => self.toggle_lyrics_panel(config),
+            MenuAction::ToggleCover => self.toggle_cover_panel(config),
+            MenuAction::TogglePlaylistView => {
+                self.playlist.toggle_view();
+                config.playlist_view = self.playlist.view();
+            }
+            // 内置频谱：在插件面板档时切回内置半屏，其余沿用 v 键循环。
+            MenuAction::SpectrumBuiltin => {
+                if self.spectrum_mode == SpectrumMode::Plugin {
+                    self.spectrum_mode = SpectrumMode::Half;
+                    config.spectrum_mode = self.spectrum_mode;
+                } else {
+                    self.toggle_spectrum_panel(config);
+                }
+            }
+            // 可视化插件面板：切到频谱 v 循环的「插件」态；无可视化插件时提示。
+            MenuAction::SpectrumPlugin => {
+                if self.visual_plugins.is_empty() {
+                    let m = self.i18n.t("msg.no_visual_pick").into_owned();
+                    self.flash_message(&m);
+                } else {
+                    self.spectrum_mode = SpectrumMode::Plugin;
+                    config.spectrum_mode = self.spectrum_mode;
+                }
+            }
+            // —— 工具 ——
+            MenuAction::PluginManager => {
+                self.refresh_plugin_rows();
+                self.plugins_visible = true;
+            }
+            // 未实现功能的占位项（enabled=false 已在选中时拦截，此为保险）。
+            MenuAction::TagEdit | MenuAction::Convert | MenuAction::CoverManage => {
+                let m = self.i18n.t("msg.feature_na").into_owned();
+                self.flash_message(&m)
+            }
+            MenuAction::CommandBar => {
+                self.command_mode = true;
+                self.command_query.clear();
+            }
+            // —— 设置 ——
             // 皮肤配色：打开选择器（↑/↓ 即时预览、Enter 确认并持久化、Esc 取消恢复）。
             MenuAction::SkinSelect => {
                 self.skin_prev = self.skin;
@@ -1629,32 +1936,189 @@ impl App {
                     .unwrap_or(0);
                 self.lang_picker = true;
             }
-            // 均衡器：切换面板（Esc 关闭）。插件加载失败时面板内提示。
-            MenuAction::Equalizer => self.eq_visible = !self.eq_visible,
-            MenuAction::Filter => self.filter_visible = !self.filter_visible,
-            // 压缩器：切换面板（Esc 关闭）。
-            MenuAction::Compressor => self.comp_visible = !self.comp_visible,
-            // 插件菜单的清单项：同样打开对应面板（√ 已表示加载态）。
-            MenuAction::PluginEq => self.eq_visible = !self.eq_visible,
-            MenuAction::PluginComp => self.comp_visible = !self.comp_visible,
-            // 可视化面板：直接切到频谱 v 循环的「插件」态；无可视化插件时提示。
-            MenuAction::PluginVisual => {
-                if self.visual_plugins.is_empty() {
-                    let m = self.i18n.t("msg.no_visual_pick").into_owned();
-                    self.flash_message(&m);
-                } else {
-                    self.spectrum_mode = crate::config::SpectrumMode::Plugin;
-                    config.spectrum_mode = self.spectrum_mode;
+            // 配置目录：TUI 不唤起系统文件管理器，显示路径供用户自取。
+            MenuAction::ConfigDir => {
+                let dir = config::config_path()
+                    .parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                let m = self.i18n.t("msg.config_dir").replace("{}", &dir);
+                self.flash_message(&m);
+            }
+            // —— 帮助 ——
+            MenuAction::Shortcuts => self.shortcuts_visible = true,
+            // 使用手册：随发行包分发，显示 exe 同目录手册路径（缺失时给提示）。
+            MenuAction::Manual => {
+                let found = std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| exe.parent().map(|d| d.join("使用手册-tuneux-fx.txt")))
+                    .filter(|p| p.is_file());
+                match found {
+                    Some(p) => {
+                        let m = self
+                            .i18n
+                            .t("msg.manual_path")
+                            .replace("{}", &p.display().to_string());
+                        self.flash_message(&m);
+                    }
+                    None => {
+                        let m = self.i18n.t("msg.manual_missing").into_owned();
+                        self.flash_message(&m);
+                    }
                 }
             }
-            // 介质：菜单显式选择（与 m 键循环同一落地函数）。
-            MenuAction::SetMedium(m) => self.apply_medium(m, config),
-            // 未实现功能的兜底（enabled=false 已在上方拦截，此为保险）。
-            _ => {
-                let m = self.i18n.t("msg.feature_na").into_owned();
-                self.flash_message(&m)
+            MenuAction::About => {
+                self.about_visible = true;
             }
         }
+    }
+
+    /// 菜单项勾选态（下拉行首 √）：开关/单选类按运行时状态计算，其余 None。
+    /// 播放顺序的勾选优先级 shuffle > repeat（混合态勾随机侧）。
+    pub(crate) fn menu_checked(&self, action: MenuAction, config: &Config) -> Option<bool> {
+        match action {
+            MenuAction::ToggleBrowser => Some(self.left_panel == LeftPanel::Browser),
+            MenuAction::ToggleCover => Some(self.left_panel == LeftPanel::Cover),
+            MenuAction::ToggleLyrics => Some(self.lyrics_mode == LyricsMode::Visible),
+            MenuAction::TogglePlaylistView => {
+                Some(self.playlist.view() == tuneux_mediax::PlaylistView::ByAlbum)
+            }
+            MenuAction::SetMedium(m) => Some(self.playback_medium == m),
+            MenuAction::ReplayGain => Some(self.replay_gain),
+            MenuAction::SetPlayOrder(ord) => Some(
+                menu::PlayOrder::checked_for(config.repeat, self.playlist.shuffle_mode()) == ord,
+            ),
+            MenuAction::SpectrumBuiltin => Some(!matches!(
+                self.spectrum_mode,
+                SpectrumMode::Hidden | SpectrumMode::Plugin
+            )),
+            MenuAction::SpectrumPlugin => Some(self.spectrum_mode == SpectrumMode::Plugin),
+            _ => None,
+        }
+    }
+
+    /// 保存播放列表到浏览器当前目录的 playlist.m3u（菜单与 save-m3u 命令共用）。
+    fn save_playlist_m3u(&mut self) {
+        let path = self.browser.cwd().join("playlist.m3u");
+        match self.save_m3u(&path) {
+            Ok(n) => self.flash_message(&format!(
+                "{} {}",
+                self.i18n.t("msg.saved_m3u").replace("{}", &n.to_string()),
+                path.display()
+            )),
+            Err(e) => self.flash_message(&format!("{}：{e}", self.i18n.t("msg.save_fail"))),
+        }
+    }
+
+    /// 从 m3u 载入播放列表（菜单与 load-m3u 命令共用；相对路径按 m3u 所在目录解析）。
+    fn load_playlist_m3u(&mut self, path: &std::path::Path, config: &mut Config) {
+        match self.load_m3u(path, config) {
+            Ok(n) => self.flash_message(&self.i18n.t("msg.loaded").replace("{}", &n.to_string())),
+            Err(e) => self.flash_message(&format!("{}：{e}", self.i18n.t("msg.load_fail"))),
+        }
+    }
+
+    /// 清空播放列表的二次确认流程（x 键与「编辑 › 清空播放列表」共用）。
+    fn request_clear_playlist(&mut self) {
+        if self.pending_clear {
+            self.clear_playlist();
+            self.pending_clear = false;
+            self.pending_clear_at = None;
+            let m = self.i18n.t("msg.cleared").into_owned();
+            self.flash_message(&m);
+        } else if !self.playlist.is_empty() {
+            self.pending_clear = true;
+            self.pending_clear_at = Some(Instant::now());
+            let msg = self.i18n.t("msg.clear_confirm").into_owned();
+            self.flash_message(&msg);
+        }
+    }
+
+    /// 「编辑 › 搜索」：按当前焦点打开搜索（浏览器可见且聚焦时搜浏览器，
+    /// 否则搜播放列表——与 / 键在两个焦点面板上的行为一致）。
+    fn open_search_for_focus(&mut self) {
+        self.search_mode = true;
+        self.search_query.clear();
+        if self.focus == playlist::Panel::Browser && self.left_panel == LeftPanel::Browser {
+            self.search_target = SearchTarget::Browser;
+            self.browser.begin_search();
+            self.search_async();
+        } else {
+            self.search_target = SearchTarget::Playlist;
+            self.jump_selected_to_filter_first();
+        }
+    }
+
+    /// 刷新插件管理页的行缓存：扫描 plugins/ 目录的 .wasm，逐文件标注
+    /// 类型（按命名约定）与加载状态（对运行时清单核对）。
+    fn refresh_plugin_rows(&mut self) {
+        let dir = config::plugins_dir();
+        self.plugin_dir_text = dir.display().to_string();
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| {
+                        let p = e.path();
+                        let stem = p.file_stem()?.to_str()?.to_owned();
+                        (p.extension()?.to_str()? == "wasm").then_some(stem)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        self.plugin_rows = names
+            .into_iter()
+            .map(|stem| {
+                let (kind_key, loaded) = if stem == "equalizer" {
+                    ("msg.pm_kind_dsp", self.eq_plugin.is_some())
+                } else if stem == "compressor" {
+                    ("msg.pm_kind_dsp", self.comp_plugin.is_some())
+                } else if stem.starts_with("皮肤-") {
+                    let loaded = self.skins.iter().any(|s| s.stem == stem);
+                    ("msg.pm_kind_skin", loaded)
+                } else if stem.starts_with("可视化-") {
+                    let loaded = self.visual_plugins.iter().any(|v| v.name == stem);
+                    ("msg.pm_kind_visual", loaded)
+                } else {
+                    ("msg.pm_kind_unknown", false)
+                };
+                PluginRow {
+                    name: stem,
+                    kind_key,
+                    loaded,
+                }
+            })
+            .collect();
+    }
+
+    /// 插件管理页 u：重载已装插件（均衡器 / 压缩器 / 可视化重新走
+    /// 装载验签流程）。皮肤不在其列——皮肤选择器按下标持有选中态，
+    /// 热换清单会让选中错位，皮肤变更重启生效。
+    fn reload_loaded_plugins(&mut self) {
+        if let Some(e) = &self.engine {
+            if self.eq_plugin.is_some() {
+                e.free_eq_slot(self.eq_slot);
+                self.eq_plugin = None;
+            }
+            if let Some((slot, plugin, caps)) = load_eq_plugin(e) {
+                record_plugin_load(tuneux_pinx::EQ_ID, plugin.tristate, caps);
+                self.eq_slot = slot;
+                self.eq_plugin = Some(plugin);
+            }
+            if self.comp_plugin.is_some() {
+                e.free_compressor_slot(self.comp_slot);
+                self.comp_plugin = None;
+            }
+            if let Some((slot, plugin, caps)) = load_comp_plugin(e) {
+                record_plugin_load(tuneux_pinx::COMP_ID, plugin.tristate, caps);
+                self.comp_slot = slot;
+                self.comp_plugin = Some(plugin);
+            }
+            self.visual_plugins = load_visual_plugins(e);
+        }
+        self.refresh_plugin_rows();
+        let m = self.i18n.t("msg.pm_reloaded").into_owned();
+        self.flash_message(&m);
     }
 
     /// 均衡器面板按键：↑/↓ 调当前段 ±1dB，←/→ 切段，e 旁路，r 恢复默认，

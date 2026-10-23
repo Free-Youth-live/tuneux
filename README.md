@@ -2,20 +2,21 @@
 
 # **不羁的青春**® **FreeYouth**®
 
-> 一个基于命令行的音乐播放器。
+> 一个音乐播放器系列，含三个产品：TUI 的 tuneux（基础版）与 tuneux-fx（插件版），以及 GUI 的 tuneux-max（以应用程序形态交付，双击启动、不提供命令行入口）。
 > 用 Rust 编写，跨平台。
 
 ## 特性
 
 - 支持 MP3 / FLAC / WAV / OGG / M4A / AAC / ALAC / Opus / WavPack 等格式（核心格式全部纯 Rust 解码，无需系统编解码器）
-- **FFmpeg 扩展格式**（需要您自己在电脑上安装FFmpeg）：APE / WMA / FLV / TAK / AC3 / DTS / DSD（DSF/DFF）等格式，自动调用系统 FFmpeg 进程解码；未安装 FFmpeg 则跳过
+- **FFmpeg 扩展格式**（发布包随附 FFmpeg 组件；未随附平台或精简包则检测系统安装）：APE / WMA / FLV / TAK / AC3 / DTS / DSD（DSF/DFF）等格式自动解码；无组件则跳过
 - **无缝播放**：同格式曲目间无间隙衔接（Gapless，下一曲预载）
 - **设备热切换**：播放中拔插耳机 / 切换输出设备自动重连，无需重启程序
 - **系统媒体键**：Linux 经 MPRIS（桌面媒体键自动路由）；Windows 用低层键盘钩子捕获媒体键——终端在后台也能控制；macOS 因需 app bundle 暂不支持；可用 `media_keys_enabled = false` 关闭
 - **ReplayGain 响度归一**：按 −14 LUFS 目标统一各专辑音量（**默认关闭**；fx 可在「设置 › ReplayGain 响度归一」开关，或在配置文件设 `replay_gain = true`——基础版为 `tuneux.toml`、fx 为 `tuneux-fx.toml`——开启后下次播放生效）
 - **自定义键位**：`tuneux.toml` 的 `keymap` 可重映射播放控制键
-- **插件化（tuneux-fx）**：WASM 插件系统——均衡器 / 压缩器 DSP 插件（F9 均衡器面板、动态多槽位叠加）与皮肤插件（界面配色只来自皮肤：随包「Norton 蓝」「午夜蓝」两款验签自动生效，删插件回落终端原生配色）。插件开发见仓库根《插件开发指南.txt》（host ABI v1）
-- **菜单栏与命令模式（tuneux-fx）**：F10 / 数字 1-8 菜单栏；`:` 命令模式（m3u、书签、歌词偏移等）
+- **插件化（tuneux-fx）**：WASM 插件系统——均衡器 / 压缩器 DSP 插件（e 键均衡器面板、动态多槽位叠加）与皮肤插件（界面配色只来自皮肤：随包「Norton 蓝」「午夜蓝」两款验签自动生效，删插件回落终端原生配色）。插件开发见仓库根《插件开发指南.txt》（host ABI v2）
+- **菜单栏与命令模式（tuneux-fx）**：数字 1-8 菜单栏；`:` 命令模式（m3u、书签、歌词偏移等）
+- **图形界面（tuneux-max）**：fx TUI 观感的 egui 图形界面——字符网格渲染、鼠标键盘双操控；模块自由组合（dock 分割树）；皮肤 / 字体 / 语言可换、命令模式；音频内核与 tuneux / tuneux-fx 完全同源（无损解码、Gapless 无缝切曲、断点续播、CUE 分轨、ReplayGain、介质风格 DSP 同口径）
 - **CUE 分轨**：整轨 + 同名 `.cue` 自动分轨播放
 - **歌词**：优先同目录 `.lrc`，无则读取歌曲内嵌歌词标签
 - 直接运行 `tuneux` 进入交互式 TUI，无子命令
@@ -24,7 +25,7 @@
 - 播放列表：加入目录后按"专辑-曲序"自动排序展示与播放
 - 专辑封面：`c` 键三态（关 → 单封面 → 封面网格 → 关），封面网格按专辑分组浏览
 - 元数据：标题、艺术家、专辑、曲序、编码格式、码率、采样率、位深
-- 实时频谱可视化（`v` 键四态：关 → 半屏 → 全屏 Matrix 频谱 → 示波器；fx 为五态，增加插件面板）
+- 实时频谱可视化（`v` 键四态：关 → 半屏 → 全屏 Matrix 频谱 → 示波器；fx 为六态，再加插件面板与指针表）
 - 电平表：顶部条右侧实时显示左右声道电平
 - **介质风格（播放介质 DSP）**：`m` 键在 无 → 4 档磁带 → 4 档黑胶 间循环，**只修饰听感、不占界面**（默认关闭，界面照常切换）——磁带从新到旧（底噪 / 磁饱和 / 抖晃 / 掉粉 + 周期带盘老化），黑胶从新到旧（底噪 / 唱针噼啪 / 槽纹磨损 + 周期偏心 wow）
 - `?` 键"关于"弹窗：版本号、简介、开源声明、版权
@@ -32,7 +33,7 @@
 
 ## 支持的音频格式
 
-tuneux 的解码采用「纯 Rust 为主 + FFmpeg 进程外补位」的双层架构：MP3 / FLAC / WAV / OGG / M4A / AAC / ALAC / Opus / WavPack 等核心格式由纯 Rust 解码（自研 WAV / FLAC / WavPack / CD-DA 后端 + [symphonia](https://github.com/pdeljanov/Symphonia) + Opus）进程内解码，**无需任何系统编解码器**；APE / WMA / DSD 等格式则调用系统 FFmpeg 进程解码（如果您电脑未安装则自动跳过）。核心格式如下：
+tuneux 的解码采用「纯 Rust 为主 + FFmpeg 进程外补位」的双层架构：MP3 / FLAC / WAV / OGG / M4A / AAC / ALAC / Opus / WavPack 等核心格式由纯 Rust 解码（自研 WAV / FLAC / WavPack / CD-DA 后端 + [symphonia](https://github.com/pdeljanov/Symphonia) + Opus）进程内解码，**无需任何系统编解码器**；APE / WMA / DSD 等格式由随包的 FFmpeg 组件进程外解码（未随附组件的平台或精简包则检测系统 ffmpeg，缺失自动跳过）。核心格式如下：
 
 | 格式        | 扩展名            | 编码类型                   | 码率范围                   | 采样率                                                    | 位深                     | 是否无损 |
 | --------- | -------------- | ---------------------- | ---------------------- | ------------------------------------------------------ | ---------------------- | ---- |
@@ -52,7 +53,7 @@ tuneux 的解码采用「纯 Rust 为主 + FFmpeg 进程外补位」的双层架
 - **采样率/位深不匹配**：当文件采样率与音频输出设备不一致时，tuneux 自动使用高质量重采样（rubato）避免变调变速。
 - **无缝播放（Gapless）**：同采样率曲目间预载下一曲、无间隙衔接；采样率变化时自动降级（短间隙）。
 - **CUE 分轨**：`.cue` 支持 UTF-8 / UTF-16 / GB18030 编码；分轨曲目快进快退限制在本曲区间内；支持 cue+bin 光盘镜像（cue 里 FILE 指向 `.bin` 时经自研 CDDA 后端解码）；数据轨（非 AUDIO 轨）自动跳过。
-- **DSD（可选，经 ffmpeg）**：DSF / DFF（SACD 使用的 1-bit Delta-Sigma 调制格式）可经系统 ffmpeg 解码（ffmpeg 自动完成 DSD→PCM 转换后以 32-bit 浮点送入音频设备）；未安装 ffmpeg 时提示安装（见「关于 FFmpeg」）。DSD 原生位流不直通输出，统一转为 PCM 播放。
+- **DSD（经 FFmpeg 组件）**：DSF / DFF（SACD 使用的 1-bit Delta-Sigma 调制格式）经 FFmpeg 进程外组件解码（自动完成 DSD→PCM 转换后以浮点送入音频设备）；组件缺席时提示（见「关于 FFmpeg」）。DSD 原生位流不直通输出，统一转为 PCM 播放。
 
 ### 单个文件大小限制
 
@@ -61,20 +62,28 @@ tuneux 的解码采用「纯 Rust 为主 + FFmpeg 进程外补位」的双层架
 - **FLAC / ALAC / MP3 / OGG / AAC**：格式本身无 4 GB 限制，实际可播放数 GB 乃至更大的高清无损文件。
 - **64 位系统**下实测可正常播放数 GB 的 24-bit/192 kHz 无损文件；32 位进程受地址空间限制，建议单文件不超过约 2 GB。
 
-## 关于 FFmpeg（可选扩展格式）
+## 关于 FFmpeg（扩展格式解码组件）
 
 **核心格式不需要它**：MP3 / FLAC / WAV / OGG / M4A / AAC / ALAC / Opus / WavPack 全部由纯 Rust 解码库进程内解码，tuneux 自带、零依赖，不装任何东西都能播。
 
-**FFmpeg 支持格式**：APE / WMA / FLV / TAK / AC3 / DTS / DSD（DSF/DFF）等较少见的格式，tuneux 检测到系统里有 `ffmpeg` 命令就自动调用它解码；没有则跳过（打开这类文件时会提示），**不需要任何配置**。
+**FFmpeg 支持格式**：APE / WMA / FLV / TAK / AC3 / DTS / DSD（DSF/DFF）等较少见的格式，tuneux 检测到 FFmpeg 组件（随包附带或系统已安装的 `ffmpeg` 命令）就自动调用它解码；没有则跳过（打开这类文件时会提示），**不需要任何配置**。
 
-### 为什么让用户自己安装，而不是 tuneux 替你装好？
+### tuneux 如何合规使用 FFmpeg
 
-- **保持"纯 Rust、纯离线"定位**：核心解码完全自包含、无系统依赖、无联网安装步骤；捆绑 ffmpeg 会把几十 MB 的外部二进制塞进安装包，破坏单文件便携与离线特性。
-- **体积与维护成本**：ffmpeg 本体 + 依赖动辄几十 MB，且需随上游持续更新安全补丁；捆绑会显著增大每个平台的下载体积和发布负担。
-- **许可证复杂度**：ffmpeg 采用 GPL / LGPL 双轨授权（取决于编译选项），不同发行版打包的 ffmpeg 许可状态不同；tuneux 本身是木兰宽松许可证 v2，捆绑分发会引入额外的许可证兼容负担与法律风险。
-- **平台习惯不同**：Windows / macOS / Linux 各有成熟的安装渠道（包管理器、Homebrew 等），让用户按平台习惯安装最省事、最安全。
+tuneux 在**符合 FFmpeg 开源协议**的前提下使用 FFmpeg：
 
-### 三个系统的安装方法
+- **进程外独立组件**：tuneux 不链接 FFmpeg 的任何库，而是以独立子进程
+  调用 `ffmpeg` 命令行（经管道读写 PCM 数据），不构成衍生作品意义上的
+  链接；tuneux 本体保持纯木兰宽松许可证 v2；
+- **许可形态**：随包附带的 FFmpeg 为官方源码的**未修改 LGPL 构建**
+  （LGPL-2.1-or-later；不启用 GPL / nonfree 部件）；
+- **义务随包履行**：许可文本、版本与哈希登记、源码指引均随包
+  （见包内 `ffmpeg/` 目录与 THIRD-PARTY-LICENSES.txt）；
+- **两种获取途径**：发布包随附的组件优先；未随附的版本或精简包则检测
+  系统已安装的 `ffmpeg` 自动调用——找不到就跳过（打开这类文件时会
+  提示），**不需要任何配置**。
+
+### 系统自装 FFmpeg（无组件平台 / 精简包适用）
 
 | 系统                   | 安装命令 / 方法                                                                                        | 验证                       |
 | -------------------- | ------------------------------------------------------------------------------------------------ | ------------------------ |
@@ -86,15 +95,16 @@ tuneux 的解码采用「纯 Rust 为主 + FFmpeg 进程外补位」的双层架
 
 安装完成后**无需任何配置**：tuneux 每次打开扩展格式文件时自动探测 `ffmpeg`，找到即用。
 
-### 注意事项与风险
+### 注意事项
 
-- **只装扩展格式才需要 ffmpeg**；不装也不影响核心格式的播放、Gapless、CUE 等全部功能。
-- **请从官方渠道安装**（系统包管理器 / ffmpeg.org / Homebrew），不要下载来路不明的"绿色版"，以免捆绑恶意软件。
+- **只播扩展格式才需要 FFmpeg**；没有它也不影响核心格式的播放、Gapless、CUE 等全部功能。
+- **系统自装请从官方渠道**（系统包管理器 / ffmpeg.org / Homebrew），不要下载来路不明的"绿色版"，以免捆绑恶意软件。
 - **PATH 生效问题**：Windows 安装后如仍提示"ffmpeg 未安装或不在 PATH 中"，需**重开终端**，或手动把 ffmpeg 的 `bin` 目录加入系统 PATH；macOS 用 Homebrew 时请确认 `/opt/homebrew/bin`（Apple Silicon）或 `/usr/local/bin`（Intel）在 PATH 中。
-- **版本建议**：推荐较新的 ffmpeg（5.x 及以上）；过旧版本可能缺少个别格式的解码器。
-- **解码质量**：无论是否使用 ffmpeg，tuneux 统一把解码结果转换为 32 位浮点 PCM 送入音频设备，不引入额外质量损失。
+- **解码质量**：无论经哪条途径，tuneux 统一把解码结果以浮点 PCM 送入音频设备，不引入额外质量损失。
 
 ## 快捷键
+
+> 下表为 tuneux / tuneux-fx（TUI）的键位；tuneux-max 的键位见其随包《使用手册-tuneux-max.txt》。
 
 | 按键                     | 作用                                      |
 | ---------------------- | --------------------------------------- |
@@ -129,7 +139,7 @@ tuneux 的解码采用「纯 Rust 为主 + FFmpeg 进程外补位」的双层架
 
 - **介质风格（playback_medium）**：`m` 键切换的介质风格（只修饰声音）会写入 `tuneux.toml` 的 `playback_medium`，下次启动自动恢复。默认 `none`（无修饰）；旧配置短名 `tape` / `vinyl` 兼容解析为对应中档。tuneux-fx 另有「介质」菜单可逐档选择。
 
-- **自定义键位（keymap）**：在 `tuneux.toml` 中可重映射播放控制键。动作名：`toggle_play`（播放/暂停）、`next`（下一曲）、`prev`（上一曲）、`volume_up`（音量+）、`volume_down`（音量−）。键描述语法：`[shift+][ctrl+][alt+]<键名>`，键名为单字符或 `space` / `tab` / `enter` / `esc` / `backspace` / `up` / `down` / `left` / `right` / `home` / `end`。示例：
+- **自定义键位（keymap）**：在 `tuneux.toml` 中可重映射播放控制键。动作名：`toggle_play`（播放/暂停）、`next`（下一曲）、`prev`（上一曲）、`volume_up`（音量+）、`volume_down`（音量−）、`cycle_repeat`（循环模式）、`toggle_shuffle`（随机）、`cycle_medium`（介质）、`cycle_visual`（频谱）、`toggle_group_view`（分组视图）、`toggle_lyrics`（歌词）、`cycle_cover`（封面）、`toggle_browser`（浏览器）。键描述语法：`[shift+][ctrl+][alt+]<键名>`，键名为单字符或 `space` / `tab` / `enter` / `esc` / `backspace` / `up` / `down` / `left` / `right` / `home` / `end`。示例：
 
   ```toml
   [keymap]
@@ -157,57 +167,98 @@ tuneux 的解码采用「纯 Rust 为主 + FFmpeg 进程外补位」的双层架
 | ------- | --------------------------- | ----------------------------------- | ----------------------------------------------------------------------------- |
 | Windows | Windows 10                  | x86_64、aarch64                      | 无                                                                             |
 | macOS   | macOS 10.13（High Sierra）及以上 | x86_64（Intel）、aarch64（M 系列）         | 无                                                                             |
-| Linux   | 主流发行版（内核自带 ALSA 即可）         | x86_64、aarch64（另支持 armv7、riscv64 等） | libasound2（多数发行版预装）；可选 ffmpeg（播放 APE/WMA 等扩展格式）；桌面环境（媒体键经 MPRIS，GNOME/KDE 均可） |
+| Linux   | 主流发行版（内核自带 ALSA 即可）         | x86_64、aarch64（另支持 armv7、riscv64 等） | libasound2（多数发行版预装）；随包 ffmpeg（播放 APE/WMA 等扩展格式）；桌面环境（媒体键经 MPRIS，GNOME/KDE 均可） |
+
+> 上表为 tuneux / tuneux-fx（TUI 双产品）的平台面。**tuneux-max 的 Linux 版本后续支持**——
+> 本版 max 提供 macOS 与 Windows 应用包，**Linux 应用包暂未提供**；但 max 在 Linux 上
+> 可自行构建运行：`cargo build --release -p tuneux-max`（GUI 依赖见「构建」节）。
 
 最低 Rust 工具链版本：**1.88+**（ratatui 0.30 要求）
 
 ## 构建
 
+本仓是 Cargo workspace，含三个可执行产品：`tuneux`（TUI 基础版）、`tuneux-fx`（TUI 插件版）、`tuneux-max`（GUI 版）。
+
 ```bash
-# 调试构建
+# 调试构建（默认构建全部三个产品）
 cargo build
 
 # 发布构建（启用 LTO、去除符号，体积更小）
 cargo build --release
 
-# 运行
-cargo run --release
+# 只构建 TUI 双产品（Linux 上未装 GUI 开发库时用这个）
+cargo build --release -p tuneux -p tuneux-fx
+
+# 运行 TUI
+cargo run --release -p tuneux
 ```
 
-编译产物位于 `target/release/tuneux`（或 `tuneux.exe`），可单独复制到任意目录运行。
+编译产物位于 `target/release/`：`tuneux` / `tuneux-fx` / `tuneux-max`（Windows 下为对应的 `.exe`），可单独复制到任意目录运行。
+
+### 构建 tuneux-max（GUI 版）
+
+```bash
+# 只构建 max
+cargo build --release -p tuneux-max
+
+# 构建并直接运行
+cargo run --release -p tuneux-max
+```
+
+编译产物为 `target/release/tuneux-max`（Windows 下 `tuneux-max.exe`）。max 的发布应用包形态见「下载与首次运行」节（macOS 为 `.app` bundle，Windows 为 GUI 子系统 `.exe`）。
+
+> **Linux 上自行构建运行 max**：**Linux 应用包暂未提供，后续支持 tuneux-max 的 Linux 版本**；
+> 但 max 在 Linux 上可正常构建运行，方式即上面的 `cargo build --release -p tuneux-max`。
+> 与 TUI 的差别在依赖面：max 是 GUI 程序（egui / eframe），除音频后端所需的 ALSA 开发库外，
+> 还需 **X11 / Wayland 与 GL 相关开发库，具体包名视发行版而定**（TUI 只需 libasound2）。
+> Wayland 与 X11 环境下均可运行；原生文件对话框走 xdg-portal（纯 Rust，不引入 GTK 运行时依赖）。
 
 ## 下载与首次运行
 
-| 系统      | CPU 架构              | 文件（以 v0.5.5 为例）                     |
+| 系统      | CPU 架构              | 文件（以 v0.6.0 为例）                     |
 | ------- | ------------------- | ----------------------------------- |
-| Windows | x86_64（多数 PC）       | `tuneux-0.5.5-windows-x86_64.zip`   |
-| Windows | arm64               | `tuneux-0.5.5-windows-arm64.zip`    |
-| macOS   | Apple Silicon（M 系列） | `tuneux-0.5.5-macos-arm64.tar.gz`   |
-| macOS   | Intel               | `tuneux-0.5.5-macos-x86_64.tar.gz`  |
-| Linux   | x86_64              | `tuneux-0.5.5-linux-x86_64.tar.gz`  |
-| Linux   | arm64               | `tuneux-0.5.5-linux-arm64.tar.gz`   |
+| Windows | x86_64（多数 PC）       | `tuneux-0.6.0-windows-x86_64.zip`   |
+| Windows | arm64               | `tuneux-0.6.0-windows-arm64.zip`    |
+| macOS   | Apple Silicon（M 系列） | `tuneux-0.6.0-macos-arm64.tar.gz`   |
+| macOS   | Intel               | `tuneux-0.6.0-macos-x86_64.tar.gz`  |
+| Linux   | x86_64              | `tuneux-0.6.0-linux-x86_64.tar.gz`  |
+| Linux   | arm64               | `tuneux-0.6.0-linux-arm64.tar.gz`   |
 
-插件版 **tuneux-fx** 另有一套下载包（以 v0.5.5 为例），压缩包内额外含 `plugins/` 插件目录（均衡器 / 压缩器 / 皮肤「Norton 蓝」「午夜蓝」）与《插件开发指南.txt》：
+插件版 **tuneux-fx** 另有一套下载包（以 v0.6.0 为例），压缩包内额外含 `plugins/` 插件目录（均衡器 / 压缩器 / 皮肤「Norton 蓝」「午夜蓝」）与《插件开发指南.txt》：
 
 | 系统      | CPU 架构              | 文件                                     |
 | ------- | ------------------- | -------------------------------------- |
-| Windows | x86_64（多数 PC）       | `tuneux-fx-0.5.5-windows-x86_64.zip`   |
-| Windows | arm64               | `tuneux-fx-0.5.5-windows-arm64.zip`    |
-| macOS   | Apple Silicon（M 系列） | `tuneux-fx-0.5.5-macos-arm64.tar.gz`   |
-| macOS   | Intel               | `tuneux-fx-0.5.5-macos-x86_64.tar.gz`  |
-| Linux   | x86_64              | `tuneux-fx-0.5.5-linux-x86_64.tar.gz`  |
-| Linux   | arm64               | `tuneux-fx-0.5.5-linux-arm64.tar.gz`   |
+| Windows | x86_64（多数 PC）       | `tuneux-fx-0.6.0-windows-x86_64.zip`   |
+| Windows | arm64               | `tuneux-fx-0.6.0-windows-arm64.zip`    |
+| macOS   | Apple Silicon（M 系列） | `tuneux-fx-0.6.0-macos-arm64.tar.gz`   |
+| macOS   | Intel               | `tuneux-fx-0.6.0-macos-x86_64.tar.gz`  |
+| Linux   | x86_64              | `tuneux-fx-0.6.0-linux-x86_64.tar.gz`  |
+| Linux   | arm64               | `tuneux-fx-0.6.0-linux-arm64.tar.gz`   |
+
+GUI 版 **tuneux-max** 以平台原生应用包交付（双击启动，不提供命令行入口）：
+
+| 系统      | CPU 架构              | 文件（以 v0.6.0 为例）                                              |
+| ------- | ------------------- | ------------------------------------------------------------ |
+| macOS   | Apple Silicon（M 系列） | `tuneux-max-0.6.0-macos-arm64.zip`（内含 `tuneux-max.app`）      |
+| macOS   | Intel               | `tuneux-max-0.6.0-macos-x86_64.zip`（内含 `tuneux-max.app`）     |
+| Windows | x86_64              | `tuneux-max-0.6.0-windows-x86_64.zip`                        |
+
+> macOS 包解压后外层还有一层版本文件夹，里面是 `tuneux-max.app` 与《使用手册-tuneux-max.txt》（同级）；
+> 首次打开见下面的「macOS 首次运行（tuneux-max）」。
+>
+> **tuneux-max 的 Linux 版本后续支持**——Linux 应用包暂未提供；Linux 上可自行构建运行
+> （`cargo build --release -p tuneux-max`，见「构建」节）。
 
 > 预编译二进制未做代码签名，首次运行会被系统拦截，按下面步骤放行即可。
 > 若不想处理提示，用源码自行编译（`cargo build --release`）则不会有任何拦截。
 
 ### Windows 首次运行
 
-1. 解压 zip，双击 `tuneux.exe`
+1. 解压 zip，双击 `tuneux.exe`（tuneux-fx 为 `tuneux-fx.exe`，tuneux-max 为 `tuneux-max.exe`）
 2. 出现蓝色「Windows 已保护你的电脑」→ 点「更多信息」
 3. 点「仍要运行」
 
-### macOS 首次运行
+### macOS 首次运行（tuneux / tuneux-fx）
 
 在「终端」里执行：
 
@@ -216,7 +267,7 @@ cargo run --release
 cd ~/Downloads
 
 # 2. 解压
-tar xzf tuneux-0.5.5-macos-arm64.tar.gz
+tar xzf tuneux-0.6.0-macos-arm64.tar.gz
 
 # 3. 清除隔离属性（关键一步）
 xattr -cr tuneux
@@ -227,13 +278,50 @@ xattr -cr tuneux
 
 `xattr -cr` 会清除文件上所有隔离标记，之后就能正常打开了（双击或 `./tuneux` 都行）。
 
+### macOS 首次运行（tuneux-max）
+
+max 的交付物与 TUI 不同：归档是 `.zip`（不是 `.tar.gz`），解压后**外层还有一层版本文件夹**，
+里面是 `tuneux-max.app` 与《使用手册-tuneux-max.txt》（同级）。max 未做代码签名与公证，
+首次打开会被 Gatekeeper 拦截，二选一放行：
+
+**方式一：右键打开（推荐，不用终端）**
+
+1. 双击 `tuneux-max-0.6.0-macos-arm64.zip` 解压，进入含 `tuneux-max.app` 的那层版本文件夹
+2. 右键点 `tuneux-max.app` → 选「打开」
+3. 弹窗里再点「打开」；之后双击即可正常启动
+
+**方式二：终端清除隔离属性**
+
+```bash
+cd ~/Downloads
+
+# 1. 解压（文件名按架构替换：arm64 = Apple Silicon，x86_64 = Intel）
+ditto -x -k tuneux-max-0.6.0-macos-arm64.zip .
+
+# 2. 清除隔离属性：目标是 .app 这个 bundle，不是裸二进制
+xattr -cr tuneux-max-0.6.0-macos-arm64/tuneux-max.app
+
+# 3. 启动（双击 .app 亦可）
+open tuneux-max-0.6.0-macos-arm64/tuneux-max.app
+```
+
+若仍被拦：系统设置 › 隐私与安全性 › 拉到底部点「仍要打开」。若提示「已损坏，无法打开」，
+那是隔离属性所致（包本身没坏），用方式二的 `xattr -cr` 清除即可。
+
+把 `.app` 拖进「应用程序」文件夹即为常规安装。注意配置与播放列表默认写在 `.app` 内部
+（便携模式），**换位置启动会像丢了配置**——数据其实留在原处、不会自动迁移；建议固定从
+一处启动，详见包内《使用手册-tuneux-max.txt》的【数据与持久化】段。
+
 ### Linux 首次运行
 
 ```bash
-tar xzf tuneux-0.5.5-linux-x86_64.tar.gz
+tar xzf tuneux-0.6.0-linux-x86_64.tar.gz
 chmod +x tuneux
 ./tuneux
 ```
+
+> tuneux-max 的 Linux 应用包暂未提供（后续支持 tuneux-max 的 Linux 版本）；
+> Linux 上可自行构建运行 max，见「构建 › 构建 tuneux-max（GUI 版）」。
 
 ## 项目代码约定
 
@@ -243,7 +331,7 @@ chmod +x tuneux
 
 ## 隐私与安全
 
-音频内核（tuneux-corex / tuneux-mediax）**纯离线、永不联网**。当前版本（tuneux / tuneux-fx）不含任何联网功能，播放 NAS 上的音乐需要操作系统把网盘映射到本地。将来 tuneux-max（或 tuneux-fx 的后续版本）可能提供**可选**的联网能力（如在线歌词 / 封面），默认关闭、经能力制授权、可编译期核查。**所有版本都不收集任何数据。**
+音频内核（tuneux-corex / tuneux-mediax）**纯离线、永不联网**。当前三个产品（tuneux / tuneux-fx / tuneux-max）均不含任何联网功能，播放 NAS 上的音乐需要操作系统把网盘映射到本地。后续版本可能提供**可选**的联网能力（如在线歌词 / 封面），默认关闭、经能力制授权、可编译期核查。**所有版本都不收集任何数据。**
 
 ## 许可
 

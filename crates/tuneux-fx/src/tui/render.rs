@@ -22,17 +22,18 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tuneux_corex as audio;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::app::menu::{menus, MenuAction};
+use super::app::menu::menus;
 use super::app::App;
 use super::theme::Palette;
-use crate::config::{Config, LeftPanel, LyricsMode, PlaylistView, SpectrumMode};
+use crate::config::{Config, LeftPanel, LyricsMode, SpectrumMode};
 use crate::fs_browser::Entry;
 use crate::playlist::{Panel, PlaylistRow, Selection};
 use tuneux_mediax::lyrics;
 
 use self::gauge::draw_gauge_panel;
 use self::popup::{
-    draw_about, draw_compressor, draw_equalizer, draw_lang_picker, draw_skin_picker,
+    draw_about, draw_bookmarks, draw_compressor, draw_equalizer, draw_lang_picker,
+    draw_plugin_manager, draw_properties, draw_shortcuts, draw_skin_picker,
 };
 use self::spectrum::{
     draw_audio_panel, draw_band_column, draw_level_meter, draw_oscilloscope, draw_visual_panel,
@@ -275,7 +276,7 @@ pub fn draw(
     draw_fkey_bar(frame, vertical[4], &pal, &app.i18n);
 
     // 菜单下拉：覆盖在工作区之上（在关于弹窗之前）。
-    draw_menu_dropdown(frame, area, app, &pal);
+    draw_menu_dropdown(frame, area, app, config, &pal);
 
     // 均衡器面板：覆盖在工作区之上（关于弹窗之前）。
     if app.eq_visible {
@@ -344,9 +345,12 @@ pub fn draw(
         draw_compressor(frame, area, app, &pal);
     }
 
-    // 关于弹窗：最后绘制，覆盖在其它内容之上。
+    // 弹窗层：最后绘制，覆盖在其它内容之上。
     if app.about_visible {
         draw_about(frame, area, app, &pal, &app.i18n);
+    }
+    if app.properties_visible {
+        draw_properties(frame, area, app, &pal);
     }
 
     // 皮肤选择器：最上层（覆盖关于弹窗）。
@@ -356,9 +360,20 @@ pub fn draw(
     if app.lang_picker {
         draw_lang_picker(frame, area, app, &pal);
     }
+
+    // 快捷键一览 / 书签列表 / 插件管理：最上层弹窗。
+    if app.shortcuts_visible {
+        draw_shortcuts(frame, area, app, &pal);
+    }
+    if app.bookmark_popup {
+        draw_bookmarks(frame, area, app, &pal);
+    }
+    if app.plugins_visible {
+        draw_plugin_manager(frame, area, app, &pal);
+    }
 }
 
-/// 菜单栏（顶部 1 行）：顶级菜单（文件…帮助 + 介质）；激活栏（menu_top）反白，下拉见 [`draw_menu_dropdown`]。
+/// 菜单栏（顶部 1 行）：顶级菜单（文件…帮助，共八栏）；激活栏（menu_top）反白，下拉见 [`draw_menu_dropdown`]。
 fn draw_menu_bar(frame: &mut ratatui::Frame, area: Rect, app: &App, pal: &Palette) {
     let ms = menus();
     let mut spans: Vec<Span> = Vec::new();
@@ -394,9 +409,34 @@ pub(super) fn menu_x_offset_translated(index: usize, app: &App) -> u16 {
     x
 }
 
+/// 菜单下拉的期望尺寸（未按可用区裁剪）：宽 = 最宽项（标签+快捷键/▸尾标）
+/// + 勾选位与边距；高 = 项数 + 2 边框。
+fn menu_list_dim(items: &[crate::tui::app::menu::MenuItem], app: &App) -> (usize, usize) {
+    let mut item_w = 0usize;
+    for it in items {
+        let suffix_w = if it.children.is_some() {
+            3 // " ▸" 尾标位
+        } else if it.shortcut.is_empty() {
+            0
+        } else {
+            UnicodeWidthStr::width(it.shortcut) + 2
+        };
+        item_w = item_w.max(UnicodeWidthStr::width(app.i18n.t(it.label).as_ref()) + 3 + suffix_w);
+        // 3 = 勾选位 2 + 间隔 1
+    }
+    (item_w + 2, items.len() + 2)
+}
+
 /// 菜单下拉框：菜单栏激活且展开时，覆盖在工作区之上渲染当前栏的菜单项。
-/// 视图开关类项按运行时状态打 √；不可用项灰显；选中项反白。
-fn draw_menu_dropdown(frame: &mut ratatui::Frame, area: Rect, app: &App, pal: &Palette) {
+/// 开关/单选类项按运行时状态打 √；子菜单父项带 ▸ 尾标；不可用项灰显；
+/// 选中项反白。子菜单展开时在其父项右侧绘制第二层下拉。
+fn draw_menu_dropdown(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    app: &App,
+    config: &Config,
+    pal: &Palette,
+) {
     if !(app.menu_active && app.menu_dropdown) {
         return;
     }
@@ -404,28 +444,77 @@ fn draw_menu_dropdown(frame: &mut ratatui::Frame, area: Rect, app: &App, pal: &P
     let Some(menu) = ms.get(app.menu_top) else {
         return;
     };
-
-    // 下拉宽度 = 最宽项（标签+快捷键）+ 边距；高度 = 项数 + 2 边框。
-    let mut item_w = 0usize;
-    for it in &menu.items {
-        let sw = if it.shortcut.is_empty() {
-            0
-        } else {
-            UnicodeWidthStr::width(it.shortcut) + 2
-        };
-        item_w = item_w.max(UnicodeWidthStr::width(app.i18n.t(it.label).as_ref()) + 3 + sw);
-        // 3 = 勾选位 2 + 间隔 1
-    }
-    let box_w = ((item_w + 2).min(area.width as usize)) as u16;
-    let box_h = ((menu.items.len() + 2).min(area.height.saturating_sub(1) as usize)) as u16;
-    if box_w < 4 || box_h < 3 {
+    let right = area.x + area.width;
+    // 主下拉：对齐标题列；右侧放不下时整体左移，保证完整显示。
+    let (want_w, _) = menu_list_dim(&menu.items, app);
+    let x = area.x + menu_x_offset_translated(app.menu_top, app);
+    let x = x.min(right.saturating_sub(want_w as u16).max(area.x));
+    let Some(main_box) = draw_menu_list(
+        frame,
+        area,
+        app,
+        config,
+        pal,
+        &menu.items,
+        app.menu_item,
+        x,
+        area.y + 1,
+    ) else {
         return;
+    };
+    // 子菜单：贴在主下拉右缘、与父项同行（父项行 = 框体首行 + 边框 1 + 下标）；
+    // 右缘放不下时同样左移（极端窄终端下允许叠在主下拉上，不裁字）。
+    if let Some(sub_idx) = app.menu_sub {
+        if let Some(children) = menu
+            .items
+            .get(sub_idx)
+            .and_then(|it| it.children.as_deref())
+        {
+            let (sub_w, _) = menu_list_dim(children, app);
+            let sub_x = main_box
+                .x
+                .saturating_add(main_box.width)
+                .min(right.saturating_sub(sub_w as u16).max(area.x));
+            let sub_y = main_box.y + 1 + sub_idx as u16;
+            draw_menu_list(
+                frame,
+                area,
+                app,
+                config,
+                pal,
+                children,
+                app.menu_sub_item,
+                sub_x,
+                sub_y,
+            );
+        }
     }
-    let x =
-        area.x + menu_x_offset_translated(app.menu_top, app).min(area.width.saturating_sub(box_w));
+}
+
+/// 绘制一层菜单下拉（主下拉与子菜单共用），返回实际框体矩形（过小不画返回 None）。
+#[allow(clippy::too_many_arguments)]
+fn draw_menu_list(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    app: &App,
+    config: &Config,
+    pal: &Palette,
+    items: &[crate::tui::app::menu::MenuItem],
+    sel: usize,
+    x: u16,
+    y: u16,
+) -> Option<Rect> {
+    let (want_w, want_h) = menu_list_dim(items, app);
+    let avail_w = (area.x + area.width).saturating_sub(x) as usize;
+    let avail_h = (area.y + area.height).saturating_sub(y) as usize;
+    let box_w = (want_w.min(avail_w)) as u16;
+    let box_h = (want_h.min(avail_h)) as u16;
+    if box_w < 4 || box_h < 3 {
+        return None;
+    }
     let box_area = Rect {
         x,
-        y: area.y + 1,
+        y,
         width: box_w,
         height: box_h,
     };
@@ -441,44 +530,30 @@ fn draw_menu_dropdown(frame: &mut ratatui::Frame, area: Rect, app: &App, pal: &P
     frame.render_widget(block, box_area);
 
     let inner_w = inner.width as usize;
-    let lines: Vec<Line> = menu
-        .items
+    let lines: Vec<Line> = items
         .iter()
         .enumerate()
         .map(|(i, it)| {
-            // 视图开关类的勾选态（按运行时状态）。
-            let checked: Option<bool> = match it.action {
-                MenuAction::ToggleBrowser => Some(app.left_panel == LeftPanel::Browser),
-                MenuAction::ToggleCover => Some(app.left_panel == LeftPanel::Cover),
-                MenuAction::ToggleLyrics => Some(app.lyrics_mode == LyricsMode::Visible),
-                MenuAction::ToggleSpectrum => Some(app.spectrum_mode != SpectrumMode::Hidden),
-                MenuAction::TogglePlaylistView => {
-                    Some(app.playlist.view() == PlaylistView::ByAlbum)
-                }
-                // 介质菜单：当前生效的介质打勾。
-                MenuAction::SetMedium(m) => Some(app.playback_medium == m),
-                // ReplayGain：开关状态打勾。
-                MenuAction::ReplayGain => Some(app.replay_gain),
-                // 插件清单：√ = 该插件已加载（运行时从 plugins/ 目录装载）。
-                MenuAction::PluginEq => Some(app.eq_plugin.is_some()),
-                MenuAction::PluginComp => Some(app.comp_plugin.is_some()),
-                MenuAction::PluginVisual => Some(!app.visual_plugins.is_empty()),
-                _ => None,
-            };
+            // 开关/单选类的勾选态（按运行时状态）。
+            let checked = app.menu_checked(it.action, config);
             let mark = match checked {
                 Some(true) => "√ ",
-                Some(false) => "  ",
-                None => "  ",
+                _ => "  ",
             };
-            // 标签 + （快捷键右对齐）。
+            // 标签 + （快捷键 / ▸ 尾标右对齐）。
             let mut text = format!("{mark}{}", app.i18n.t(it.label));
-            if !it.shortcut.is_empty() {
+            let suffix = if it.children.is_some() {
+                "▸"
+            } else {
+                it.shortcut
+            };
+            if !suffix.is_empty() {
                 let lw = UnicodeWidthStr::width(text.as_str());
-                let sw = UnicodeWidthStr::width(it.shortcut);
+                let sw = UnicodeWidthStr::width(suffix);
                 let gap = inner_w.saturating_sub(lw + sw);
-                text = format!("{}{}{}", text, " ".repeat(gap.max(1)), it.shortcut);
+                text = format!("{}{}{}", text, " ".repeat(gap.max(1)), suffix);
             }
-            let st = if i == app.menu_item && it.enabled {
+            let st = if i == sel && it.enabled {
                 pal_style(pal.menu_bg, pal.menu_fg).add_modifier(Modifier::BOLD)
             } else if !it.enabled {
                 pal_style(pal.menu_fg, pal.menu_bg).add_modifier(Modifier::DIM)
@@ -489,6 +564,7 @@ fn draw_menu_dropdown(frame: &mut ratatui::Frame, area: Rect, app: &App, pal: &P
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
+    Some(box_area)
 }
 
 /// 播放列表区（或频谱/歌词）渲染分发器。
@@ -1337,14 +1413,15 @@ fn draw_now_playing(frame: &mut ratatui::Frame, area: Rect, app: &App, pal: &Pal
         (None, Some(n)) => format!("{} {n}", app.i18n.t("metadata.track_label")),
         (None, None) => app.i18n.t("metadata.unknown_album").into_owned(),
     };
-    let tech = format!(
-        "{} · {} · {} · {}",
-        md.codec
-            .as_deref()
-            .unwrap_or(app.i18n.t("msg.unknown_format").as_ref()),
-        md.bitrate_label(),
-        md.sample_rate_label(),
-        md.bits_label(),
+    let eng_status = app.engine.as_ref().map(|e| e.status());
+    let eng_codec = app.engine.as_ref().and_then(|e| e.src_codec());
+    // 技术参数行：元数据优先，缺失段回落引擎实测源参数（FFmpeg 长尾
+    // 格式文件探测返回兜底记录时仍有真实参数；与基础版 / max 同口径）。
+    let tech = md.tech_line_with_engine(
+        eng_codec.as_deref(),
+        eng_status.and_then(|s| s.src_sample_rate),
+        eng_status.and_then(|s| s.src_bits),
+        app.i18n.t("msg.unknown_format").as_ref(),
     );
     let bitstream = app.engine.as_ref().is_some_and(|e| e.bitstream());
     // 直通/降级用独立语义色：直通亮（白）、降级暗（深灰），
@@ -1476,11 +1553,13 @@ fn draw_status_bar(
     } else {
         "".into()
     };
+    // 右段信息序（与基础版同构）：时间 | 音量 百分比 | 循环 随机。
+    // 百分数定宽（:>3）防播放中数字跳动拖曳右段宽度。
     let right_main = format!(
-        "{time_str}  {}{vol}%  {}{}",
+        "{time_str}  {} {vol:>3}%  {}{}",
+        app.i18n.t("status.volume"),
         app.i18n.t(crate::config::repeat_key(config.repeat)),
         shuffle_s,
-        app.i18n.t("status.volume")
     );
 
     // 三段：图标 | 进度条 | 右段（时间/音量/循环）。
@@ -1518,6 +1597,11 @@ fn draw_status_bar(
         spans.push(Span::styled(ch.to_string(), st));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), chunks[1]);
+    // 右段（时间 / 音量 / 循环 / 随机）：右对齐，随播放状态着色（与基础版同口径）。
+    frame.render_widget(
+        Paragraph::new(Span::styled(right_main, icon_style)).alignment(Alignment::Right),
+        chunks[2],
+    );
 }
 
 /// 功能键栏（最底 1 行）：数字菜单 + 功能键提示。
@@ -1529,9 +1613,8 @@ fn draw_fkey_bar(
 ) {
     let keys: Vec<(&str, std::borrow::Cow<'_, str>)> = vec![
         ("1-8", i18n.t("fkey.menu")),
-        ("F5-F8", i18n.t("fkey.panels")),
-        ("F9", i18n.t("fkey.eq")),
-        ("F10", i18n.t("fkey.menu")),
+        ("e", i18n.t("fkey.eq")),
+        ("f", i18n.t("fkey.filter")),
         ("?", i18n.t("fkey.help")),
     ];
     match pal.fkey_num {

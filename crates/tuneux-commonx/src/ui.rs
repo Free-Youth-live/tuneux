@@ -81,16 +81,16 @@ pub enum UiAction {
     MediumSet(u8),
 
     // 面板开合
-    /// 文件浏览器面板开合（默认键 b / F5；冻结 id toggle_browser）。
+    /// 文件浏览器面板开合（默认键 b；冻结 id toggle_browser）。
     ToggleBrowser,
-    /// 专辑封面面板开合（默认键 c / F6；冻结 id toggle_cover）。
+    /// 专辑封面面板开合（默认键 c；冻结 id toggle_cover）。
     ToggleCover,
-    /// 歌词面板开合（默认键 l / F7；冻结 id toggle_lyrics）。
+    /// 歌词面板开合（默认键 l；冻结 id toggle_lyrics）。
     ToggleLyrics,
-    /// 频谱面板开合（默认键 v / F8，max 中 v 循环频谱/示波器；
+    /// 频谱面板开合（默认键 v，max 中 v 循环频谱/示波器；
     /// 冻结 id toggle_spectrum）。
     ToggleSpectrum,
-    /// 均衡器面板开合（默认键 F9；冻结 id toggle_eq）。
+    /// 均衡器面板开合（冻结 id toggle_eq）。
     ToggleEq,
     /// 播放列表分组视图开关（默认键 g；冻结 id toggle_group）。
     ToggleGroupView,

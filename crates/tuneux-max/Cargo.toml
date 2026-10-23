@@ -1,5 +1,5 @@
 # =============================================================================
-# tuneux-max · GUI 发行版（egui/eframe）——框架搭建阶段（首里程碑）
+# tuneux-max · GUI 发行版（egui/eframe）
 #
 # 版权所有 © 2026 不羁的青春（FreeYouth）
 # 本项目采用木兰宽松许可证，第 2 版（MulanPSL-2.0）开源。
@@ -10,7 +10,7 @@
 #
 # 红线（机器可断言）：
 #   - 永不依赖 ratatui / crossterm（TUI 渲染栈与 max 无关）；
-#   - 插件（pinx）随插件里程碑接入，本阶段依赖图不含 pinx；
+#   - 插件（pinx）宿主——皮肤供色与效果器链路，与 fx 同协议同验签；
 #   - 纯离线（网络随 netx 独立线，产品 feature 未启用前不接）。
 # =============================================================================
 
@@ -20,7 +20,7 @@ version = "0.6.0"
 edition = "2021"
 license = "MulanPSL-2.0"
 authors = ["不羁的青春（FreeYouth）"]
-description = "tuneux GUI 版（egui/eframe）——复用 corex/mediax/commonx，首期框架：浏览器 + 播放列表 + 播放控制 + 频谱"
+description = "tuneux GUI 版（egui/eframe）——复用 corex/mediax/commonx：dock 12 模块 + 皮肤/插件/命令模式"
 rust-version = "1.88"
 
 [features]
@@ -30,16 +30,16 @@ default = []
 [dependencies]
 # GUI 壳：egui 生态官方框架（winit 窗口 + wgpu/glow 渲染），版本随 workspace 统一
 eframe.workspace = true
-# 共享音频内核 / 领域数据 / 通用机制（媒体键 feature 随媒体键里程碑接线，先不启用）
+# 共享音频内核 / 领域数据 / 通用机制（media-key feature 已启用）
 tuneux-corex = { path = "../tuneux-corex" }
 tuneux-mediax = { path = "../tuneux-mediax" }
 tuneux-commonx = { path = "../tuneux-commonx", features = ["media-key"] }
 crossbeam-channel.workspace = true
 # 封面解码（jpeg/png，与双 TUI 同源同版本）
 image.workspace = true
-# 原生文件对话框（打开文件/打开目录；C 裁决落地，deny 三查已过）
+# 原生文件对话框（打开文件/打开目录；方案落地，deny 三查已过）
 rfd.workspace = true
-# 插件宿主（皮肤供色链路，与 fx 同协议同验签；效果器面板随后续里程碑）
+# 插件宿主（皮肤供色 + EQ/压缩器链路，与 fx 同协议同验签）
 tuneux-pinx = { path = "../tuneux-pinx" }
 # 配置持久化
 serde.workspace = true

@@ -400,8 +400,8 @@ impl App {
                 None => engine.duration(),
             };
             // 末尾态双判据：进度判定（有时长曲目）∪ 引擎末尾标志——
-            // 无时长曲目（Opus / FFmpeg 后端 duration=0）进度判定永假，
-            // EOF 后靠标志重播，而非无效 Resume（只解暂停、不出声）。
+            // 无时长曲目（Opus 后端 duration=0；FFmpeg 探测失败亦无时长）
+            // 进度判定永假，EOF 后靠标志重播，而非无效 Resume（只解暂停、不出声）。
             let at_end = engine.at_eof() || (end_secs > 0.0 && engine.position() >= end_secs - 0.1);
             let decision = tuneux_mediax::toggle_decision(is_playing, at_end, cue.as_ref());
             match decision {
