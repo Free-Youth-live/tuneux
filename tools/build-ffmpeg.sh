@@ -62,6 +62,13 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# --out 目录必须先建：curl -o 不自建父目录（缺目录时报 curl(23)
+# "Failure writing output to destination" 而非明确的目录错误），且第 2 步的
+# work/ 与第 4 步的 ffmpeg/ 产出也都挂在它下面，故在取源码包之前统一创建。
+# 非空校验：OUT 为空会让第 4 步的 rm -rf "$OUT/ffmpeg" 退化到根路径。
+[ -n "$OUT" ] || { echo "❌ --out 不得为空"; exit 1; }
+mkdir -p "$OUT"
+
 CC_BIN="${FFMPEG_CC:-cc}"
 STRIP_BIN="${FFMPEG_STRIP:-strip}"
 FFMPEG_CROSS_OPTS="${FFMPEG_CROSS_OPTS:-}"
@@ -102,7 +109,14 @@ echo "· configure（$FF_CONFIGURE_ARGS ${FFMPEG_CROSS_OPTS}）"
     ${FFMPEG_EXTRA_CFLAGS:+--extra-cflags="$FFMPEG_EXTRA_CFLAGS"} \
     2>&1 | tail -3 )
 echo "· make -j$JOBS"
-( cd "$BUILD" && make -j"$JOBS" >/dev/null 2>&1 )
+# 成功时保持静默（FFmpeg 构建输出上万行，会淹没 CI 日志）；失败时留末 40 行。
+# 交叉编译（zig cc / msys2 mingw64 / mac x86_64 交叉）是本脚本最易失败处，
+# 全量丢弃输出会让 CI 只报退出码、无从判断病因，白搭一轮往返。
+if ! ( cd "$BUILD" && make -j"$JOBS" ) > "$OUT/make.log" 2>&1; then
+  echo "❌ make 失败，末 40 行："
+  tail -40 "$OUT/make.log"
+  exit 1
+fi
 for b in ffmpeg ffprobe; do
   [ -f "$BUILD/$b" ] || [ -f "$BUILD/$b.exe" ] || { echo "❌ $b 未产出"; exit 1; }
 done
@@ -126,6 +140,10 @@ cp "$SRC/COPYING.LGPLv2.1" "$DIST/licenses/"
 # —— 第 5 步：产物自检（许可纯度 + 禁项扫描） ——
 FF_BIN="$DIST/bin/ffmpeg"
 [ -f "$FF_BIN" ] || FF_BIN="$DIST/bin/ffmpeg.exe"
+# ffprobe 同口径回退：Windows（msys2/mingw64）腿产出为 .exe，下方哈希登记
+# 若硬编码无后缀路径会取不到文件，在 set -e 下中断整个构建。
+FFPROBE_BIN="$DIST/bin/ffprobe"
+[ -f "$FFPROBE_BIN" ] || FFPROBE_BIN="$DIST/bin/ffprobe.exe"
 VERSION_OUT="$("$FF_BIN" -version 2>&1)"
 echo "$VERSION_OUT" | head -1 | grep -q "ffmpeg version $FF_VERSION" \
   || { echo "❌ 版本行异常：$(echo "$VERSION_OUT" | head -1)"; exit 1; }
@@ -135,8 +153,8 @@ echo "✓ 自检通过（版本 + 配置串两禁；与运行时闸门同源判�
 
 # —— 第 6 步：生成 VERSIONS.txt（版本登记 + 源码要约） ——
 CONFIG_LINE="$(echo "$VERSION_OUT" | grep '^configuration:' | head -1)"
-BIN_SHA="$(shasum -a 256 "$DIST/bin/ffmpeg" 2>/dev/null | awk '{print $1}' || sha256sum "$DIST/bin/ffmpeg" | awk '{print $1}')"
-PROBE_SHA="$(shasum -a 256 "$DIST/bin/ffprobe" 2>/dev/null | awk '{print $1}' || sha256sum "$DIST/bin/ffprobe" | awk '{print $1}')"
+BIN_SHA="$(shasum -a 256 "$FF_BIN" 2>/dev/null | awk '{print $1}' || sha256sum "$FF_BIN" | awk '{print $1}')"
+PROBE_SHA="$(shasum -a 256 "$FFPROBE_BIN" 2>/dev/null | awk '{print $1}' || sha256sum "$FFPROBE_BIN" | awk '{print $1}')"
 BUILD_DATE="$(date '+%Y-%m-%d %H:%M %Z')"
 cat > "$DIST/VERSIONS.txt" <<EOT
 FFmpeg ${FF_VERSION}（LGPL-2.1-or-later；官方源码未修改构建）
