@@ -277,11 +277,15 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }} -p tuneux -p tuneux-fx
 
       - name: 下载 FFmpeg 组件
-        # windows-arm64 无对应组件（build-ffmpeg 矩阵不含该腿，属预期：该平台
-        # 回退系统 PATH 的 ffmpeg，CHANGELOG 已声明）。用显式 if 跳过整个下载步，
+        # 无对应组件的腿（build-ffmpeg 矩阵不含，属预期：该平台回退系统 PATH
+        # 的自装 ffmpeg，CHANGELOG「已知限制」已声明）。用显式 if 跳过整个下载步，
         # 不依赖 action 对 if-no-files-found 的处理语义（该参数为 upload 口径），
         # 使正确性与第三方 action 的实现解耦。
-        if: matrix.name != 'windows-arm64'
+        # ⚠ 本排除清单必须与 build-ffmpeg 矩阵**闭合**：改动任一侧都要同步核对，
+        #   否则该腿取不到 artifact 即失败，并经 release 的 needs 拖垮整单。
+        #   当前 build-ffmpeg = linux-x86_64 / macos-arm64 / macos-x86_64 /
+        #   windows-x86_64；下方 build 六腿中缺组件的正是被排除的这两腿。
+        if: matrix.name != 'windows-arm64' && matrix.name != 'linux-arm64'
         uses: actions/download-artifact@v4
         with:
           name: ffmpeg-${{ matrix.name }}
