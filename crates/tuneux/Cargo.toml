@@ -8,7 +8,7 @@
 [package]
 # 包名 tuneux；可执行文件名 tuneux
 name = "tuneux"
-version = "0.5.5"
+version = "0.6.0"
 edition = "2021"
 # 木兰宽松许可证 v2
 license = "MulanPSL-2.0"

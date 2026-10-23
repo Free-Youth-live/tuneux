@@ -3,7 +3,7 @@
 # tuneux · 钩子安装器
 #
 # 把入库的钩子源码（tools/hooks/pre-push）安装到 .git/hooks/pre-push
-# （字节一致 + 可执行位）。批 0（git init 后）与任何钩子修订后各跑一次。
+# （字节一致 + 可执行位）。初次安装（git init 后）与任何钩子修订后各跑一次。
 #
 # 用法：bash tools/hooks/install.sh（在 code/ 仓库根执行）
 # =============================================================================
@@ -13,7 +13,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 
 if [ ! -d "$root/.git" ]; then
-  echo "❌ $root 不是 git 仓库（批 0 收口后再安装）"
+  echo "❌ $root 不是 git 仓库（安装收口后再安装）"
   exit 1
 fi
 

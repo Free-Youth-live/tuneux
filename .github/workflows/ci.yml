@@ -12,6 +12,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # 周一定时全量核查（依赖漏洞与撤回版本不等人推送；UTC 19:00 = 京周二 03:00）
+    - cron: "0 19 * * 1"
 
 permissions:
   contents: read
@@ -35,7 +38,11 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: 测试
         run: cargo test --workspace
+      # 仅 push 事件跑分层守卫：guard.sh 会解码并加载仓内词表文件，
+      # pull_request（fork）检出的内容不可信，不在其上执行；
+      # fork PR 由 fmt/clippy/test/deny 兜底，合入后的 push 事件补全量检查。
       - name: 分层守卫（依赖红线 / API 面 / i18n key / 敏感词 / 文件头 / 棘轮 / 发布管线纯度）
+        if: github.event_name == 'push'
         run: bash tools/guard.sh
       - name: 依赖核查（advisories / bans / licenses / sources）
         run: |

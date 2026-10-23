@@ -93,7 +93,7 @@ pub struct App {
     pub playlist: playlist::Playlist,
     /// 播放状态（播放列表 + 每首进度），退出时保存到独立文件 playlist.toml。
     pub playlist_state: PlaylistState,
-    /// i18n 查询器：请求语言表（locales/<lang>.txt）+ zh 内置兜底。
+    /// i18n 查询器：请求语言表（`locales/<lang>.txt`）+ zh 内置兜底。
     pub i18n: tuneux_commonx::I18n,
     /// 当前焦点面板（Tab 切换）
     pub focus: playlist::Panel,
@@ -160,6 +160,8 @@ pub struct App {
     /// "关于"弹窗是否可见（`?` 键切换，任意键关闭）。
     /// 显示版本号、开源声明、版权声明，覆盖在主界面之上。
     pub about_visible: bool,
+    /// 当前曲目属性弹窗（`i` / Alt+Enter 唤起，任意键关闭）。
+    pub properties_visible: bool,
     /// 清空播放列表的确认状态：true 时再按 x 才真正清空（防误触）。
     pub pending_clear: bool,
     /// 清空确认的发起时刻：与提示同寿命（5 秒过期），防止提示消失后误清空。
@@ -167,6 +169,14 @@ pub struct App {
 }
 
 impl App {
+    /// 当前播放曲目路径（属性弹窗显示用）；无当前曲时 None。
+    pub fn current_file_path(&self) -> Option<&std::path::Path> {
+        self.playlist
+            .current_index()
+            .and_then(|i| self.playlist.items().get(i))
+            .map(|it| it.path.as_path())
+    }
+
     /// 引擎启动失败时 engine 为 None，程序仍可浏览。
     pub fn new(config: &Config) -> Self {
         let initial = config.effective_last_dir();
@@ -186,9 +196,6 @@ impl App {
                 Some(i18n.t("msg.engine_fail").replace("{}", &e.to_string())),
             ),
         };
-        let engine_init_error_at = engine_init_error
-            .as_ref()
-            .map(|_| std::time::Instant::now());
         // 启动即下发介质风格，避免配置与声音不一致（介质纯声音修饰、无画面）。
         // 一并下发 ReplayGain 开关（默认关）。
         if let Some(e) = &engine {
@@ -196,7 +203,15 @@ impl App {
             e.set_replay_gain_enabled(config.replay_gain);
         }
         // 加载播放状态（独立文件 playlist.toml）
-        let playlist_state = crate::config::load_playlist_state();
+        let (playlist_state, playlist_status) = crate::config::load_playlist_state_with_status();
+        // 文件损坏：走 UI 通道提示（此处已在 raw 模式，eprintln 会弄脏备用屏）；
+        // 备份与停写锁已在加载函数内完成，本次会话不会覆写原文件。
+        // 文案构造用 commonx 统一口径（备份成败两分支，含单元测试）。
+        let playlist_corrupt_msg = tuneux_commonx::config_status::corrupt_flash_msg(
+            &playlist_status,
+            &i18n.t("msg.state_corrupt"),
+            &i18n.t("msg.state_corrupt_nobackup"),
+        );
 
         let mut playlist = playlist::Playlist::new();
         playlist.set_shuffle(config.shuffle);
@@ -248,6 +263,15 @@ impl App {
         let (search_load_tx, search_load_rx) = crossbeam_channel::unbounded();
         let (add_load_tx, add_load_rx) = crossbeam_channel::unbounded();
 
+        // 启动期错误合并展示：引擎失败与播放列表损坏共用 last_error 通道。
+        let startup_error = match (engine_init_error, playlist_corrupt_msg) {
+            (Some(a), Some(b)) => Some(format!("{a}；{b}")),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let startup_error_at = startup_error.as_ref().map(|_| std::time::Instant::now());
+
         Self {
             scan_pool: tuneux_mediax::scan_pool::ScanPool::new(),
             browser: fs_browser::FsBrowser::open(&initial, fs_browser::browser_config()),
@@ -287,12 +311,13 @@ impl App {
             search_mode: false,
             search_query: String::new(),
             search_target: SearchTarget::Playlist,
-            last_error: engine_init_error,
-            last_error_at: engine_init_error_at,
+            last_error: startup_error,
+            last_error_at: startup_error_at,
             consecutive_failures: 0,
             frame_tick: 0,
             spectrum_peaks: std::cell::RefCell::new(audio::spectrum::SpectrumPeakHold::default()),
             about_visible: false,
+            properties_visible: false,
             pending_clear: false,
             pending_clear_at: None,
         }

@@ -23,6 +23,7 @@
 // 本模块与基础版 config 同源，本产品线已分化出皮肤/首启继承/歌词偏移/书签等。
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +36,16 @@ use tuneux_commonx::{sanitize_f32, sanitize_f64, validate_keymap};
 /// 错误聚合为 trait 对象，避免为每种底层错误（IO、TOML 解析）单独定义类型，
 /// 简化代码。配置模块的错误对用户均不致命，调用方据此回退默认值。
 pub type ConfigResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+use tuneux_commonx::config_status::backup_corrupt_file;
+/// 加载状态与损坏备份口径已下沉 commonx（三端共用）；再导出保持
+/// `config::LoadStatus` 引用不变（含首启继承前代的 Ok 口径）。
+pub use tuneux_commonx::config_status::LoadStatus;
+
+/// 配置损坏停写锁（tuneux-fx.toml 维度）：置位后本会话一切保存入口跳过。
+static CONFIG_SAVE_LOCKED: AtomicBool = AtomicBool::new(false);
+/// 播放状态损坏停写锁（tuneux-fx-playlist.toml 维度）。
+static PLAYLIST_SAVE_LOCKED: AtomicBool = AtomicBool::new(false);
 
 /// 循环播放模式的 i18n key（状态条显示）。
 /// 呈现归发行版：枚举本体在数据层（tuneux-mediax），文案走 i18n 表。
@@ -73,6 +84,10 @@ panel.plugin = \"插 件\"\n\
 status.playing = \"[播]\"\n\
 status.stopped = \"[停]\"\n\
 status.shuffle = \" 随机\"\n\
+shuffle.off = \"随机：关\"\n\
+shuffle.tracks = \"随机：曲目（不重复袋）\"\n\
+shuffle.albums = \"随机：专辑（整张连播）\"\n\
+shuffle.true_random = \"随机：真随机（允许重复）\"\n\
 status.volume = \"音量\"\n\
 # —— 元数据展示 ——\n\
 metadata.unknown_title = \"未知曲目\"\n\
@@ -87,37 +102,62 @@ repeat.single = \"单曲\"\n\
 repeat.list = \"循环\"\n\
 # —— 功能键栏 ——\n\
 fkey.menu = \"菜单\"\n\
-fkey.panels = \"面板\"\n\
 fkey.eq = \"均衡器\"\n\
+fkey.filter = \"滤波器\"\n\
 fkey.help = \"帮助\"\n\
 # —— 菜单 ——\n\
 menu.file = \"文件\"\n\
+menu.edit = \"编辑\"\n\
 menu.play = \"播放\"\n\
+menu.audio = \"音效\"\n\
 menu.medium = \"介质\"\n\
 menu.view = \"视图\"\n\
 menu.tools = \"工具\"\n\
 menu.settings = \"设置\"\n\
-menu.plugins = \"插件\"\n\
 menu.help = \"帮助\"\n\
 menu.quit = \"退出\"\n\
+menu.add_dir = \"加入浏览器目录\"\n\
+menu.add_selection = \"加入浏览器选中项\"\n\
+menu.save_playlist = \"保存播放列表…\"\n\
+menu.load_playlist = \"载入播放列表…\"\n\
+menu.remove_selected = \"移除选中\"\n\
+menu.clear_playlist = \"清空播放列表\"\n\
+menu.search = \"搜索\"\n\
+menu.properties = \"属性\"\n\
 menu.toggle_play = \"播放 / 暂停\"\n\
 menu.prev = \"上一曲\"\n\
 menu.next = \"下一曲\"\n\
-menu.repeat = \"循环模式\"\n\
-menu.shuffle = \"随机播放\"\n\
+menu.seek_back = \"快退\"\n\
+menu.seek_forward = \"快进\"\n\
+menu.play_order = \"播放顺序\"\n\
+order.sequential = \"顺序\"\n\
+order.repeat_one = \"单曲循环\"\n\
+order.repeat_all = \"列表循环\"\n\
+order.shuffle_tracks = \"随机曲目\"\n\
+order.shuffle_albums = \"随机专辑\"\n\
+order.true_random = \"真随机\"\n\
+menu.bookmark = \"书签\"\n\
+menu.bm_add = \"添加\"\n\
+menu.bm_list = \"列表…\"\n\
+menu.bm_del = \"删除…\"\n\
 menu.vol_up = \"音量增大\"\n\
 menu.vol_down = \"音量减小\"\n\
 menu.browser = \"文件浏览器\"\n\
 menu.cover = \"专辑封面\"\n\
 menu.lyrics = \"歌词\"\n\
 menu.spectrum = \"频谱\"\n\
+menu.spectrum_builtin = \"内置频谱\"\n\
 menu.group = \"播放列表分组\"\n\
 menu.eq = \"均衡器\"\n\
 menu.compressor = \"压缩器\"\n\
-menu.dsp = \"DSP\"\n\
 menu.tag_edit = \"标签编辑\"\n\
 menu.convert = \"格式转换\"\n\
 menu.cover_mgmt = \"封面管理\"\n\
+menu.plugin_mgr = \"插件管理…\"\n\
+menu.command_bar = \"命令输入条\"\n\
+menu.config_dir = \"配置目录\"\n\
+menu.shortcuts = \"快捷键一览…\"\n\
+menu.manual = \"使用手册\"\n\
 menu.output_device = \"输出设备（自动跟随）\"\n\
 menu.replaygain = \"ReplayGain 响度归一\"\n\
 msg.cover_fail = \"封面解码失败（已跳过）\"\n\
@@ -160,6 +200,8 @@ msg.rg_on = \"已开启\"\n\
 msg.rg_off = \"已关闭\"\n\
 msg.lang_switched = \"已切换为{}\"\n\
 msg.engine_fail = \"音频引擎初始化失败，播放功能不可用：{}\"\n\
+msg.state_corrupt = \"播放列表文件损坏：已备份为 {}，本次会话不会自动保存\"\n\
+msg.state_corrupt_nobackup = \"播放列表文件损坏且自动备份失败：请立即手工复制保存原文件；本次会话不会自动保存\"\n\
 msg.medium = \"介质\"\n\
 msg.bm_jump = \"跳到书签：{}\"\n\
 msg.bm_deleted = \"已删书签：{}\"\n\
@@ -187,7 +229,7 @@ about.plugins_cat = \"插件\"\n\
 about.formats = \"支持 MP3 · FLAC · WAV · OGG · OPUS · WV · M4A · AAC · ALAC\"\n\
 about.keys1 = \"空格 播放/暂停 · n/p 下一曲/上一曲 · ←→ ±5秒 · +/- 音量\"\n\
 about.keys2 = \"b 浏览器 · c 封面 · l 歌词 · v 频谱 · g 分组 · a 加入\"\n\
-about.keys3 = \"F10 菜单 · : 命令 · m 介质 · ? 关于 · q 退出\"\n\
+about.keys3 = \"1-8 菜单 · : 命令 · m 介质 · e 均衡器 · f 滤波器 · ? 关于 · q 退出\"\n\
 about.deps = \"基于以下开源项目构建：\"\n\
 about.dep_audio = \"音频  cpal · symphonia · opus-decoder · rubato · rustfft · ringbuf\"\n\
 about.dep_ui = \"界面  ratatui · crossterm · image · unicode-width\"\n\
@@ -197,12 +239,17 @@ about.dep_platform = \"平台  zbus（Linux）· rdev（Windows）\"\n\
 about.license = \"本项目采用木兰宽松许可证 v2（MulanPSL-2.0）\"\n\
 about.copyright = \"© 不羁的青春（FreeYouth）\"\n\
 about.close = \"按任意键关闭\"\n\
+popup.properties = \"属性\"\n\
+prop.codec = \"编码\"\n\
+prop.channels = \"声道\"\n\
+prop.duration = \"时长\"\n\
+prop.path = \"路径\"\n\
 search.esc_exit_search = \"（无匹配）Esc 退出搜索\"\n\
 menu.lang_select = \"语言…\"\n\
 menu.skin_select = \"皮肤配色…\"\n\
-menu.visual = \"可视化面板\"\n\
-menu.about = \"关于 / 快捷键速查\"\n\
-fkey.bar = \"1-8菜单  F5-F8面板  F9均衡器  F10菜单  ?帮助\"\n\
+menu.visual = \"可视化插件\"\n\
+menu.about = \"关于\"\n\
+fkey.bar = \"1-8菜单  e均衡器  f滤波器  ?帮助\"\n\
 empty.cover = \"（无封面）\n按 c 隐藏\"\n\
 empty.dir = \"（空目录）\"\n\
 empty.lyrics = \"（无歌词）\n放置同名 .lrc 或在标签内嵌歌词（USLT/LYRICS）可显示\"\n\
@@ -234,6 +281,24 @@ msg.vol_set = \"音量已设为 {}%\"\n\
 skin.default_dos = \"默认（DOS）\"\n\
 skin.hint = \"↑↓ 预览 · Enter 确认 · Esc 取消\"\n\
 skin.terminal_native = \"终端原生\"\n\
+# —— 弹窗与插件管理（2026-10-14 菜单结构调整）——\n\
+panel.shortcuts = \"快捷键一览\"\n\
+panel.bookmarks = \"书签\"\n\
+panel.plugin_mgr = \"插件管理\"\n\
+msg.bm_hint = \"Enter 跳转 · d 删除 · Esc 关闭\"\n\
+msg.config_dir = \"配置目录：{}\"\n\
+msg.manual_path = \"使用手册：{}\"\n\
+msg.manual_missing = \"使用手册（使用手册-tuneux-fx.txt）随发行包提供\"\n\
+msg.pm_dir = \"插件目录：{}\"\n\
+msg.pm_kind_dsp = \"效果器\"\n\
+msg.pm_kind_skin = \"皮肤\"\n\
+msg.pm_kind_visual = \"可视化\"\n\
+msg.pm_kind_unknown = \"未知\"\n\
+msg.pm_loaded = \"已加载\"\n\
+msg.pm_not_loaded = \"未加载\"\n\
+msg.pm_hint = \"u 重载已装插件 · Esc 关闭\"\n\
+msg.pm_reloaded = \"已重载已装插件（皮肤变更重启生效）\"\n\
+msg.pm_empty = \"（目录为空）将 .wasm 插件放入插件目录后按 u 重载；开发见《插件开发指南》\"\n\
 ",
     )
 }
@@ -265,7 +330,8 @@ pub use tuneux_mediax::PlaylistView;
 
 /// 播放列表显示模式的默认值（fx：平铺大排行）。
 fn default_playlist_view() -> PlaylistView {
-    PlaylistView::Flat
+    // 2026-10-09 起默认按专辑分组（产品口径：加入即分组、按曲序排）。
+    PlaylistView::ByAlbum
 }
 
 /// 可视化面板的显示模式（`v` 键切换：关 → 频谱半屏 → 频谱全屏 → 示波器 →
@@ -284,7 +350,7 @@ pub enum SpectrumMode {
     Oscilloscope,
     /// 插件可视化面板（「可视化-*」插件输出的字符画）占满整个主区。
     Plugin,
-    /// 指针表（灰阶 2.5D 字符网格的仿真 VU 指针表，L/R 双表）。
+    /// 指针表（灰阶 2.5D 字符网格的 VU 指针表，L/R 双表）。
     Gauge,
 }
 
@@ -370,6 +436,9 @@ pub struct Config {
     /// 是否随机播放。
     #[serde(default)]
     pub shuffle: bool,
+    /// 随机模式（off / tracks / true_random / albums；旧 shuffle=true 加载时迁移为 tracks）。
+    #[serde(default)]
+    pub shuffle_mode: String,
 
     /// 播放列表显示模式（平铺 / 按专辑分组）。
     #[serde(default = "default_playlist_view")]
@@ -424,7 +493,7 @@ pub struct Config {
     /// `next`（下一曲）、`prev`（上一曲）、`volume_up`（音量 +5%）、
     /// `volume_down`（音量 −5%）。
     ///
-    /// **键描述**（map 的值，即"按哪个键"）语法见 [`parse_key_desc`]，
+    /// **键描述**（map 的值，即"按哪个键"）语法见 [`tuneux_commonx::parse_key_desc`]，
     /// 例：`"space"`、`"n"`、`"shift+n"`、`"+"`、`"-"`。
     ///
     /// 默认空 map：全部沿用内置默认键（空格/n/p/+/-），旧配置无需迁移。
@@ -489,6 +558,7 @@ impl Default for Config {
             repeat: RepeatMode::default(),
             skin: String::new(),
             shuffle: false,
+            shuffle_mode: "off".to_string(),
             playlist_view: default_playlist_view(),
             spectrum_mode: SpectrumMode::Hidden,
             lyrics_mode: LyricsMode::Hidden,
@@ -620,7 +690,22 @@ pub fn plugin_log_path() -> PathBuf {
 }
 
 /// keymap 合法动作名白名单（与 tui/app/mod.rs 键处理支持的动作一致）。
-const KEYMAP_ACTIONS: &[&str] = &["toggle_play", "next", "prev", "volume_up", "volume_down"];
+const KEYMAP_ACTIONS: &[&str] = &[
+    "toggle_play",
+    "next",
+    "prev",
+    "volume_up",
+    "volume_down",
+    // 模式 / 面板键（2026-10-09 扩容：默认键不变、用户映射叠加）
+    "cycle_repeat",
+    "toggle_shuffle",
+    "cycle_medium",
+    "cycle_visual",
+    "toggle_group_view",
+    "toggle_lyrics",
+    "cycle_cover",
+    "toggle_browser",
+];
 
 /// 校验并清理 keymap：剔除非法动作名（未知动作 / 空白键描述），
 /// 避免用户误配导致快捷键静默失效或与退出键（q/Ctrl+C）冲突。
@@ -665,13 +750,25 @@ fn load_first_existing<T: serde::de::DeserializeOwned>(candidates: &[PathBuf]) -
 
 /// 加载配置：始终返回有效 Config——加载失败时打印警告并回退默认值，
 /// 保证程序在任何情况下都能启动。首次启动时尝试继承 tuneux 的配置。
+///
+/// 文件损坏（存在但解析失败）时：先备份原文件为 `.corrupt.bak`，再锁死
+/// 本会话的保存入口——默认值只在内存兜底运行，绝不落盘覆写用户原文件。
 pub fn load() -> Config {
     let path = config_path();
     let mut cfg = if path.exists() {
         match load_from(&path) {
             Ok(cfg) => cfg,
             Err(e) => {
-                eprintln!("[配置] 配置解析失败，使用默认值（{}）：{e}", path.display());
+                let bak = backup_corrupt_file(&path);
+                CONFIG_SAVE_LOCKED.store(true, Ordering::SeqCst);
+                eprintln!(
+                    "[配置] 解析失败，本次会话使用默认值且不会自动保存（{}）：{e}",
+                    path.display()
+                );
+                match bak {
+                    Some(b) => eprintln!("[配置] 原文件已备份到 {}，请修复配置后重启", b.display()),
+                    None => eprintln!("[配置] 原文件备份失败，请立即手工复制保存原文件"),
+                }
                 Config::default()
             }
         }
@@ -718,9 +815,17 @@ fn load_from(path: &Path) -> ConfigResult<Config> {
 ///
 /// 保存失败静默吞掉、不向上传播——配置丢失不影响音频播放，不应阻塞
 /// 程序退出流程；且运行期定期保存时 eprintln 会弄脏 raw-mode 屏幕。
+/// 损坏停写锁置位时（加载发现原文件损坏）整体跳过，见 [`load`]。
 pub fn save(cfg: &Config) {
-    let path = config_path();
-    let _ = save_to(&path, cfg);
+    let _ = save_to_if_unlocked(&config_path(), cfg, &CONFIG_SAVE_LOCKED);
+}
+
+/// 带停写锁检查的保存（锁与路径均可注入，便于单元测试）。
+fn save_to_if_unlocked(path: &Path, cfg: &Config, locked: &AtomicBool) -> ConfigResult<()> {
+    if locked.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    save_to(path, cfg)
 }
 
 /// 保存配置到指定路径（内部接口，便于单元测试）。
@@ -734,28 +839,53 @@ fn save_to(path: &Path, cfg: &Config) -> ConfigResult<()> {
     Ok(())
 }
 
-/// 加载播放状态（播放列表 + 每首进度）。
+/// 加载播放状态（播放列表 + 每首进度）并报告加载状态（供 UI 弹出损坏提示）。
 ///
 /// 文件不存在或解析失败时返回默认（空），绝不 panic，保证程序可启动。
-pub fn load_playlist_state() -> PlaylistState {
+/// 损坏时与 [`load`] 同口径：备份原文件为 `.corrupt.bak` 并锁死本会话
+/// 播放状态写回。注意本函数在 TUI raw 模式下被调用（App::new），损坏
+/// 提示由调用方走 UI 通道，此处不 eprintln（会弄脏备用屏）。
+pub fn load_playlist_state_with_status() -> (PlaylistState, LoadStatus) {
     let path = playlist_state_path();
     if path.exists() {
-        return std::fs::read_to_string(&path)
+        let parsed = std::fs::read_to_string(&path)
             .ok()
-            .and_then(|text| toml::from_str(&text).ok())
-            .unwrap_or_default();
+            .and_then(|text| toml::from_str(&text).ok());
+        return match parsed {
+            Some(state) => (state, LoadStatus::Ok),
+            None => {
+                let backup = backup_corrupt_file(&path);
+                PLAYLIST_SAVE_LOCKED.store(true, Ordering::SeqCst);
+                (PlaylistState::default(), LoadStatus::Corrupt { backup })
+            }
+        };
     }
     // 首次启动：继承前代同名产品的播放状态（播放列表与断点），平滑迁移。
-    load_first_existing::<PlaylistState>(&legacy_tuneux_candidates("playlist.toml"))
-        .unwrap_or_default()
+    match load_first_existing::<PlaylistState>(&legacy_tuneux_candidates("playlist.toml")) {
+        Some(state) => (state, LoadStatus::Ok),
+        None => (PlaylistState::default(), LoadStatus::Missing),
+    }
 }
 
 /// 保存播放状态到独立文件 `tuneux-fx-playlist.toml`。
 ///
 /// 保存失败静默吞掉、不阻塞退出（理由同 [`save`]：运行期打印会弄脏屏幕）。
+/// 损坏停写锁置位时整体跳过，见 [`load_playlist_state_with_status`]。
 pub fn save_playlist_state(state: &PlaylistState) {
-    let path = playlist_state_path();
-    let _ = save_playlist_state_to(&path, state);
+    let _ =
+        save_playlist_state_to_if_unlocked(&playlist_state_path(), state, &PLAYLIST_SAVE_LOCKED);
+}
+
+/// 带停写锁检查的播放状态保存（锁与路径均可注入，便于单元测试）。
+fn save_playlist_state_to_if_unlocked(
+    path: &Path,
+    state: &PlaylistState,
+    locked: &AtomicBool,
+) -> ConfigResult<()> {
+    if locked.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    save_playlist_state_to(path, state)
 }
 
 /// 保存播放状态到指定路径（内部接口，便于单元测试）。
@@ -842,7 +972,8 @@ mod tests {
             repeat: RepeatMode::Single,
             skin: "午夜蓝".to_string(),
             shuffle: true,
-            playlist_view: PlaylistView::Flat,
+            shuffle_mode: "tracks".to_string(),
+            playlist_view: PlaylistView::ByAlbum,
             spectrum_mode: SpectrumMode::Half,
             lyrics_mode: LyricsMode::Visible,
             lyrics_offset: 0.5,
@@ -1290,5 +1421,62 @@ mod tests {
             Some("shift+q"),
             "合法映射应保留"
         );
+    }
+
+    // —— 损坏配置保护（2026-10-13，与基础版同源修复）——
+
+    /// 损坏文件备份：生成 .corrupt.bak 且内容与原文件一致；
+    /// 已有备份时不得覆盖（保留最早现场）。
+    #[test]
+    fn corrupt_file_backed_up_once() {
+        let tmp = std::env::temp_dir().join("tuneux_fx_test_corrupt_backup.toml");
+        let bak = PathBuf::from(format!("{}.corrupt.bak", tmp.display()));
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&bak);
+        std::fs::write(&tmp, "not = [valid").expect("写入损坏配置");
+        let first = backup_corrupt_file(&tmp).expect("首次备份应成功");
+        assert_eq!(first, bak);
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), "not = [valid");
+        // 第二次损坏内容不同，备份不得覆盖
+        std::fs::write(&tmp, "other = [broken").expect("改写损坏配置");
+        let second = backup_corrupt_file(&tmp).expect("已有备份仍返回路径");
+        assert_eq!(
+            std::fs::read_to_string(&second).unwrap(),
+            "not = [valid",
+            "已有备份不得被覆盖"
+        );
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&bak);
+    }
+
+    /// 损坏的 TOML 经 load_from 报错（load() 进入 Corrupt 分支的前提）。
+    #[test]
+    fn corrupt_toml_load_from_errors() {
+        let tmp = std::env::temp_dir().join("tuneux_fx_test_corrupt_load.toml");
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::write(&tmp, "volume = [oops").expect("写入损坏配置");
+        assert!(load_from(&tmp).is_err());
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// 停写锁：置位后配置/播放状态保存整体跳过（不落盘、不建文件）。
+    #[test]
+    fn save_skipped_when_locked() {
+        let tmp = std::env::temp_dir().join("tuneux_fx_test_save_locked.toml");
+        let _ = std::fs::remove_file(&tmp);
+        let locked = AtomicBool::new(true);
+        save_to_if_unlocked(&tmp, &Config::default(), &locked).expect("锁定态保存应静默跳过");
+        assert!(!tmp.exists(), "锁定态不得创建/改写配置文件");
+        // 播放状态维度同口径
+        let ptmp = std::env::temp_dir().join("tuneux_fx_test_save_locked_playlist.toml");
+        let _ = std::fs::remove_file(&ptmp);
+        save_playlist_state_to_if_unlocked(&ptmp, &PlaylistState::default(), &locked)
+            .expect("锁定态播放状态保存应静默跳过");
+        assert!(!ptmp.exists(), "锁定态不得创建/改写播放状态文件");
+        // 未置位时正常落盘
+        locked.store(false, Ordering::SeqCst);
+        save_to_if_unlocked(&tmp, &Config::default(), &locked).expect("未锁定应保存成功");
+        assert!(tmp.exists());
+        let _ = std::fs::remove_file(&tmp);
     }
 }

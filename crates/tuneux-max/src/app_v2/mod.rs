@@ -1,4 +1,4 @@
-//! # max 应用 v2：fx TUI 风格的 egui 复刻
+//! # max 应用 v2：fx TUI 观感的 egui 界面
 //!
 //! 视觉基准 = tuneux-fx（002 手册 + P0 规格冻结）：
 //! - 所有面板 = 边框盒 + 标题嵌入上边框（ratatui Block 同款观感）
@@ -9,26 +9,26 @@
 //! 交互白名单（相对 fx 仅两项新增）：拖拽（浏览器→播放列表、面板分隔线）、右键菜单。
 //! 老 UI（app.rs）保留，切换点在 main.rs。
 //!
-//! 现代呈现层（[`modern`]）：`config.modern = true` 时切换为纯图形观感
 //! （圆角卡片 / 矢量控件 / 鼠标全覆盖），默认关闭、一键可逆。
 
+mod context_menu;
 mod gauge;
-mod modern;
+mod menu;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
 use eframe::egui;
 use egui::text::{LayoutJob, TextFormat};
-use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
+use egui::{Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 
 use tuneux_commonx::fs_browser::{FsBrowser, FsBrowserConfig};
 use tuneux_commonx::ui::{FocusTarget, UiAction, UiMode, UiModel};
 use tuneux_commonx::I18n;
 use tuneux_corex::{Engine, PlaybackMedium, PlaybackStatus, KNOWN_AUDIO_EXTS};
 use tuneux_mediax::lyrics::Lyrics;
-use tuneux_mediax::metadata::TrackMetadata;
+use tuneux_mediax::metadata::{sample_rate_khz_label, TrackMetadata};
 use tuneux_mediax::{PlaylistCore, PlaylistItem, PlaylistView, RepeatMode};
 
 use crate::config::MaxConfig;
@@ -39,9 +39,6 @@ use crate::theme::{self, Palette};
 const FONT: f32 = 15.0;
 /// 行高（列表行 / 字符画行距）。
 const LINE_H: f32 = 19.0;
-/// 现代模式按钮圆角。
-const CTRL_R_MODERN: u8 = 5;
-
 fn mono(sz: f32) -> FontId {
     FontId::monospace(sz)
 }
@@ -245,44 +242,12 @@ enum PlRow {
     Track { item: usize, seq: usize },
 }
 
-/// dock 叶子菜单动作（f2k Change layout 同款）。
-enum LeafAct {
-    Close(dock::ModuleId),
-    /// 在 target 处拆分插入 new（side_by_side = 水平/垂直）。
-    Split(dock::ModuleId, dock::ModuleId, bool),
-    /// 原位更换。
-    Replace(dock::ModuleId, dock::ModuleId),
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SpectrumMode {
     Hidden,
     Full,
     /// 示波器（时域波形，fx v 循环第四态）。
     Oscilloscope,
-}
-
-/// 菜单动作缓冲（闭包内记录、循环外执行——避免 egui 借用冲突）。
-enum MenuAct {
-    Ui(UiAction),
-    Medium(PlaybackMedium),
-    ReplayGain,
-    PickFiles,
-    PickDir,
-    Font(usize),
-    Lang(String),
-    ToggleComp,
-    NotYet,
-    DevFollow,
-    Theme(String),
-    ToggleMod(String),
-    ToggleModule(dock::ModuleId),
-    PresetSave,
-    PresetLoad(String),
-    /// 切换现代 / 经典界面（可逆开关）。
-    ModernUi,
-    /// 在当前位置添加书签（与 :bm 命令同语义）。
-    Bookmark,
 }
 
 /// v2 应用状态。
@@ -296,10 +261,8 @@ pub struct MaxAppV2 {
     status: Option<PlaybackStatus>,
     palette: Palette,
     replay_gain: bool,
-    /// 浏览器右键菜单（行索引 + 屏幕位置）。
-    browser_menu: Option<(usize, Pos2, u64)>,
-    /// 播放列表右键菜单。
-    playlist_menu: Option<(usize, Pos2, u64)>,
+    /// 统一右键菜单（五套手写弹层删并后的唯一弹层；2026-10-15 右键菜单统一重写）。
+    ctx_menu: Option<context_menu::CtxMenuState>,
     /// 浏览器拖拽源行。
     drag_browser: Option<usize>,
     /// x 键二次确认时间戳。
@@ -360,12 +323,11 @@ pub struct MaxAppV2 {
     album_covers: std::collections::HashMap<PathBuf, Option<egui::TextureHandle>>,
     /// 全曲波形包络（路径 → 256 桶峰值；后台线程计算，当前曲切换时触发）。
     track_envelope: Option<(PathBuf, Vec<f32>)>,
-    /// 待打开的菜单索引（数字键 1-8 / F10 触发，菜单栏渲染时消费）。
+    /// 待打开的菜单索引（数字键 1-8 触发，菜单栏渲染时消费）。
     pending_menu: Option<usize>,
-    /// dock 叶子右键菜单（目标模块 + 弹出位 + 打开帧号）。
-    dock_leaf_menu: Option<(dock::ModuleId, Pos2, u64)>,
-    /// 叶子菜单当前页（0=根页 1=水平拆分 2=垂直拆分 3=更换为）。
-    leaf_page: u8,
+    /// Cmd/Ctrl+O 打开文件的待办（快捷键在菜单轮询置位并执行——
+    /// rfd 对话框是阻塞调用，须在有 ctx 的位置跑并归还焦点）。
+    pending_open_files: bool,
     /// 拖拽中的模块（标题带 drag 开始；落到别的叶子松手 = 换位）。
     dock_drag: Option<dock::ModuleId>,
     /// 待应用的叶子交换（渲染后做树手术）。
@@ -374,16 +336,14 @@ pub struct MaxAppV2 {
     browser_rect: egui::Rect,
     /// 播放列表面板矩形（每帧更新；频谱独占时为 NOTHING 不误判）。
     playlist_rect: egui::Rect,
-    /// 空白区右键菜单（true = 播放列表 / false = 浏览器）。
-    blank_menu: Option<(bool, Pos2, u64)>,
-    /// 帧首是否有菜单开启（该帧的右键只关不开——防「关了又弹」观感）。
+    /// 帧首是否有右键菜单开启（该帧的区域右键只关不开——防「关了又弹」观感）。
     menu_open_at_frame_start: bool,
+    /// 帧首是否有顶栏下拉/弹层开启（右键互斥：帧首开着则本帧右键不弹）。
+    top_popup_at_frame_start: bool,
     /// 上一帧的浏览器目录（目录变化 = 行索引失效，清行菜单）。
     last_cwd: PathBuf,
     /// 状态栏矩形（每帧更新；右键开模块菜单的命中区）。
     status_rect: egui::Rect,
-    /// 模块加装菜单弹出位置（状态栏右键触发）。
-    mod_menu: Option<(Pos2, u64)>,
     /// EQ 槽位（插件装载时由插件分配；关闭后音效保持）。
     eq_slot: Option<(u32, std::sync::Arc<tuneux_corex::EqParams>)>,
     /// 均衡器插件（第一方 wasm；验签装载失败 → 面板显示「未加载」提示）。
@@ -399,7 +359,7 @@ pub struct MaxAppV2 {
     comp_slot: Option<(u32, std::sync::Arc<tuneux_corex::CompressorParams>)>,
     /// 输出设备清单快照（启动时枚举一次；选择仅提示——输出跟随系统）。
     output_devices: Vec<String>,
-    /// 字体目录（内置文泉驿 + fonts/ 目录扫描）。
+    /// 字体目录（内置 Sarasa Mono SC + fonts/ 目录扫描）。
     fonts: Vec<theme::FontEntry>,
     /// 当前字体索引。
     font_idx: usize,
@@ -411,11 +371,22 @@ pub struct MaxAppV2 {
     volume_before_mute: Option<f32>,
     /// 现代播放列表列头排序键：0=默认（专辑+曲号）1=标题 2=艺术家
     /// 3=专辑 4=时长（会话级，不持久化）。
-    pl_sort: u8,
     /// 列头排序方向（true = 降序）。
-    pl_sort_desc: bool,
+    /// 属性弹窗（播放列表右键 → 查看属性）。
+    pub properties_visible: bool,
+    /// 属性弹窗目标行（播放列表行索引）。
+    properties_row: Option<usize>,
+    /// 书签弹窗（菜单 书签 ▸ 列表…/删除…）。
+    bookmarks_visible: bool,
+    /// 书签弹窗选中行（Enter 跳转用）。
+    bm_sel: usize,
+    /// 插件管理页（工具菜单；只读 + 重载）。
+    plugins_visible: bool,
+    /// 插件管理页行快照（打开/重载时刷新，避免每帧读盘）。
+    plugins_rows: Vec<menu::PluginRow>,
+    /// 快捷键一览弹窗（内容生成自菜单静态表）。
+    shortcuts_visible: bool,
     /// 播放列表行拖拽重排的源条目索引（平铺视图）。
-    pl_drag_from: Option<usize>,
     /// 指针表针物理（L/R 双针）。
     gauge_needles: [tuneux_commonx::gauge::NeedlePhys; 2],
     /// 指针表帧时刻（dt 计算）。
@@ -423,6 +394,59 @@ pub struct MaxAppV2 {
 }
 
 impl MaxAppV2 {
+    /// 属性弹窗的数据（目标行的元数据 + 路径），Window 前预计算以解借用冲突。
+    fn properties_data(
+        &self,
+    ) -> (
+        Option<tuneux_mediax::metadata::TrackMetadata>,
+        Option<std::path::PathBuf>,
+    ) {
+        let row = match self.properties_row {
+            Some(r) => r,
+            None => return (None, None),
+        };
+        let rows = self.build_rows();
+        let pr = match rows.get(row) {
+            Some(p) => p,
+            None => return (None, None),
+        };
+        let item_idx = match pr {
+            crate::app_v2::PlRow::Track { item, .. } => *item,
+            _ => return (None, None),
+        };
+        let it = match self.playlist.items().get(item_idx) {
+            Some(i) => i,
+            None => return (None, None),
+        };
+        let mut md = self.metadata_cache.get(&it.path).cloned();
+        // 引擎回落（2026-10-15 产品实测补齐）：该行恰为正在播放曲目时，
+        // 引擎快照即此文件的实测参数——FFmpeg 长尾元数据为空兜底时
+        // 属性弹窗不再全「未知」。非当前曲目不回落（快照参数不属于它）。
+        let cur = self
+            .playlist
+            .current_index()
+            .and_then(|i| self.playlist.items().get(i))
+            .map(|c| c.path.clone());
+        if cur.as_deref() == Some(it.path.as_path()) {
+            if let Some(e) = self.engine.as_ref() {
+                let st = e.status();
+                let dur = (st.duration > 0.0).then_some(st.duration);
+                md = md.map(|m| {
+                    // 引擎回落：三端同源（mediax TrackMetadata::overlay_engine_params），
+                    // 字段语义见该方法的文档（元数据优先、码率不补）。
+                    m.overlay_engine_params(
+                        e.src_codec(),
+                        st.src_sample_rate,
+                        st.src_channels,
+                        st.src_bits,
+                        dur,
+                    )
+                });
+            }
+        }
+        (md, Some(it.path.clone()))
+    }
+
     /// 创建应用。
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let config = crate::config::load();
@@ -478,7 +502,7 @@ impl MaxAppV2 {
             },
         );
 
-        // 字体目录：内置文泉驿 + fonts/ 扫描；按配置恢复上次选择
+        // 字体目录：内置 Sarasa Mono SC + fonts/ 扫描；按配置恢复上次选择
         let fonts = theme::font_catalog();
         let font_idx = fonts
             .iter()
@@ -490,7 +514,16 @@ impl MaxAppV2 {
         // 播放列表状态恢复（mediax PlaylistState 规范格式）：
         // 多列表取活跃列表；旧版单列表字段（items/current/shuffle）作迁移入口。
         let mut playlist = PlaylistCore::new();
-        let st = crate::config::load_state();
+        let (st, state_status) = crate::config::load_state_with_status();
+        // 播放状态文件损坏：状态栏 flash 提示；备份与停写锁已在加载内完成，
+        // 本次会话不会覆写原文件。文案构造用 commonx 统一口径
+        //（备份成败两分支，含单元测试）。
+        let state_corrupt_flash = tuneux_commonx::config_status::corrupt_flash_msg(
+            &state_status,
+            &i18n.t("msg.state_corrupt"),
+            &i18n.t("msg.state_corrupt_nobackup"),
+        );
+        let state_corrupt_at = state_corrupt_flash.as_ref().map(|_| Instant::now());
         let (items, shuffle, current) = if !st.lists.is_empty() {
             let active = st.active.min(st.lists.len() - 1);
             let l = &st.lists[active];
@@ -519,8 +552,7 @@ impl MaxAppV2 {
             status: None,
             palette,
             replay_gain: false,
-            browser_menu: None,
-            playlist_menu: None,
+            ctx_menu: None,
             drag_browser: None,
             x_confirm_at: None,
             metadata: None,
@@ -546,8 +578,8 @@ impl MaxAppV2 {
             scan_pool,
 
             tag_added: 0,
-            flash: None,
-            flash_at: None,
+            flash: state_corrupt_flash,
+            flash_at: state_corrupt_at,
             search_target_browser: false,
             search_focus_req: false,
             command_focus_req: false,
@@ -558,17 +590,15 @@ impl MaxAppV2 {
             album_covers: std::collections::HashMap::new(),
             track_envelope: None,
             pending_menu: None,
-            dock_leaf_menu: None,
-            leaf_page: 0,
+            pending_open_files: false,
             dock_drag: None,
             dock_swap: None,
             browser_rect: egui::Rect::NOTHING,
             playlist_rect: egui::Rect::NOTHING,
-            blank_menu: None,
             menu_open_at_frame_start: false,
+            top_popup_at_frame_start: false,
             last_cwd: last_cwd_init,
             status_rect: egui::Rect::NOTHING,
-            mod_menu: None,
             eq_slot: eq_slot_init,
             comp_slot: comp_slot_init,
             eq_plugin: eq_loaded.map(|(_, p)| p),
@@ -583,9 +613,13 @@ impl MaxAppV2 {
             fonts_dirty: false,
             spectrum_font: FONT,
             volume_before_mute: None,
-            pl_sort: 0,
-            pl_sort_desc: false,
-            pl_drag_from: None,
+            properties_visible: false,
+            properties_row: None,
+            bookmarks_visible: false,
+            bm_sel: 0,
+            plugins_visible: false,
+            plugins_rows: Vec::new(),
+            shortcuts_visible: false,
             gauge_needles: [
                 tuneux_commonx::gauge::NeedlePhys::default(),
                 tuneux_commonx::gauge::NeedlePhys::default(),
@@ -633,6 +667,45 @@ impl MaxAppV2 {
             } else if cancel {
                 self.execute(UiAction::CommandCancel);
             }
+            return;
+        }
+        // 书签弹窗模态键：↑/↓ 选择 · Enter 跳转 · Esc 关闭（弹窗期不穿透到列表）
+        if self.bookmarks_visible {
+            let mut op = 0u8;
+            ctx.input(|i| {
+                if i.key_pressed(egui::Key::ArrowUp) {
+                    op = 1;
+                } else if i.key_pressed(egui::Key::ArrowDown) {
+                    op = 2;
+                } else if i.key_pressed(egui::Key::Enter) {
+                    op = 3;
+                } else if i.key_pressed(egui::Key::Escape) {
+                    op = 4;
+                }
+            });
+            let len = self.config.bookmarks.items.len();
+            match op {
+                1 => self.bm_sel = self.bm_sel.saturating_sub(1),
+                2 => {
+                    if len > 0 {
+                        self.bm_sel = (self.bm_sel + 1).min(len - 1);
+                    }
+                }
+                3 => {
+                    if self.bm_sel < len {
+                        let n = self.bm_sel + 1;
+                        self.bookmark_jump(n);
+                        self.bookmarks_visible = false;
+                    }
+                }
+                4 => self.bookmarks_visible = false,
+                _ => {}
+            }
+            return;
+        }
+        // 右键菜单开着：↑↓/Enter/Esc 归菜单导航，不穿透到底层列表
+        if self.ctx_menu.is_some() {
+            self.ctx_menu_keys(ctx);
             return;
         }
         if self.ui.mode != UiMode::Normal {
@@ -714,10 +787,50 @@ impl MaxAppV2 {
                 Some(UiAction::SearchStart)
             } else if text_char(i, '?') {
                 Some(UiAction::About)
+            } else if text_char(i, 'i') && !ctrl {
+                // 属性弹窗（播放列表选中行优先，无选中回落当前曲）
+                self.open_properties_for_selection();
+                None
+            } else if text_char(i, 'e') && !ctrl {
+                // e 双重身份：EQ 模块未开 = 打开/聚焦；已开 = 归面板（切换启用）
+                let eq_open = self
+                    .config
+                    .dock
+                    .as_ref()
+                    .is_some_and(|d| d.contains(dock::ModuleId::Eq));
+                if eq_open {
+                    if let Some((_, params)) = &self.eq_slot {
+                        let on = params.enabled();
+                        params.set_enabled(!on);
+                    }
+                    None
+                } else {
+                    Some(UiAction::ToggleEq)
+                }
             } else if i.key_pressed(Key::Tab) {
                 Some(UiAction::CycleFocus)
             } else if i.key_pressed(Key::Escape) {
-                Some(UiAction::NavBack)
+                // 弹窗优先（属性/插件管理/快捷键一览），其次开着的 EQ 模块，否则返回
+                if self.properties_visible {
+                    self.properties_visible = false;
+                    None
+                } else if self.plugins_visible {
+                    self.plugins_visible = false;
+                    None
+                } else if self.shortcuts_visible {
+                    self.shortcuts_visible = false;
+                    None
+                } else if self
+                    .config
+                    .dock
+                    .as_ref()
+                    .is_some_and(|d| d.contains(dock::ModuleId::Eq))
+                {
+                    self.toggle_dock_module(dock::ModuleId::Eq);
+                    None
+                } else {
+                    Some(UiAction::NavBack)
+                }
             } else if i.key_pressed(Key::Backspace) {
                 match self.ui.focus {
                     FocusTarget::Browser => {
@@ -729,6 +842,10 @@ impl MaxAppV2 {
                         None
                     }
                 }
+            } else if i.modifiers.alt && i.key_pressed(Key::Enter) {
+                // Alt+Enter：属性（i 的辅助别名）
+                self.open_properties_for_selection();
+                None
             } else if i.key_pressed(Key::Enter) {
                 Some(UiAction::NavEnter)
             } else if i.key_pressed(Key::ArrowUp) || (text_char(i, 'k') && !ctrl) {
@@ -743,19 +860,6 @@ impl MaxAppV2 {
             } else if i.key_pressed(Key::End) {
                 nav = true;
                 Some(UiAction::NavEnd)
-            } else if i.key_pressed(Key::F5) {
-                Some(UiAction::ToggleBrowser)
-            } else if i.key_pressed(Key::F6) {
-                Some(UiAction::ToggleCover)
-            } else if i.key_pressed(Key::F7) {
-                Some(UiAction::ToggleLyrics)
-            } else if i.key_pressed(Key::F8) {
-                Some(UiAction::ToggleSpectrum)
-            } else if i.key_pressed(Key::F9) {
-                Some(UiAction::ToggleEq)
-            } else if i.key_pressed(Key::F10) {
-                self.pending_menu = Some(0);
-                None
             } else if !ctrl {
                 // 数字键 1-8：直接打开对应菜单（fx 同款）
                 match (1..=8u8).find(|d| text_char(i, char::from(b'0' + d))) {
@@ -917,6 +1021,9 @@ impl MaxAppV2 {
                 self.playlist.clear();
                 self.ui.playlist_selected = None;
                 self.collapsed.clear();
+                // 二次确认已在输入层完成（x x / 菜单点击即确认），
+                // 模型层 apply 置的 ConfirmClear 在此复位，否则键盘输入被卡住
+                self.ui.mode = UiMode::Normal;
             }
             ToggleGroupView => {
                 self.config.view = match self.config.view {
@@ -1545,11 +1652,6 @@ impl MaxAppV2 {
         match node {
             dock::DockNode::Leaf { module } => {
                 let module = *module;
-                // 现代模式：圆角卡片叶（头部条 + 关闭× + 拖拽/右键，语义与经典同源）
-                if self.config.modern {
-                    self.render_leaf_modern(ui, rect, module);
-                    return;
-                }
                 ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                     // 独立 id 作用域：ScrollArea/Slider 等状态按 ui id 键控，
                     // 不 push_id 则各叶子的滚动偏移共用同一键 = 同步滚动 bug
@@ -1557,21 +1659,17 @@ impl MaxAppV2 {
                         self.render_module(module, ui);
                     });
                 });
-                // 标题带：右键 = 模块菜单（f2k 同款：关闭/拆分加装/更换）；
-                // 拖拽 = 换位（拖到别的叶子松手交换）
+                // 标题带：右键 = 模块菜单（关闭/拆分加装/更换为 ▸ 子菜单，
+                // 统一右键组件）；拖拽 = 换位（拖到别的叶子松手交换）
                 let band = egui::Rect::from_min_size(rect.min, Vec2::new(rect.width(), 16.0));
-                if !self.menu_open_at_frame_start
-                    && ui.input(|i| i.pointer.secondary_clicked())
-                    && ui
-                        .input(|i| i.pointer.hover_pos())
-                        .is_some_and(|pp| band.contains(pp))
-                {
-                    self.dock_leaf_menu = Some((
-                        module,
-                        ui.input(|i| i.pointer.hover_pos()).unwrap_or_default(),
-                        self.frame_tick,
-                    ));
-                    self.leaf_page = 0;
+                let sec_on_band = ui.input(|i| {
+                    i.pointer.secondary_clicked()
+                        && i.pointer.hover_pos().is_some_and(|pp| band.contains(pp))
+                });
+                if sec_on_band {
+                    if let Some(pp) = ui.input(|i| i.pointer.hover_pos()) {
+                        self.trigger_dock_leaf_ctx(ui.ctx(), module, pp);
+                    }
                 }
                 let band_resp = ui
                     .allocate_rect(band, egui::Sense::drag())
@@ -1597,8 +1695,8 @@ impl MaxAppV2 {
                 b,
             } => {
                 let r = ratio.clamp(0.08, 0.92);
-                // 分割条宽度：现代模式更细（10px）更轻；经典 18px
-                let handle_sz = if self.config.modern { 10.0 } else { 18.0 };
+                // 分割条宽度 18px（经典口径）
+                let handle_sz = 18.0;
                 let (a_rect, handle, b_rect) = if *side_by_side {
                     let aw = (rect.width() - handle_sz) * r;
                     let ar = egui::Rect::from_min_size(rect.min, Vec2::new(aw, rect.height()));
@@ -1628,32 +1726,19 @@ impl MaxAppV2 {
                 let hresp = ui.allocate_rect(handle, egui::Sense::click_and_drag());
                 {
                     let pt = ui.painter_at(handle.expand(2.0));
-                    // 手柄底色：现代 = 透明（背景透出，悬停才亮）；经典 = 沉底色
-                    if !self.config.modern {
-                        pt.rect_filled(handle, 0.0, pal.panel_bg);
-                    }
-                    // 悬停/拖拽高亮仅现代模式（经典路径观感零变化）
-                    let grip_col = if self.config.modern && (hresp.hovered() || hresp.dragged()) {
-                        pal.accent
-                    } else {
-                        pal.border
-                    };
+                    // 手柄底色：沉底色（经典口径）
+                    pt.rect_filled(handle, 0.0, pal.panel_bg);
+                    let grip_col = pal.border;
                     let c = handle.center();
                     if *side_by_side {
                         pt.line_segment(
                             [Pos2::new(c.x, c.y - 14.0), Pos2::new(c.x, c.y + 14.0)],
-                            egui::Stroke::new(
-                                if self.config.modern { 3.0_f32 } else { 1.0_f32 },
-                                grip_col,
-                            ),
+                            egui::Stroke::new(1.0_f32, grip_col),
                         );
                     } else {
                         pt.line_segment(
                             [Pos2::new(c.x - 14.0, c.y), Pos2::new(c.x + 14.0, c.y)],
-                            egui::Stroke::new(
-                                if self.config.modern { 3.0_f32 } else { 1.0_f32 },
-                                grip_col,
-                            ),
+                            egui::Stroke::new(1.0_f32, grip_col),
                         );
                     }
                 }
@@ -1690,12 +1775,8 @@ impl MaxAppV2 {
         }
     }
 
-    /// 模块分发（dock 叶子渲染入口）：现代模式走 modern 层，经典走原路径。
+    /// 模块分发（dock 叶子渲染入口）。
     fn render_module(&mut self, m: dock::ModuleId, ui: &mut Ui) {
-        if self.config.modern {
-            self.render_module_modern(m, ui);
-            return;
-        }
         match m {
             dock::ModuleId::Browser => self.render_browser_in(ui),
             dock::ModuleId::Playlist => self.render_playlist_in(ui),
@@ -2074,8 +2155,8 @@ impl MaxAppV2 {
     }
 
     /// 执行一条命令（fx 同款命令集 + 布局预设扩展；未知命令 flash 提示）。
-    /// 支持：vol 0-100 / repeat off|list|single / save-m3u / load-m3u [path] /
-    /// bm / bm-list / bm-jump n / bm-del n / preset-save [名] /
+    /// 支持：vol 0-100 / repeat off|list|single / save-m3u / load-m3u \[path\] /
+    /// bm / bm-list / bm-jump n / bm-del n / preset-save \[名\] /
     /// preset-load 名|序号 / preset-del 名|序号 / preset-list / help。
     fn execute_command(&mut self, raw: &str) {
         let line = raw.trim();
@@ -2136,56 +2217,11 @@ impl MaxAppV2 {
                 }
             },
             "save-m3u" | "m3u-save" => {
-                if self.playlist.items().is_empty() {
-                    let m = self.i18n.t("msg.m3u_empty").into_owned();
-                    self.flash_msg(m);
-                } else {
-                    let path = self.browser.cwd().join("playlist.m3u");
-                    let paths: Vec<PathBuf> = self
-                        .playlist
-                        .items()
-                        .iter()
-                        .map(|it| it.path.clone())
-                        .collect();
-                    let content = tuneux_mediax::m3u::serialize(&paths);
-                    match std::fs::write(&path, content) {
-                        Ok(_) => {
-                            let m = format!(
-                                "{} {}",
-                                self.i18n
-                                    .t("msg.saved_m3u")
-                                    .replace("{}", &paths.len().to_string()),
-                                path.display()
-                            );
-                            self.flash_msg(m);
-                        }
-                        Err(e) => {
-                            let m = format!("{}\u{ff1a}{e}", self.i18n.t("msg.save_fail"));
-                            self.flash_msg(m);
-                        }
-                    }
-                }
+                self.save_m3u();
             }
             "load-m3u" | "m3u-load" => {
-                let path = match parts.next() {
-                    Some(pp) => PathBuf::from(pp),
-                    None => self.browser.cwd().join("playlist.m3u"),
-                };
-                match std::fs::read_to_string(&path) {
-                    Ok(content) => {
-                        let paths = tuneux_mediax::m3u::parse(&content);
-                        let cnt = paths.len();
-                        for pp in paths {
-                            self.enqueue_scan(pp);
-                        }
-                        let m = self.i18n.t("msg.loaded").replace("{}", &cnt.to_string());
-                        self.flash_msg(m);
-                    }
-                    Err(e) => {
-                        let m = format!("{}\u{ff1a}{e}", self.i18n.t("msg.load_fail"));
-                        self.flash_msg(m);
-                    }
-                }
+                let p = parts.next().map(PathBuf::from);
+                self.load_m3u(p);
             }
             "bookmark" | "bm" => {
                 self.add_bookmark_now();
@@ -2214,32 +2250,7 @@ impl MaxAppV2 {
                     self.flash_msg(m);
                     return;
                 };
-                let bm = self.config.bookmarks.items.get(nm.wrapping_sub(1)).cloned();
-                match bm {
-                    None => {
-                        let m = self.i18n.t("msg.bm_not_found").into_owned();
-                        self.flash_msg(m);
-                    }
-                    Some(b) => {
-                        let idx = match self
-                            .playlist
-                            .items()
-                            .iter()
-                            .position(|it| it.path == b.path)
-                        {
-                            Some(i) => i,
-                            None => self.add_file_sync(&b.path).unwrap_or(0),
-                        };
-                        self.play_item(idx);
-                        let seek = b.position_secs
-                            + b.cue_start_ms.map(|m| m as f64 / 1000.0).unwrap_or(0.0);
-                        if let Some(e) = &self.engine {
-                            e.send(tuneux_corex::AudioCmd::Seek(seek));
-                        }
-                        let m = self.i18n.t("msg.bm_jump").replace("{}", &nm.to_string());
-                        self.flash_msg(m);
-                    }
-                }
+                self.bookmark_jump(nm);
             }
             "bookmark-del" | "bm-del" => {
                 let Some(nm) = parts.next().and_then(|x| x.parse::<usize>().ok()) else {
@@ -2288,22 +2299,6 @@ impl MaxAppV2 {
                         .collect();
                     self.flash_msg(lines.join("\n"));
                 }
-            }
-            "modern" => {
-                // 现代界面开关：:modern 切换 / :modern on|off 显式设定
-                let want = match parts.next().map(|x| x.to_lowercase()) {
-                    Some(x) if x == "on" || x == "1" || x == "true" => Some(true),
-                    Some(x) if x == "off" || x == "0" || x == "false" => Some(false),
-                    _ => None,
-                };
-                let new_v = want.unwrap_or(!self.config.modern);
-                self.config.modern = new_v;
-                let m = if new_v {
-                    self.i18n.t("msg.modern_on").into_owned()
-                } else {
-                    self.i18n.t("msg.modern_off").into_owned()
-                };
-                self.flash_msg(m);
             }
             "help" | "about" => {
                 self.ui.about_visible = true;
@@ -3583,432 +3578,6 @@ impl MaxAppV2 {
         ui.fonts(|f| f.glyph_width(&mono(FONT), 'M')).max(4.0)
     }
 
-    // ==================== 菜单栏（1 行，fx 同款：数字弱化 + 标题） ====================
-
-    fn render_menu_bar(&mut self, ctx: &egui::Context) {
-        let pal = self.palette.clone();
-        let t = |k: &str| self.i18n.t(k).into_owned();
-        let titles: Vec<(String, String)> = [
-            ("menu.file", "1"),
-            ("menu.play", "2"),
-            ("menu.medium", "3"),
-            ("menu.view", "4"),
-            ("menu.tools", "5"),
-            ("menu.settings", "6"),
-            ("menu.plugins", "7"),
-            ("menu.help", "8"),
-        ]
-        .iter()
-        .map(|(k, n)| (t(k), n.to_string()))
-        .collect();
-        let (l_quit, l_open, l_add_dir) = (t("menu.quit"), t("menu.open_files"), t("menu.add_dir"));
-        let (l_pp, l_prev, l_next) = (t("menu.play_pause"), t("menu.prev"), t("menu.next"));
-        let (l_rep, l_shuf, l_vu, l_vd) = (
-            t("menu.repeat"),
-            t("menu.shuffle"),
-            t("menu.vol_up"),
-            t("menu.vol_down"),
-        );
-        let (l_br, l_cov, l_lyr, l_spec, l_grp) = (
-            t("menu.panel_browser"),
-            t("menu.panel_cover"),
-            t("menu.lyrics"),
-            t("menu.panel_spectrum"),
-            t("menu.group"),
-        );
-        let (l_eq, l_comp) = (t("menu.eq"), t("menu.compressor"));
-        let (l_dsp, l_tag, l_cvt, l_cvm) = (
-            t("menu.dsp"),
-            t("menu.tag_edit"),
-            t("menu.convert"),
-            t("menu.cover_mgmt"),
-        );
-        let (l_dev, l_rg, l_skin, l_lang) = (
-            t("menu.output_device"),
-            t("menu.replaygain"),
-            t("menu.skin_select"),
-            t("menu.lang_select"),
-        );
-        let l_about = t("menu.about");
-        let l_font = t("menu.font");
-        let font_names: Vec<String> = self.fonts.iter().map(|f| f.name.clone()).collect();
-        let font_cur = self.font_idx;
-        // 语言清单：scan_langs 首项即内置 zh/中文，勿再手动前置（会重复）
-        let lang_list: Vec<(String, String)> = tuneux_commonx::scan_langs();
-        let dev_list = self.output_devices.clone();
-        let cur_theme = self.config.theme.clone();
-        let l_mods = t("menu.modules");
-        let mod_entries = self.mod_entries();
-        let l_presets = t("menu.presets");
-        let l_preset_save = t("menu.preset_save");
-        let cur_lang = self.config.lang.clone();
-        let mediums: Vec<(PlaybackMedium, String)> = PlaybackMedium::ALL
-            .iter()
-            .map(|&m| (m, t(medium_key(m))))
-            .collect();
-        // 菜单 √ 读 dock 树（模块在树里即在显示——dock 是唯一事实源）
-        let dock_has = |m: dock::ModuleId| self.config.dock.as_ref().is_some_and(|d| d.contains(m));
-        let (on_br, on_cov, on_lyr, on_spec) = (
-            dock_has(dock::ModuleId::Browser),
-            dock_has(dock::ModuleId::Cover),
-            dock_has(dock::ModuleId::Lyrics),
-            dock_has(dock::ModuleId::Spectrum),
-        );
-        let cur_medium = self
-            .engine
-            .as_ref()
-            .map(|e| e.medium())
-            .unwrap_or(PlaybackMedium::None);
-        let rg_on = self.replay_gain;
-        let modern_on = self.config.modern;
-        let l_modern = t("menu.modern_ui");
-        let l_bm = t("menu.add_bookmark");
-
-        let mut acts: VecDeque<MenuAct> = VecDeque::new();
-        // 设备/预设子菜单点击标志（acts 已被 item 闭包捕获，不能二次可变借用）
-        let mut dev_pick = false;
-        let mut preset_pick: Option<MenuAct> = None;
-        // 菜单栏 id + 各菜单按钮位置（数字键程序化打开用）
-        let mut bar_id: Option<egui::Id> = None;
-        let mut rects: Vec<(String, Pos2)> = Vec::new();
-
-        egui::TopBottomPanel::top("menu_bar")
-            .exact_height(26.0)
-            .resizable(false)
-            .frame(
-                egui::Frame::new()
-                    .fill(pal.panel_bg)
-                    .inner_margin(egui::Margin::symmetric(4, 2)),
-            )
-            .show(ctx, |ui| {
-                let mk_label = |num: &str, title: &str| -> LayoutJob {
-                    let mut job = LayoutJob::default();
-                    // 现代模式：无数字前缀、比例字体（菜单观感去 TUI 化）
-                    if modern_on {
-                        job.append(
-                            title,
-                            0.0,
-                            TextFormat::simple(FontId::proportional(FONT), pal.fg),
-                        );
-                        return job;
-                    }
-                    job.append(
-                        &format!("{num} "),
-                        0.0,
-                        TextFormat::simple(mono(FONT), pal.fg_weak),
-                    );
-                    job.append(
-                        &format!("{title}  "),
-                        0.0,
-                        TextFormat::simple(mono(FONT), pal.fg),
-                    );
-                    job
-                };
-                let mut item =
-                    |ui: &mut Ui, label: &str, act: Option<MenuAct>, on: Option<bool>| {
-                        let prefix = match on {
-                            Some(true) => "√ ",
-                            Some(false) => "  ",
-                            None => "",
-                        };
-                        if ui.button(format!("{prefix}{label}")).clicked() {
-                            if let Some(a) = act {
-                                acts.push_back(a);
-                            }
-                            ui.close();
-                        }
-                    };
-                let disabled = |ui: &mut Ui, label: &str| {
-                    ui.add_enabled(false, egui::Button::new(label.to_string()));
-                };
-
-                egui::MenuBar::new().ui(ui, |ui| {
-                    bar_id = Some(ui.id());
-                    let r0 = ui.menu_button(mk_label(&titles[0].1, &titles[0].0), |ui| {
-                        item(ui, &l_open, Some(MenuAct::PickFiles), None);
-                        item(ui, &l_add_dir, Some(MenuAct::PickDir), None);
-                        ui.separator();
-                        item(ui, &l_quit, Some(MenuAct::Ui(UiAction::Quit)), None);
-                    });
-                    let r1 = ui.menu_button(mk_label(&titles[1].1, &titles[1].0), |ui| {
-                        item(ui, &l_pp, Some(MenuAct::Ui(UiAction::PlayToggle)), None);
-                        item(ui, &l_prev, Some(MenuAct::Ui(UiAction::PrevTrack)), None);
-                        item(ui, &l_next, Some(MenuAct::Ui(UiAction::NextTrack)), None);
-                        ui.separator();
-                        item(ui, &l_rep, Some(MenuAct::Ui(UiAction::CycleRepeat)), None);
-                        item(
-                            ui,
-                            &l_shuf,
-                            Some(MenuAct::Ui(UiAction::ToggleShuffle)),
-                            None,
-                        );
-                        ui.separator();
-                        item(ui, &l_vu, Some(MenuAct::Ui(UiAction::VolumeUp)), None);
-                        item(ui, &l_vd, Some(MenuAct::Ui(UiAction::VolumeDown)), None);
-                        ui.separator();
-                        item(ui, &l_bm, Some(MenuAct::Bookmark), None);
-                    });
-                    let r2 = ui.menu_button(mk_label(&titles[2].1, &titles[2].0), |ui| {
-                        for (m, label) in &mediums {
-                            item(ui, label, Some(MenuAct::Medium(*m)), Some(*m == cur_medium));
-                        }
-                    });
-                    let r3 = ui.menu_button(mk_label(&titles[3].1, &titles[3].0), |ui| {
-                        item(ui, &l_modern, Some(MenuAct::ModernUi), Some(modern_on));
-                        ui.separator();
-                        item(
-                            ui,
-                            &l_br,
-                            Some(MenuAct::Ui(UiAction::ToggleBrowser)),
-                            Some(on_br),
-                        );
-                        ui.menu_button(&l_mods, |ui| {
-                            for (key, label) in &mod_entries {
-                                item(
-                                    ui,
-                                    label,
-                                    Some(MenuAct::ToggleMod((*key).to_string())),
-                                    Some(self.mod_on(key)),
-                                );
-                            }
-                            ui.separator();
-                            for m in dock::ModuleId::ALL {
-                                let label = self.i18n.t(m.label_key()).into_owned();
-                                let on = self.config.dock.as_ref().is_some_and(|d| d.contains(m));
-                                item(ui, &label, Some(MenuAct::ToggleModule(m)), Some(on));
-                            }
-                        });
-                        ui.menu_button(&l_presets, |ui| {
-                            if ui.button(&l_preset_save).clicked() {
-                                preset_pick = Some(MenuAct::PresetSave);
-                            }
-                            if self.config.dock_presets.is_empty() {
-                                ui.weak(self.i18n.t("msg.preset_empty"));
-                            }
-                            for nm in self.config.dock_presets.keys() {
-                                if ui.button(nm).clicked() {
-                                    preset_pick = Some(MenuAct::PresetLoad(nm.clone()));
-                                }
-                            }
-                        });
-                        item(
-                            ui,
-                            &l_cov,
-                            Some(MenuAct::Ui(UiAction::ToggleCover)),
-                            Some(on_cov),
-                        );
-                        item(
-                            ui,
-                            &l_lyr,
-                            Some(MenuAct::Ui(UiAction::ToggleLyrics)),
-                            Some(on_lyr),
-                        );
-                        item(
-                            ui,
-                            &l_spec,
-                            Some(MenuAct::Ui(UiAction::ToggleSpectrum)),
-                            Some(on_spec),
-                        );
-                        item(
-                            ui,
-                            &l_grp,
-                            Some(MenuAct::Ui(UiAction::ToggleGroupView)),
-                            None,
-                        );
-                    });
-                    let r4 = ui.menu_button(mk_label(&titles[4].1, &titles[4].0), |ui| {
-                        item(ui, &l_eq, Some(MenuAct::Ui(UiAction::ToggleEq)), None);
-                        item(ui, &l_comp, Some(MenuAct::ToggleComp), None);
-                        ui.separator();
-                        disabled(ui, &l_dsp);
-                        disabled(ui, &l_tag);
-                        disabled(ui, &l_cvt);
-                        disabled(ui, &l_cvm);
-                    });
-                    let r5 = ui.menu_button(mk_label(&titles[5].1, &titles[5].0), |ui| {
-                        ui.menu_button(&l_dev, |ui| {
-                            for d in &dev_list {
-                                if ui.button(d).clicked() {
-                                    dev_pick = true;
-                                }
-                            }
-                        });
-                        item(ui, &l_rg, Some(MenuAct::ReplayGain), Some(rg_on));
-                        ui.separator();
-                        ui.menu_button(&l_skin, |ui| {
-                            for (tid, tname) in theme::builtin_list() {
-                                item(
-                                    ui,
-                                    tname,
-                                    Some(MenuAct::Theme(tid.to_string())),
-                                    Some(tid == cur_theme),
-                                );
-                            }
-                            if !self.skin_plugins.is_empty() {
-                                ui.separator();
-                                for (nm, _) in &self.skin_plugins {
-                                    item(
-                                        ui,
-                                        nm,
-                                        Some(MenuAct::Theme(nm.clone())),
-                                        Some(*nm == cur_theme),
-                                    );
-                                }
-                            }
-                        });
-                        ui.menu_button(&l_lang, |ui| {
-                            for (lid, lname) in &lang_list {
-                                item(
-                                    ui,
-                                    lname,
-                                    Some(MenuAct::Lang(lid.clone())),
-                                    Some(*lid == cur_lang),
-                                );
-                            }
-                        });
-                        ui.separator();
-                        ui.menu_button(&l_font, |ui| {
-                            for (fi, fname) in font_names.iter().enumerate() {
-                                item(ui, fname, Some(MenuAct::Font(fi)), Some(fi == font_cur));
-                            }
-                        });
-                    });
-                    let r6 = ui.menu_button(mk_label(&titles[6].1, &titles[6].0), |ui| {
-                        item(ui, &l_eq, Some(MenuAct::NotYet), None);
-                        item(ui, &l_comp, Some(MenuAct::NotYet), None);
-                    });
-                    let r7 = ui.menu_button(mk_label(&titles[7].1, &titles[7].0), |ui| {
-                        item(ui, &l_about, Some(MenuAct::Ui(UiAction::About)), None);
-                    });
-                    for (k, r) in [&r0, &r1, &r2, &r3, &r4, &r5, &r6, &r7]
-                        .into_iter()
-                        .enumerate()
-                    {
-                        rects.push((
-                            format!("{} {}  ", titles[k].1, titles[k].0),
-                            r.response.rect.left_bottom(),
-                        ));
-                    }
-                });
-            });
-
-        if dev_pick {
-            acts.push_back(MenuAct::DevFollow);
-        }
-        if let Some(a) = preset_pick {
-            acts.push_back(a);
-        }
-        // 数字键 1-8 / F10：程序化打开对应菜单（BarState 直设，等效点击；
-        // menu_id = bar_id.with(按钮文本)，与 egui menu_button 内部同式）。
-        // 定点豁免 deprecated：egui 0.32 新 menu API（MenuBar/menu_button）
-        // 没有程序化开菜单的等价入口，仅此处的 BarState/MenuRoot 直设可复用；
-        // 升级 egui 时重访（若新 API 补齐副入口则迁移）。
-        #[allow(deprecated)]
-        if let Some(i) = self.pending_menu.take() {
-            if let (Some(bid), Some((text, pos))) = (bar_id, rects.get(i)) {
-                let mut bs = egui::menu::BarState::load(ctx, bid);
-                **bs = Some(egui::menu::MenuRoot::new(*pos, bid.with(text)));
-                bs.store(ctx, bid);
-            }
-        }
-
-        while let Some(a) = acts.pop_front() {
-            match a {
-                MenuAct::Ui(u) => self.execute(u),
-                MenuAct::Medium(m) => {
-                    if let Some(e) = &self.engine {
-                        e.set_medium(m);
-                    }
-                }
-                MenuAct::ReplayGain => {
-                    self.replay_gain = !self.replay_gain;
-                    if let Some(e) = &self.engine {
-                        e.set_replay_gain_enabled(self.replay_gain);
-                    }
-                }
-                MenuAct::PickFiles => {
-                    if let Some(paths) = rfd::FileDialog::new()
-                        .add_filter(
-                            "音频",
-                            &["flac", "wav", "mp3", "ogg", "opus", "wv", "m4a", "aiff"],
-                        )
-                        .pick_files()
-                    {
-                        for p in paths {
-                            self.enqueue_scan(p);
-                        }
-                    }
-                    // 原生对话框关闭后取回窗口焦点（macOS 有时不自动归还）
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
-                MenuAct::PickDir => {
-                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                        self.enqueue_scan(dir);
-                    }
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
-                MenuAct::Font(i) => {
-                    self.font_idx = i;
-                    self.fonts_dirty = true;
-                    if let Some(f) = self.fonts.get(i) {
-                        self.config.font = f.name.clone();
-                    }
-                }
-                MenuAct::Lang(id) => {
-                    self.config.lang = id.clone();
-                    self.i18n = tuneux_commonx::build_i18n(&id, crate::config::zh_table());
-                }
-                MenuAct::ToggleComp => {
-                    self.toggle_dock_module(dock::ModuleId::Comp);
-                }
-                MenuAct::NotYet => {
-                    self.flash = Some(self.i18n.t("msg.not_yet").into_owned());
-                    self.flash_at = Some(Instant::now());
-                }
-                MenuAct::DevFollow => {
-                    self.flash = Some(self.i18n.t("msg.dev_follow").into_owned());
-                    self.flash_at = Some(Instant::now());
-                }
-                MenuAct::ToggleModule(m) => {
-                    self.toggle_dock_module(m);
-                }
-                MenuAct::PresetSave => {
-                    self.preset_save(None);
-                }
-                MenuAct::PresetLoad(name) => {
-                    self.preset_load(&name);
-                }
-                MenuAct::Theme(id) => {
-                    self.config.theme = id.clone();
-                    self.palette = theme::builtin(&id)
-                        .or_else(|| {
-                            self.skin_plugins
-                                .iter()
-                                .find(|(n, _)| *n == id)
-                                .map(|(_, p)| p.clone())
-                        })
-                        .unwrap_or_default();
-                    theme::apply_visuals(ctx, &self.palette);
-                }
-                MenuAct::ToggleMod(key) => {
-                    self.toggle_mod(&key);
-                }
-                MenuAct::ModernUi => {
-                    self.config.modern = !self.config.modern;
-                    let m = if self.config.modern {
-                        self.i18n.t("msg.modern_on").into_owned()
-                    } else {
-                        self.i18n.t("msg.modern_off").into_owned()
-                    };
-                    self.flash_msg(m);
-                }
-                MenuAct::Bookmark => {
-                    self.add_bookmark_now();
-                }
-            }
-        }
-    }
-
     // ==================== 当前曲目（6 行三栏，fx draw_now_playing 同款） ====================
 
     /// 换曲检测：元数据 / 封面纹理 / 歌词 / 波形包络一次性重载
@@ -4061,6 +3630,20 @@ impl MaxAppV2 {
             .current_index()
             .and_then(|i| self.playlist.items().get(i))
             .and_then(|it| it.cue.clone());
+        // 引擎实测源参数快照（FFmpeg 长尾元数据为兜底记录时技术行回落源；
+        // 与状态栏/现代行同规格）。
+        let (eng_codec, eng_rate, eng_ch, eng_bits) = match self.engine.as_ref() {
+            Some(e) => {
+                let st = e.status();
+                (
+                    e.src_codec(),
+                    st.src_sample_rate,
+                    st.src_channels,
+                    st.src_bits,
+                )
+            }
+            None => (None, None, None, None),
+        };
         let info = self.metadata.as_ref().map(|md| {
             let title = cur_cue
                 .as_ref()
@@ -4080,12 +3663,34 @@ impl MaxAppV2 {
                 (None, Some(n)) => format!("{} {n}", self.i18n.t("metadata.track_label")),
                 (None, None) => self.i18n.t("metadata.unknown_album").into_owned(),
             };
+            // 技术行：元数据缺失段回落引擎实测源参数（此前纯元数据，
+            // FFmpeg 长尾兜底记录全 None → 显示「? · 未知 · 未知 · 有损」）；
+            // 声道段随现代行口径补齐（codec · 码率 · 采样率 · 声道 · 位深）。
+            let codec = md
+                .codec
+                .clone()
+                .or(eng_codec.clone())
+                .unwrap_or_else(|| "?".to_string());
+            let hz_label = match md.sample_rate.or(eng_rate) {
+                Some(r) => sample_rate_khz_label(r),
+                None => md.sample_rate_label(),
+            };
+            let ch_label = match md.channels.or(eng_ch) {
+                Some(c) if c >= 2 => "stereo".to_string(),
+                Some(_) => "mono".to_string(),
+                None => "未知".to_string(),
+            };
+            let bits_label = match md.bits_per_sample.or(eng_bits) {
+                Some(b) => format!("{} bit", b),
+                None => md.bits_label(),
+            };
             let tech = format!(
-                "{} · {} · {} · {}",
-                md.codec.as_deref().unwrap_or("?"),
+                "{} · {} · {} · {} · {}",
+                codec,
                 md.bitrate_label(),
-                md.sample_rate_label(),
-                md.bits_label(),
+                hz_label,
+                ch_label,
+                bits_label,
             );
             (title, artist, album_line, tech)
         });
@@ -4481,6 +4086,65 @@ impl MaxAppV2 {
 
     // ==================== 浏览器（左侧，fx draw_browser 同款） ====================
 
+    /// 上级目录图标（矢量直绘）：向上箭头 + 底部横线。
+    /// 不依赖字体字形——内置等宽字体对 U+2302/箭头字形观感不稳定。
+    fn icon_up_dir(ui: &Ui, c: Pos2, s: f32, col: Color32) {
+        let p = ui.painter();
+        let st = Stroke::new(1.5_f32, col);
+        // 箭杆（竖线）
+        p.line_segment(
+            [c + Vec2::new(0.0, -s * 0.45), c + Vec2::new(0.0, s * 0.28)],
+            st,
+        );
+        // 两翼
+        p.line_segment(
+            [
+                c + Vec2::new(-s * 0.40, -s * 0.02),
+                c + Vec2::new(0.0, -s * 0.45),
+            ],
+            st,
+        );
+        p.line_segment(
+            [
+                c + Vec2::new(s * 0.40, -s * 0.02),
+                c + Vec2::new(0.0, -s * 0.45),
+            ],
+            st,
+        );
+        // 底部横线（目录托盘）
+        p.line_segment(
+            [
+                c + Vec2::new(-s * 0.55, s * 0.45),
+                c + Vec2::new(s * 0.55, s * 0.45),
+            ],
+            st,
+        );
+    }
+
+    /// 主目录图标（矢量直绘）：房顶三角 + 方体（实心，小尺寸下清晰）。
+    fn icon_home(ui: &Ui, c: Pos2, s: f32, col: Color32) {
+        let p = ui.painter();
+        // 屋顶（屋檐略宽于房体）
+        p.add(egui::Shape::convex_polygon(
+            vec![
+                c + Vec2::new(0.0, -s * 0.55),
+                c + Vec2::new(s * 0.65, s * 0.02),
+                c + Vec2::new(-s * 0.65, s * 0.02),
+            ],
+            col,
+            Stroke::NONE,
+        ));
+        // 房体
+        p.rect_filled(
+            Rect::from_min_size(
+                c + Vec2::new(-s * 0.45, s * 0.06),
+                Vec2::new(s * 0.9, s * 0.50),
+            ),
+            0.0,
+            col,
+        );
+    }
+
     fn render_browser_in(&mut self, ui: &mut Ui) {
         // 叶子命中矩形（空白区右键检测）
         self.browser_rect = ui.max_rect();
@@ -4495,6 +4159,23 @@ impl MaxAppV2 {
         let mut search_blur = false;
         let esc_hint = self.i18n.t("search.esc_exit").into_owned();
         let empty_search_hint = self.i18n.t("search.esc_exit_search").into_owned();
+        // 工具行文案（自现代版移植的上级/主目录钮）与面包屑路径段快照
+        let t_up = self.i18n.t("browser.up").into_owned();
+        let t_home = self.i18n.t("browser.home").into_owned();
+        let crumbs: Vec<(String, PathBuf)> = {
+            let mut v = Vec::new();
+            let mut acc = PathBuf::new();
+            for c in self.browser.cwd().components() {
+                acc.push(c);
+                let label = acc
+                    .components()
+                    .next_back()
+                    .map(|x| x.as_os_str().to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                v.push((label, acc.clone()));
+            }
+            v
+        };
 
         // 行数据快照：(索引, 文本, 是否目录)——闭包内不借 self.browser
         let entries: Vec<(usize, String, bool)> = self
@@ -4519,8 +4200,64 @@ impl MaxAppV2 {
         let mut dbl_file = None;
         let mut rmb_row: Option<(usize, Pos2)> = None;
         let mut drag_src = None;
+        let mut go_up = false;
+        let mut go_home = false;
+        let mut nav: Option<PathBuf> = None;
 
         Self::tui_box(ui, &pal, &truncate_to_width(&path_str, 40), focused, |ui| {
+            // —— 工具行：上级 / 主目录 / 面包屑（可点路径段跳转）——
+            // 前两钮为矢量直绘图标（不依赖字体字形——U+2302 在内置
+            // 等宽字体里观感不稳，字形回退发虚）；面包屑过长
+            // 只留尾部 4 段 + 省略号（窄面板不撑爆）。
+            ui.horizontal(|ui| {
+                let (up_rect, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+                let up_resp = ui.interact(up_rect, egui::Id::new("browser_btn_up"), Sense::click());
+                let up_col = if up_resp.hovered() {
+                    pal.accent
+                } else {
+                    pal.fg
+                };
+                Self::icon_up_dir(ui, up_rect.center(), 7.5, up_col);
+                if up_resp.clone().on_hover_text(&t_up).clicked() {
+                    go_up = true;
+                }
+                let (home_rect, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+                let home_resp =
+                    ui.interact(home_rect, egui::Id::new("browser_btn_home"), Sense::click());
+                let home_col = if home_resp.hovered() {
+                    pal.accent
+                } else {
+                    pal.fg
+                };
+                Self::icon_home(ui, home_rect.center(), 8.0, home_col);
+                if home_resp.clone().on_hover_text(&t_home).clicked() {
+                    go_home = true;
+                }
+                ui.add_space(4.0);
+                let skip = crumbs.len().saturating_sub(4);
+                if skip > 0 {
+                    ui.colored_label(pal.fg_weak, "…");
+                }
+                for (idx, (label, path)) in crumbs.iter().enumerate() {
+                    if idx < skip {
+                        continue;
+                    }
+                    let seg = ui.add(
+                        egui::Button::new(
+                            RichText::new(label.as_str())
+                                .font(mono(12.0))
+                                .color(pal.accent),
+                        )
+                        .small()
+                        .fill(Color32::TRANSPARENT),
+                    );
+                    if seg.clicked() {
+                        nav = Some(path.clone());
+                    }
+                    ui.colored_label(pal.fg_weak, "/");
+                }
+            });
+            ui.add_space(2.0);
             if search_here {
                 // 搜索输入行（/ 进入 · Esc 退出 · Enter 首个匹配）
                 ui.horizontal(|ui| {
@@ -4634,6 +4371,18 @@ impl MaxAppV2 {
         if search_blur {
             self.end_search();
         }
+        // 工具行导航（上级 / 主目录 / 面包屑段）：浏览器核心同款接口。
+        if go_up {
+            self.browser.go_up();
+        }
+        if go_home {
+            if let Some(h) = dirs::home_dir() {
+                self.browser.navigate_to(&h);
+            }
+        }
+        if let Some(t) = nav {
+            self.browser.navigate_to(&t);
+        }
         if let Some(i) = click {
             self.browser.select(i);
             self.ui.focus = FocusTarget::Browser;
@@ -4650,10 +4399,8 @@ impl MaxAppV2 {
             }
         }
         if let Some((i, pos)) = rmb_row {
-            if !self.menu_open_at_frame_start {
-                self.browser_menu = Some((i, pos, self.frame_tick));
-            }
-            self.blank_menu = None;
+            // 行右键：换行原地重定位（统一右键组件；顶栏互斥在组件内判定）
+            self.trigger_browser_ctx(ui.ctx(), i, pos);
         }
         if let Some(i) = drag_src {
             self.drag_browser = Some(i);
@@ -4687,7 +4434,8 @@ impl MaxAppV2 {
         let col_title = self.i18n.t("col.title").into_owned();
         let col_artist = self.i18n.t("col.artist").into_owned();
         let col_dur = self.i18n.t("col.dur").into_owned();
-        let show_col_header = self.mod_on("col_header");
+        // 列头永远显示：右键配列是功能入口，不随皮肤模块开关。
+        let show_col_header = true;
         let show_group_rule = self.mod_on("group_rule");
         let sel = self.ui.playlist_selected;
         let current = self.playlist.current_index();
@@ -4727,6 +4475,7 @@ impl MaxAppV2 {
         let mut dbl = None;
         let mut rmb_row: Option<(usize, Pos2)> = None;
         let mut drop_here = false;
+        let mut col_header_menu: Option<Pos2> = None;
 
         Self::tui_box(ui, &pal, &title, focused, |ui| {
             if search_here {
@@ -4784,10 +4533,14 @@ impl MaxAppV2 {
             // 横向滚动时隐藏：置顶列头无法与滚动行对齐，宁缺毋错
             let h_scroll = ((ui.available_width() - 8.0) / cw) < natural_cols as f32;
             if show_col_header && !h_scroll {
-                let (rect, _) = ui.allocate_exact_size(
+                let (rect, hdr_resp) = ui.allocate_exact_size(
                     Vec2::new(ui.available_width(), LINE_H),
-                    egui::Sense::hover(),
+                    egui::Sense::click(),
                 );
+                // 右键列头 → 列开关菜单
+                if hdr_resp.secondary_clicked() {
+                    col_header_menu = hdr_resp.hover_pos();
+                }
                 let p = ui.painter_at(rect);
                 p.rect_filled(rect, 0.0, pal.panel_bg);
                 let f = mono(FONT);
@@ -5093,10 +4846,36 @@ impl MaxAppV2 {
             }
         }
         if let Some((ri, pos)) = rmb_row {
-            if !self.menu_open_at_frame_start {
-                self.playlist_menu = Some((ri, pos, self.frame_tick));
-            }
-            self.blank_menu = None;
+            // 行右键：换行原地重定位（统一右键组件）
+            self.trigger_playlist_ctx(ui.ctx(), ri, pos);
+        }
+        // 列头右键 → 列开关（# / 标题 / 艺术家 / 专辑 / 时长）
+        if let Some(pos) = col_header_menu {
+            let cols = &mut self.config.pl_cols;
+            let t_num = self.i18n.t("col.num").into_owned();
+            let t_title = self.i18n.t("col.title").into_owned();
+            let t_artist = self.i18n.t("col.artist").into_owned();
+            let t_album = self.i18n.t("col.album").into_owned();
+            let t_dur = self.i18n.t("col.dur").into_owned();
+            egui::Area::new(egui::Id::new("col_header_rmb"))
+                .fixed_pos(pos)
+                .order(egui::Order::Foreground)
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::menu(ui.style())
+                        .inner_margin(egui::Margin::same(4))
+                        .show(ui, |ui| {
+                            ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
+                            ui.visuals_mut().widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                            ui.visuals_mut().widgets.inactive.fg_stroke.color = pal.fg;
+                            ui.visuals_mut().widgets.hovered.bg_fill = pal.sel_bg;
+                            ui.visuals_mut().widgets.hovered.bg_stroke = egui::Stroke::NONE;
+                            flat_menu_item(ui, &t_num, &mut cols.num);
+                            flat_menu_item(ui, &t_title, &mut cols.title);
+                            flat_menu_item(ui, &t_artist, &mut cols.artist);
+                            flat_menu_item(ui, &t_album, &mut cols.album);
+                            flat_menu_item(ui, &t_dur, &mut cols.duration);
+                        });
+                });
         }
         if drop_here {
             if let Some(src) = self.drag_browser.take() {
@@ -5494,11 +5273,6 @@ impl MaxAppV2 {
     // ==================== 状态栏（3 行盒，fx draw_status_bar 同款） ====================
 
     fn render_status_bar(&mut self, ctx: &egui::Context) {
-        // 现代模式：单行状态栏（信息 + 提示体系 + 右键模块菜单）
-        if self.config.modern {
-            self.render_status_bar_modern(ctx);
-            return;
-        }
         let pal = self.palette.clone();
         let title = self.i18n.t("panel.status").into_owned();
         let show_tech = self.mod_on("status_tech");
@@ -5575,8 +5349,12 @@ impl MaxAppV2 {
                     // f2k 技术行：codec | 码率 | 采样率 | 声道 | 位置 / 时长
                     if show_tech {
                         let md = self.metadata.as_ref();
+                        // 引擎实测源参数：元数据探测缺失时（FFmpeg 长尾格式）
+                        // 回落显示——引擎在后端 open 时快照了真实参数。
+                        let st = self.status.as_ref();
                         let codec = md
                             .and_then(|m| m.codec.clone())
+                            .or_else(|| self.engine.as_ref().and_then(|e| e.src_codec()))
                             .unwrap_or_else(|| "---".to_string());
                         let kbps = md
                             .and_then(|m| m.bitrate)
@@ -5584,10 +5362,12 @@ impl MaxAppV2 {
                             .unwrap_or_default();
                         let hz = md
                             .and_then(|m| m.sample_rate)
-                            .map(|r| format!("{} Hz", r))
+                            .or_else(|| st.and_then(|s| s.src_sample_rate))
+                            .map(sample_rate_khz_label)
                             .unwrap_or_default();
                         let ch = md
                             .and_then(|m| m.channels)
+                            .or_else(|| st.and_then(|s| s.src_channels))
                             .map(|c| {
                                 if c >= 2 {
                                     "stereo".to_string()
@@ -5596,7 +5376,15 @@ impl MaxAppV2 {
                                 }
                             })
                             .unwrap_or_default();
-                        let left = [codec, kbps, hz, ch]
+                        // 位深段（2026-10-15 补齐）：经典行原仅 codec|码率|
+                        // 采样率|声道，与现代行不一致；长尾
+                        // 格式元数据缺失时回落引擎实测源位深。
+                        let bits = md
+                            .and_then(|m| m.bits_per_sample)
+                            .or_else(|| st.and_then(|s| s.src_bits))
+                            .map(|b| format!("{b} bit"))
+                            .unwrap_or_default();
+                        let left = [codec, kbps, hz, ch, bits]
                             .into_iter()
                             .filter(|seg| !seg.is_empty())
                             .collect::<Vec<_>>()
@@ -5676,9 +5464,7 @@ impl MaxAppV2 {
         let pal = self.palette.clone();
         let keys: Vec<(&'static str, String)> = vec![
             ("1-8", self.i18n.t("fkey.menu").into_owned()),
-            ("F5-F8", self.i18n.t("fkey.panels").into_owned()),
-            ("F9", self.i18n.t("fkey.eq").into_owned()),
-            ("F10", self.i18n.t("fkey.menu").into_owned()),
+            ("e", self.i18n.t("fkey.eq").into_owned()),
             ("?", self.i18n.t("fkey.help").into_owned()),
         ];
 
@@ -5717,337 +5503,15 @@ impl MaxAppV2 {
 
     fn render_popups(&mut self, ctx: &egui::Context) {
         let pal = self.palette.clone();
-        let _pal = self.palette.clone();
 
-        // —— 浏览器右键菜单 ——
-        if let Some((i, pos, opened_tick)) = self.browser_menu {
-            let entry = self
-                .browser
-                .entries()
-                .get(i)
-                .map(|e| (e.name().to_string(), e.is_dir(), e.path().to_path_buf()));
-            let (l_play, l_add, l_dir, l_enter) = (
-                self.i18n.t("menu.ctx_add_play").into_owned(),
-                self.i18n.t("menu.ctx_add_only").into_owned(),
-                self.i18n.t("menu.ctx_add_dir").into_owned(),
-                self.i18n.t("menu.ctx_open").into_owned(),
-            );
-            let mut close = false;
-            let mut act: Option<fn(&mut MaxAppV2, &std::path::Path)> = None;
-            let mut target: Option<PathBuf> = None;
-            egui::Area::new(egui::Id::new("browser_rmb"))
-                .fixed_pos(pos)
-                .order(egui::Order::Foreground)
-                .show(ctx, |ui| {
-                    egui::Frame::new()
-                        .fill(pal.panel_bg)
-                        .stroke(egui::Stroke::new(1.0_f32, pal.border))
-                        .corner_radius(egui::CornerRadius::same(0))
-                        .inner_margin(egui::Margin::same(2))
-                        .shadow(egui::epaint::Shadow::NONE)
-                        .show(ui, |ui| {
-                            ui.spacing_mut().button_padding = egui::Vec2::new(6.0, 2.0);
-                            ui.set_min_width(170.0);
-                            if let Some((_, is_dir, path)) = &entry {
-                                if *is_dir {
-                                    if ui.button(&l_enter).clicked() {
-                                        self.browser.select(i);
-                                        self.browser.enter_selected();
-                                        close = true;
-                                    }
-                                    if ui.button(&l_dir).clicked() {
-                                        act = Some(|s: &mut MaxAppV2, p: &std::path::Path| {
-                                            s.enqueue_scan(p.to_path_buf())
-                                        });
-                                        target = Some(path.clone());
-                                        close = true;
-                                    }
-                                } else {
-                                    if ui.button(&l_play).clicked() {
-                                        act = Some(|s: &mut MaxAppV2, p: &std::path::Path| {
-                                            if let Some(idx) = s.add_file_sync(p) {
-                                                s.play_item(idx);
-                                            }
-                                        });
-                                        target = Some(path.clone());
-                                        close = true;
-                                    }
-                                    if ui.button(&l_add).clicked() {
-                                        act = Some(|s, p| {
-                                            s.playlist.add(PlaylistItem {
-                                                path: p.to_path_buf(),
-                                                album: None,
-                                                track_number: None,
-                                                cue: None,
-                                            });
-                                        });
-                                        target = Some(path.clone());
-                                        close = true;
-                                    }
-                                }
-                            }
-                        });
-                });
-            if let (Some(f), Some(p)) = (act, target) {
-                f(self, &p);
-            }
-            if close {
-                self.browser_menu = None;
-            }
-            // 只认左键关闭：右键释放的那一帧 any_click 也为真，会把刚弹出
-            // 的菜单同帧杀掉（只活一帧 = 肉眼不可见）。左键点击别处才关；
-            // 右键换行 = 重定位菜单，不关闭。
-            // 左键任意处、或非打开帧的右键 → 关闭（打开帧的右键是开启
-            // 事件本身，必须排除——同帧自杀教训）
-            if !close {
-                let pri = ctx.input(|inp| inp.pointer.button_clicked(egui::PointerButton::Primary));
-                let sec =
-                    ctx.input(|inp| inp.pointer.button_clicked(egui::PointerButton::Secondary));
-                if pri || (sec && opened_tick != self.frame_tick) {
-                    self.browser_menu = None;
-                }
-            }
-        }
-
-        // —— 播放列表右键菜单（行级：曲目行 = 播放/移除；组头行 = 折叠/展开/展开全部）——
-        if let Some((ri, pos, opened_tick)) = self.playlist_menu {
-            let rows = self.build_rows();
-            let target: Option<PlRow> = rows.get(ri).cloned();
-            let (l_play, l_rm, l_collapse, l_expand, l_expand_all) = (
-                self.i18n.t("menu.ctx_play").into_owned(),
-                self.i18n.t("menu.ctx_remove").into_owned(),
-                self.i18n.t("menu.ctx_collapse").into_owned(),
-                self.i18n.t("menu.ctx_expand").into_owned(),
-                self.i18n.t("menu.ctx_expand_all").into_owned(),
-            );
-            let is_collapsed = match &target {
-                Some(PlRow::Header { album, .. }) => self.collapsed.contains(album),
-                _ => false,
-            };
-            let mut close = false;
-            let mut do_play: Option<usize> = None;
-            let mut do_rm: Option<usize> = None;
-            let mut do_toggle: Option<String> = None;
-            let mut do_expand_all = false;
-            egui::Area::new(egui::Id::new("playlist_rmb"))
-                .fixed_pos(pos)
-                .order(egui::Order::Foreground)
-                .show(ctx, |ui| {
-                    egui::Frame::new()
-                        .fill(pal.panel_bg)
-                        .stroke(egui::Stroke::new(1.0_f32, pal.border))
-                        .corner_radius(egui::CornerRadius::same(0))
-                        .inner_margin(egui::Margin::same(2))
-                        .shadow(egui::epaint::Shadow::NONE)
-                        .show(ui, |ui| match &target {
-                            Some(PlRow::Track { item, .. }) => {
-                                if ui.button(&l_play).clicked() {
-                                    do_play = Some(*item);
-                                    close = true;
-                                }
-                                ui.separator();
-                                if ui.button(&l_rm).clicked() {
-                                    do_rm = Some(*item);
-                                    close = true;
-                                }
-                            }
-                            Some(PlRow::Header { album, .. }) => {
-                                let label = if is_collapsed { &l_expand } else { &l_collapse };
-                                if ui.button(label).clicked() {
-                                    do_toggle = Some(album.clone());
-                                    close = true;
-                                }
-                                ui.separator();
-                                if ui.button(&l_expand_all).clicked() {
-                                    do_expand_all = true;
-                                    close = true;
-                                }
-                            }
-                            None => close = true,
-                        });
-                });
-            if let Some(idx) = do_play {
-                self.play_item(idx);
-            }
-            if let Some(item) = do_rm {
-                self.playlist.remove(item);
-                let after = self.build_rows();
-                self.ui.playlist_selected = if after.is_empty() {
-                    None
-                } else {
-                    Some(ri.min(after.len() - 1))
-                };
-            }
-            if let Some(a) = do_toggle {
-                self.toggle_collapse(&a);
-            }
-            if do_expand_all {
-                self.collapsed.clear();
-            }
-            if close {
-                self.playlist_menu = None;
-            }
-            // 只认左键关闭（防右键同帧自杀）。
-            // 左键任意处、或非打开帧的右键 → 关闭（打开帧的右键是开启
-            // 事件本身，必须排除——同帧自杀教训）
-            if !close {
-                let pri = ctx.input(|inp| inp.pointer.button_clicked(egui::PointerButton::Primary));
-                let sec =
-                    ctx.input(|inp| inp.pointer.button_clicked(egui::PointerButton::Secondary));
-                if pri || (sec && opened_tick != self.frame_tick) {
-                    self.playlist_menu = None;
-                }
-            }
-        }
-
-        // —— 空白区右键：未命中任何行菜单时弹「加入」菜单（用户诉求：
-        //    不必先选中一行也能右键添加）——
-        if self.blank_menu.is_none()
-            && self.browser_menu.is_none()
-            && self.playlist_menu.is_none()
-            && !self.menu_open_at_frame_start
-            && ctx.input(|i| i.pointer.secondary_clicked())
-        {
+        // —— 统一右键菜单：区域触发（空白区/状态栏；行/叶触发在各面板内），
+        //    渲染与生命周期在 context_menu 只此一份（2026-10-15 右键菜单统一重写）——
+        if ctx.input(|i| i.pointer.secondary_clicked()) {
             if let Some(hp) = ctx.input(|i| i.pointer.hover_pos()) {
-                if self.browser_rect.contains(hp) {
-                    self.blank_menu = Some((false, hp, self.frame_tick));
-                } else if self.playlist_rect.contains(hp) {
-                    self.blank_menu = Some((true, hp, self.frame_tick));
-                }
+                self.trigger_zone_ctx(ctx, hp);
             }
         }
-        if let Some((is_pl, pos, opened_tick)) = self.blank_menu {
-            let (l_files, l_dir, l_clear) = (
-                self.i18n.t("menu.open_files").into_owned(),
-                self.i18n.t("menu.add_dir").into_owned(),
-                self.i18n.t("menu.clear_playlist").into_owned(),
-            );
-            let mut close = false;
-            let mut act: Option<u8> = None;
-            egui::Area::new(egui::Id::new("blank_rmb"))
-                .fixed_pos(pos)
-                .order(egui::Order::Foreground)
-                .show(ctx, |ui| {
-                    egui::Frame::new()
-                        .fill(pal.panel_bg)
-                        .stroke(egui::Stroke::new(1.0_f32, pal.border))
-                        .corner_radius(egui::CornerRadius::same(0))
-                        .inner_margin(egui::Margin::same(2))
-                        .shadow(egui::epaint::Shadow::NONE)
-                        .show(ui, |ui| {
-                            ui.spacing_mut().button_padding = egui::Vec2::new(6.0, 2.0);
-                            ui.set_min_width(170.0);
-                            if ui.button(&l_files).clicked() {
-                                act = Some(0);
-                                close = true;
-                            }
-                            if ui.button(&l_dir).clicked() {
-                                act = Some(1);
-                                close = true;
-                            }
-                            if is_pl {
-                                ui.separator();
-                                if ui.button(&l_clear).clicked() {
-                                    act = Some(2);
-                                    close = true;
-                                }
-                            }
-                        });
-                });
-            match act {
-                Some(0) => {
-                    if let Some(paths) = rfd::FileDialog::new().pick_files() {
-                        for pp in paths {
-                            self.enqueue_scan(pp);
-                        }
-                    }
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
-                Some(1) => {
-                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                        self.enqueue_scan(dir);
-                    }
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
-                Some(2) => {
-                    self.playlist.clear();
-                    self.collapsed.clear();
-                    self.ui.playlist_selected = None;
-                }
-                _ => {}
-            }
-            if close {
-                self.blank_menu = None;
-            }
-            // 只认左键关闭（防右键同帧自杀）。
-            // 左键任意处、或非打开帧的右键 → 关闭（打开帧的右键是开启
-            // 事件本身，必须排除——同帧自杀教训）
-            if !close {
-                let pri = ctx.input(|inp| inp.pointer.button_clicked(egui::PointerButton::Primary));
-                let sec =
-                    ctx.input(|inp| inp.pointer.button_clicked(egui::PointerButton::Secondary));
-                if pri || (sec && opened_tick != self.frame_tick) {
-                    self.blank_menu = None;
-                }
-            }
-        }
-
-        // —— 状态栏右键：模块加装菜单 ——
-        if self.mod_menu.is_none()
-            && !self.menu_open_at_frame_start
-            && ctx.input(|i| i.pointer.secondary_clicked())
-            && ctx
-                .input(|i| i.pointer.hover_pos())
-                .is_some_and(|pp| self.status_rect.contains(pp))
-        {
-            self.mod_menu = ctx
-                .input(|i| i.pointer.hover_pos())
-                .map(|pp| (pp, self.frame_tick));
-        }
-        if let Some((pos, opened_tick)) = self.mod_menu {
-            let entries = self.mod_entries();
-            let mut close = false;
-            let mut toggle: Option<String> = None;
-            egui::Area::new(egui::Id::new("mod_rmb"))
-                .fixed_pos(pos)
-                .order(egui::Order::Foreground)
-                .show(ctx, |ui| {
-                    egui::Frame::new()
-                        .fill(pal.panel_bg)
-                        .stroke(egui::Stroke::new(1.0_f32, pal.border))
-                        .corner_radius(egui::CornerRadius::same(0))
-                        .inner_margin(egui::Margin::same(2))
-                        .shadow(egui::epaint::Shadow::NONE)
-                        .show(ui, |ui| {
-                            ui.spacing_mut().button_padding = egui::Vec2::new(6.0, 2.0);
-                            ui.set_min_width(170.0);
-                            for (key, label) in &entries {
-                                let on = self.mod_on(key);
-                                let text =
-                                    format!("{} {}", if on { "\u{221a}" } else { " " }, label);
-                                if ui.button(text).clicked() {
-                                    toggle = Some((*key).to_string());
-                                    close = true;
-                                }
-                            }
-                        });
-                });
-            if let Some(key) = toggle {
-                self.toggle_mod(&key);
-            }
-            if close {
-                self.mod_menu = None;
-            }
-            // 左键任意处、或非打开帧的右键 → 关闭
-            if !close {
-                let pri = ctx.input(|inp| inp.pointer.button_clicked(egui::PointerButton::Primary));
-                let sec =
-                    ctx.input(|inp| inp.pointer.button_clicked(egui::PointerButton::Secondary));
-                if pri || (sec && opened_tick != self.frame_tick) {
-                    self.mod_menu = None;
-                }
-            }
-        }
+        self.render_ctx_menu(ctx);
 
         // —— 命令输入条（':' 进入 · Esc 取消 · Enter 执行；浮在状态栏上方）——
         if self.ui.mode == UiMode::Command {
@@ -6087,132 +5551,81 @@ impl MaxAppV2 {
             }
         }
 
-        // —— dock 叶子右键菜单（f2k 同款操作 + 钻取分页：根页四项，
-        //     拆分/更换进子页选模块。全部久经考验原语（Area + button +
-        //     ScrollArea）——模块再多子页也只是滚动列表，弹层永不超屏）——
-        if let Some((target, pos, opened_tick)) = self.dock_leaf_menu {
-            let present =
-                |mm: dock::ModuleId| self.config.dock.as_ref().is_some_and(|d| d.contains(mm));
-            let names: Vec<(dock::ModuleId, String)> = dock::ModuleId::ALL
-                .into_iter()
-                .filter(|&mm| mm != target && !present(mm))
-                .map(|mm| (mm, self.i18n.t(mm.label_key()).into_owned()))
-                .collect();
-            let (l_close, l_sh, l_sv, l_ch, l_back) = (
-                self.i18n.t("menu.dock_close").into_owned(),
-                self.i18n.t("menu.dock_split_h").into_owned(),
-                self.i18n.t("menu.dock_split_v").into_owned(),
-                self.i18n.t("menu.dock_change").into_owned(),
-                self.i18n.t("menu.dock_back").into_owned(),
-            );
-            let mut close = false;
-            let mut nav: Option<u8> = None;
-            let mut act: Option<LeafAct> = None;
-            egui::Area::new(egui::Id::new("dock_leaf_rmb"))
-                .fixed_pos(pos)
-                .order(egui::Order::Foreground)
+        // —— 属性弹窗（播放列表右键 → 查看属性；Esc / 按钮关闭）——
+        if self.properties_visible {
+            let pal = self.palette.clone();
+            let t_title = self.i18n.t("popup.properties").into_owned();
+            let (md, path) = self.properties_data();
+            let mut open_flag = self.properties_visible;
+            egui::Window::new(format!("  {}  ", t_title))
+                .open(&mut open_flag)
+                .collapsible(false)
+                .resizable(false)
+                .min_width(420.0)
+                .default_width(460.0)
                 .show(ctx, |ui| {
-                    egui::Frame::new()
-                        .fill(pal.panel_bg)
-                        .stroke(egui::Stroke::new(1.0_f32, pal.border))
-                        .corner_radius(egui::CornerRadius::same(0))
-                        .inner_margin(egui::Margin::same(2))
-                        .shadow(egui::epaint::Shadow::NONE)
-                        .show(ui, |ui| {
-                            ui.spacing_mut().button_padding = egui::Vec2::new(6.0, 2.0);
-                            ui.set_min_width(180.0);
-                            match self.leaf_page {
-                                pg @ (1 | 2) => {
-                                    let sbs = pg == 1;
-                                    let head = if sbs { &l_sh } else { &l_sv };
-                                    if ui.button(format!("\u{2039} {l_back}")).clicked() {
-                                        nav = Some(0);
+                    ui.add_space(4.0);
+
+                    let dim = pal.fg_weak;
+                    match (&md, &path) {
+                        (None, _) => {
+                            ui.label(egui::RichText::new(self.i18n.t("msg.empty")).color(dim));
+                        }
+                        (Some(m), p) => {
+                            egui::Grid::new("props")
+                                .num_columns(2)
+                                .spacing([12.0, 4.0])
+                                .show(ui, |ui| {
+                                    let lbl = |ui: &mut egui::Ui, k: &str| {
+                                        ui.label(
+                                            egui::RichText::new(format!("{}:", k))
+                                                .color(dim)
+                                                .weak(),
+                                        );
+                                    };
+                                    lbl(ui, &self.i18n.t("metadata.unknown_title"));
+                                    ui.label(
+                                        egui::RichText::new(m.title.clone().unwrap_or_default())
+                                            .strong(),
+                                    );
+                                    ui.end_row();
+                                    lbl(ui, &self.i18n.t("metadata.artist_label"));
+                                    ui.label(m.artist.clone().unwrap_or_default());
+                                    ui.end_row();
+                                    lbl(ui, &self.i18n.t("metadata.album_label"));
+                                    ui.label(m.album.clone().unwrap_or_default());
+                                    ui.end_row();
+                                    lbl(ui, &self.i18n.t("prop.codec"));
+                                    ui.label(format!(
+                                        "{} · {} · {} · {}",
+                                        m.codec.clone().unwrap_or_default(),
+                                        m.bitrate_label(),
+                                        m.sample_rate_label(),
+                                        m.bits_label(),
+                                    ));
+                                    ui.end_row();
+                                    lbl(ui, &self.i18n.t("prop.duration"));
+                                    ui.label(
+                                        m.duration
+                                            .map(|d| format!("{:.1}s", d))
+                                            .unwrap_or_default(),
+                                    );
+                                    ui.end_row();
+                                    if let Some(p) = p {
+                                        lbl(ui, &self.i18n.t("prop.path"));
+                                        ui.label(
+                                            egui::RichText::new(p.display().to_string())
+                                                .small()
+                                                .color(dim),
+                                        );
+                                        ui.end_row();
                                     }
-                                    ui.colored_label(pal.fg_weak, head);
-                                    egui::ScrollArea::vertical()
-                                        .max_height(340.0)
-                                        .auto_shrink([false, false])
-                                        .show(ui, |ui| {
-                                            for (mm, nm) in &names {
-                                                if ui.button(nm).clicked() {
-                                                    act = Some(LeafAct::Split(target, *mm, sbs));
-                                                    close = true;
-                                                }
-                                            }
-                                        });
-                                }
-                                3 => {
-                                    if ui.button(format!("\u{2039} {l_back}")).clicked() {
-                                        nav = Some(0);
-                                    }
-                                    ui.colored_label(pal.fg_weak, &l_ch);
-                                    egui::ScrollArea::vertical()
-                                        .max_height(340.0)
-                                        .auto_shrink([false, false])
-                                        .show(ui, |ui| {
-                                            for (mm, nm) in &names {
-                                                if ui.button(nm).clicked() {
-                                                    act = Some(LeafAct::Replace(target, *mm));
-                                                    close = true;
-                                                }
-                                            }
-                                        });
-                                }
-                                _ => {
-                                    if ui.button(&l_close).clicked() {
-                                        act = Some(LeafAct::Close(target));
-                                        close = true;
-                                    }
-                                    ui.separator();
-                                    if ui.button(&l_sh).clicked() {
-                                        nav = Some(1);
-                                    }
-                                    if ui.button(&l_sv).clicked() {
-                                        nav = Some(2);
-                                    }
-                                    if ui.button(&l_ch).clicked() {
-                                        nav = Some(3);
-                                    }
-                                }
-                            }
-                        });
+                                });
+                        }
+                    }
+                    ui.add_space(6.0);
                 });
-            if let Some(pg) = nav {
-                self.leaf_page = pg;
-            }
-            match act {
-                Some(LeafAct::Close(m)) => {
-                    if let Some(tree) = self.config.dock.take() {
-                        self.config.dock = tree.prune(m);
-                    }
-                }
-                Some(LeafAct::Split(t, new, sbs)) => {
-                    if let Some(tree) = self.config.dock.as_mut() {
-                        tree.split_insert(t, new, sbs);
-                    }
-                }
-                Some(LeafAct::Replace(t, new)) => {
-                    if let Some(tree) = self.config.dock.as_mut() {
-                        tree.replace_leaf(t, new);
-                    }
-                }
-                None => {}
-            }
-            if close {
-                self.dock_leaf_menu = None;
-                self.leaf_page = 0;
-            }
-            // 页面跳转帧不判关（点击在弹层内部）；左键任意处、或非打开帧
-            // 的右键 → 关闭（同帧自杀教训）
-            if !close && nav.is_none() {
-                let pri = ctx.input(|inp| inp.pointer.button_clicked(egui::PointerButton::Primary));
-                let sec =
-                    ctx.input(|inp| inp.pointer.button_clicked(egui::PointerButton::Secondary));
-                if pri || (sec && opened_tick != self.frame_tick) {
-                    self.dock_leaf_menu = None;
-                    self.leaf_page = 0;
-                }
-            }
+            self.properties_visible = open_flag;
         }
 
         // —— 关于弹窗（fx draw_about 同款：字标 + 品牌 + 运行态自检 +
@@ -6304,7 +5717,31 @@ impl MaxAppV2 {
                 });
             self.ui.about_visible = open && !close_req;
         }
+
+        // —— 菜单弹窗：书签 / 插件管理 / 快捷键一览（实现见 menu.rs）——
+        self.render_bookmarks_window(ctx);
+        self.render_plugins_window(ctx);
+        self.render_shortcuts_window(ctx);
     }
+}
+
+/// 扁平菜单项：透明底、悬停高亮；toggled 时前缀 ☑ / ☐。
+/// 返回 Response——clicked() 判定选中；toggled 传 Some 时自动翻转。
+fn flat_menu_item(ui: &mut egui::Ui, label: &str, toggled: &mut bool) -> egui::Response {
+    let check = if *toggled { "☑ " } else { "☐ " };
+    let text = format!("{check}{label}");
+    let btn = egui::Button::new(egui::RichText::new(text).color(if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(220, 224, 232)
+    } else {
+        egui::Color32::BLACK
+    }))
+    .fill(egui::Color32::TRANSPARENT)
+    .stroke(egui::Stroke::NONE);
+    let resp = ui.add(btn);
+    if resp.clicked() {
+        *toggled = !*toggled;
+    }
+    resp
 }
 
 impl eframe::App for MaxAppV2 {
@@ -6319,17 +5756,21 @@ impl eframe::App for MaxAppV2 {
         // 面板矩形每帧重置（空白区右键命中判定用）
         self.browser_rect = egui::Rect::NOTHING;
         self.playlist_rect = egui::Rect::NOTHING;
-        // 帧首菜单快照：本帧已有菜单开启时，任何右键只做关闭、
-        // 不新开（否则旧菜单关闭的同帧新菜单弹出 = 「没消失」观感）
-        self.menu_open_at_frame_start = self.browser_menu.is_some()
-            || self.playlist_menu.is_some()
-            || self.blank_menu.is_some()
-            || self.mod_menu.is_some()
-            || self.dock_leaf_menu.is_some();
-        // 目录变化 → 行索引失效 → 清行菜单（防「进入子目录后旧菜单还在」）
+        // 帧首菜单快照：本帧已有右键菜单开启时，区域右键只做关闭、
+        // 不新开（否则旧菜单关闭的同帧新菜单弹出 = 「没消失」观感）；
+        // 顶栏下拉/弹层帧首开着 → 本帧右键不弹（顶栏/右键互斥）
+        self.menu_open_at_frame_start = self.ctx_menu.is_some();
+        self.top_popup_at_frame_start = egui::Popup::is_any_open(ctx);
+        // 目录变化 → 行索引失效 → 清浏览器行菜单（防「进入子目录后旧菜单还在」）
         if self.browser.cwd() != self.last_cwd.as_path() {
             self.last_cwd = self.browser.cwd().to_path_buf();
-            self.browser_menu = None;
+            if self
+                .ctx_menu
+                .as_ref()
+                .is_some_and(|m| m.kind == context_menu::CtxKind::Browser)
+            {
+                self.ctx_menu = None;
+            }
         }
         self.status_rect = egui::Rect::NOTHING;
         // 主题 + TUI 紧凑风格（每帧下发，皮肤切换即时生效）
@@ -6341,67 +5782,29 @@ impl eframe::App for MaxAppV2 {
             self.fonts_dirty = false;
         }
         let mut style = (*ctx.style()).clone();
-        if self.config.modern {
-            // 现代模式：圆角 + 宽松间距 + 比例字体 + 可见按钮底色
-            let r = egui::CornerRadius::same(6);
-            style.visuals.window_corner_radius = r;
-            style.visuals.menu_corner_radius = r;
-            style.visuals.popup_shadow = egui::Shadow {
-                offset: [0, 3],
-                blur: 6,
-                spread: 0,
-                color: Color32::from_black_alpha(60),
-            };
-            style.visuals.window_shadow = egui::Shadow {
-                offset: [0, 4],
-                blur: 10,
-                spread: 0,
-                color: Color32::from_black_alpha(70),
-            };
-            for w in [
-                &mut style.visuals.widgets.noninteractive,
-                &mut style.visuals.widgets.inactive,
-                &mut style.visuals.widgets.hovered,
-                &mut style.visuals.widgets.active,
-                &mut style.visuals.widgets.open,
-            ] {
-                w.corner_radius = egui::CornerRadius::same(CTRL_R_MODERN);
-            }
-            style.spacing.item_spacing = Vec2::new(8.0, 6.0);
-            style.spacing.button_padding = Vec2::new(10.0, 4.0);
-            style.spacing.menu_margin = egui::Margin::same(6);
-            style.spacing.window_margin = egui::Margin::same(10);
-            style.spacing.interact_size = Vec2::new(18.0, 20.0);
-            style.visuals.widgets.inactive.bg_fill = self.palette.sel_bg.linear_multiply(0.5);
-            style.visuals.widgets.inactive.bg_stroke = Stroke::NONE;
-            style.visuals.widgets.hovered.bg_fill = self.palette.sel_bg;
-            style.visuals.widgets.active.bg_fill = self.palette.accent.linear_multiply(0.7);
-            style.override_font_id = Some(FontId::proportional(FONT));
-        } else {
-            style.visuals.window_corner_radius = egui::CornerRadius::same(0);
-            style.visuals.menu_corner_radius = egui::CornerRadius::same(0);
-            style.visuals.popup_shadow = egui::Shadow::NONE;
-            style.visuals.window_shadow = egui::Shadow::NONE;
-            for w in [
-                &mut style.visuals.widgets.noninteractive,
-                &mut style.visuals.widgets.inactive,
-                &mut style.visuals.widgets.hovered,
-                &mut style.visuals.widgets.active,
-                &mut style.visuals.widgets.open,
-            ] {
-                w.corner_radius = egui::CornerRadius::same(0);
-            }
-            style.spacing.item_spacing = Vec2::new(4.0, 2.0);
-            style.spacing.button_padding = Vec2::new(4.0, 1.0);
-            style.spacing.menu_margin = egui::Margin::same(2);
-            style.spacing.window_margin = egui::Margin::same(4);
-            style.spacing.interact_size = Vec2::new(14.0, 16.0);
-            style.visuals.widgets.inactive.bg_fill = Color32::TRANSPARENT;
-            style.visuals.widgets.inactive.bg_stroke = Stroke::NONE;
-            style.visuals.widgets.hovered.bg_fill = self.palette.sel_bg;
-            style.visuals.widgets.active.bg_fill = self.palette.sel_bg;
-            style.override_font_id = Some(mono(FONT));
+        style.visuals.window_corner_radius = egui::CornerRadius::same(0);
+        style.visuals.menu_corner_radius = egui::CornerRadius::same(0);
+        style.visuals.popup_shadow = egui::Shadow::NONE;
+        style.visuals.window_shadow = egui::Shadow::NONE;
+        for w in [
+            &mut style.visuals.widgets.noninteractive,
+            &mut style.visuals.widgets.inactive,
+            &mut style.visuals.widgets.hovered,
+            &mut style.visuals.widgets.active,
+            &mut style.visuals.widgets.open,
+        ] {
+            w.corner_radius = egui::CornerRadius::same(0);
         }
+        style.spacing.item_spacing = Vec2::new(4.0, 2.0);
+        style.spacing.button_padding = Vec2::new(4.0, 1.0);
+        style.spacing.menu_margin = egui::Margin::same(2);
+        style.spacing.window_margin = egui::Margin::same(4);
+        style.spacing.interact_size = Vec2::new(14.0, 16.0);
+        style.visuals.widgets.inactive.bg_fill = Color32::TRANSPARENT;
+        style.visuals.widgets.inactive.bg_stroke = Stroke::NONE;
+        style.visuals.widgets.hovered.bg_fill = self.palette.sel_bg;
+        style.visuals.widgets.active.bg_fill = self.palette.sel_bg;
+        style.override_font_id = Some(mono(FONT));
         ctx.set_style(style);
 
         // 键盘输入
@@ -6548,37 +5951,23 @@ impl eframe::App for MaxAppV2 {
         // 面板渲染顺序 = egui 布局顺序：
         // 顶：菜单栏 → 当前曲目；底：功能键栏（最先声明=最底）→ 状态栏
         self.render_menu_bar(ctx);
-        if self.config.modern {
-            // 现代模式：顶栏自带传输控制；不渲染功能键栏（菜单 + 右键全覆盖）
-            self.render_now_playing_modern(ctx);
-        } else {
-            // 传输工具条（f2k 默认模块；右键/菜单可加装或移除）
-            if self.mod_on("transport") {
-                self.render_transport(ctx);
-            }
-            self.render_now_playing(ctx);
-            self.render_fkey_bar(ctx);
+        // 传输工具条（f2k 默认模块；右键/菜单可加装或移除）
+        if self.mod_on("transport") {
+            self.render_transport(ctx);
         }
+        self.render_now_playing(ctx);
+        self.render_fkey_bar(ctx);
         self.render_status_bar(ctx);
         // 中央工作区：停靠树（模块自由组合，分割条可拖）
         let pal = self.palette.clone();
         let empty_dock = self.i18n.t("dock.empty").into_owned();
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(pal.bg)
-                    .inner_margin(if self.config.modern {
-                        // 现代模式：卡片自带框饰，中央留白对称收紧
-                        egui::Margin::same(4)
-                    } else {
-                        egui::Margin {
-                            left: 3,
-                            right: 3,
-                            top: 12,
-                            bottom: 3,
-                        }
-                    }),
-            )
+            .frame(egui::Frame::new().fill(pal.bg).inner_margin(egui::Margin {
+                left: 3,
+                right: 3,
+                top: 12,
+                bottom: 3,
+            }))
             .show(ctx, |ui| {
                 let rect = ui.max_rect();
                 let dock_pal = self.palette.clone();
@@ -6634,5 +6023,48 @@ impl eframe::App for MaxAppV2 {
             shuffle: false,
         };
         crate::config::save_state(&st);
+    }
+}
+
+#[cfg(test)]
+mod props_tests {
+    use super::*;
+
+    /// 引擎回落：缺失字段补齐、已有字段不覆盖（元数据优先于引擎实测）。
+    /// FFmpeg 长尾曲目属性弹窗全「未知」的修复锚点。
+    #[test]
+    fn overlay_engine_params_fills_missing_keeps_existing() {
+        let md = TrackMetadata {
+            sample_rate: Some(44_100), // 元数据已有的采样率
+            ..Default::default()
+        };
+        let out = md.overlay_engine_params(
+            Some("dsd_lsbf_planar".into()),
+            Some(352_800),
+            Some(2),
+            Some(32),
+            Some(10.0),
+        );
+        // 缺失字段被引擎实测值补齐
+        assert_eq!(out.codec.as_deref(), Some("dsd_lsbf_planar"));
+        assert_eq!(out.channels, Some(2));
+        assert_eq!(out.bits_per_sample, Some(32));
+        assert_eq!(out.duration, Some(10.0));
+        // 已有字段不被覆盖
+        assert_eq!(out.sample_rate, Some(44_100));
+    }
+
+    /// 引擎值全 None 时回落为 no-op（停曲态 / 快照清空后不误填）。
+    #[test]
+    fn overlay_engine_params_noop_when_engine_empty() {
+        let md = TrackMetadata {
+            title: Some("x".into()),
+            ..Default::default()
+        };
+        let out = md.overlay_engine_params(None, None, None, None, None);
+        assert_eq!(out.codec, None);
+        assert_eq!(out.sample_rate, None);
+        assert_eq!(out.duration, None);
+        assert_eq!(out.title.as_deref(), Some("x"));
     }
 }

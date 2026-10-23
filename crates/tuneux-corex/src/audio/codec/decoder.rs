@@ -44,8 +44,9 @@ use super::wavpack::{is_wavpack_path, WavPackBackend};
 pub const KNOWN_AUDIO_EXTS: &[&str] = &[
     // 原生进程内：symphonia / Opus / WavPack
     "mp3", "flac", "wav", "ogg", "m4a", "aac", "alac", "opus", "wv",
-    // ffmpeg 桥接长尾：装了 ffmpeg 才能播
-    "ape", "wma", "flv", "tak", "ofr", "mpc", "shn", "ac3", "dts", "tta", "dsf", "dff",
+    // ffmpeg 桥接长尾：随包附带或系统已装的 ffmpeg 才能播（003 方案口径）
+    "ape", "wma", "flv", "tak", "mpc", "shn", "ac3", "dts", "tta", "dsf", "dff", "mkv", "avi", "ts",
+    "m2ts", "wmv", "mpg", "mpeg", "vob", "mp4", "mov", "rmvb",
 ];
 
 /// 把解码器给出的编码名（字符串）映射为用户可读的编码名称。
@@ -302,8 +303,8 @@ static BACKENDS: &[BackendEntry] = &[
         is_path: is_ffmpeg_path,
         open: open_ffmpeg,
         fallback_on_unsupported: false,
-        probe_sample_rate: None, // ffmpeg 长尾无原生直通
-        probe_params: None,      // ffmpeg 长尾不参与元数据探测
+        probe_sample_rate: Some(super::ffmpeg::probe_sample_rate), // 跟随音源采样率
+        probe_params: None,                                        // ffmpeg 长尾不参与元数据探测
     },
 ];
 
@@ -664,7 +665,10 @@ mod tests {
         );
 
         let ffmpeg = &BACKENDS[5];
-        assert!(ffmpeg.probe_sample_rate.is_none(), "ffmpeg 长尾无原生直通");
+        assert!(
+            ffmpeg.probe_sample_rate.is_some(),
+            "ffmpeg 长尾跟随音源采样率（ffprobe 探测）"
+        );
         assert!(ffmpeg.probe_params.is_none(), "ffmpeg 长尾不参与元数据探测");
         assert!(
             !ffmpeg.fallback_on_unsupported,

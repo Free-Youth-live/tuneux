@@ -8,15 +8,18 @@
 # 每个平台产出两个压缩包：
 # - tuneux-<ver>-<平台>    ：基础版二进制 + 使用手册-tuneux + locales/ 语言表；
 # - tuneux-fx-<ver>-<平台> ：插件版二进制 + 使用手册-tuneux-fx + 插件开发指南 + plugins/ 插件目录 + locales/ 语言表。
-# max 首发收敛四平台（mac 双架构 / win x64 / linux x64，见 003 批 B 口径），产出：
-# - tuneux-max-<ver>-<平台>：mac = 可双击的 tuneux-max.app bundle（zip 封装）；
-#   win = exe（GUI 子系统，双击无控制台窗）；linux = 二进制 + .desktop 模板；
-#   均含 locales/ 语言表与手册/第三方许可。
-# **max 仅随 v0.6+ 标签构建**（版本线裁决 2026-10-08：0.5.x 线为双 TUI 维护版，
-#   max 不随发，产物 6×2 = 12 个；v0.6+ 起为 6×2 + 4 = 16 个）。
+# max 平台面为 mac 双架构 / win x64（Linux 应用包后续支持），产出：
+# - tuneux-max-<ver>-<平台>：mac = 可双击的 tuneux-max.app bundle（zip 封装，
+#   外层版本文件夹内含 .app 与手册同级）；win = exe（GUI 子系统，双击无控制台窗）。
+#   均含 locales/ 语言表、plugins/ 第一方插件、ffmpeg/ 组件、手册与第三方许可
+#   （含内嵌字体的 OFL 文本）。
+# **max 仅随 v0.6+ 标签构建**（版本线口径 2026-10-08：0.5.x 线为双 TUI 维护版，
+#   max 不随发，产物 6×2 = 12 个；v0.6+ 起为 6×2 + 3 = 15 个）。
 #
 # 发布关卡（任一不过整单不发）：checks（格式/静态检查/测试/分层守卫）+
-# deny（依赖四项核查）+ build（六平台编译），release 需三者全部通过。
+# deny（依赖四项核查）+ build-ffmpeg（组件构建）+ build（六平台编译）+
+# build-max（GUI 三平台），release 需全部通过（0.5.x 标签下 build-max 为
+# skipped，同样放行）。
 #
 # —— Linux 构建基线 ——
 # ubuntu-latest（24.04，glibc 2.39）上直接构建的产物要求新版 glibc，
@@ -37,8 +40,9 @@ on:
         description: 版本标签（如 v0.5.0）
         required: true
 
+# 最小权限：全流程只读；仅 release job 单独提写（创建发布/上传产物）
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -78,7 +82,92 @@ jobs:
       - name: 依赖核查（advisories / bans / licenses / sources）
         run: cargo deny --workspace check
 
+  build-ffmpeg:
+    name: FFmpeg 组件（${{ matrix.name }}）
+    # LGPL 纯度构建：规格钉在 tools/ffmpeg-pin.toml；tarball 缓存按哈希键
+    # （每版本只下载一次）；产物 ffmpeg/ 目录（bin + licenses + VERSIONS.txt）
+    # 供三个产品的打包步骤并入。windows-arm64 暂不构建（查找链回退系统
+    # PATH，包内无 ffmpeg 属预期行为）。
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: ubuntu-latest
+            name: linux-arm64
+            cc: "zig cc -target aarch64-linux-musl"
+            cross: "--arch=aarch64 --target-os=linux --enable-cross-compile"
+            strip: "true"
+          - os: macos-14
+            name: macos-arm64
+          - os: macos-14
+            name: macos-x86_64
+            cross: "--arch=x86_64 --target-os=darwin --enable-cross-compile"
+          - os: windows-latest
+            name: windows-x86_64
+    env:
+      FFMPEG_CC: ${{ matrix.cc }}
+      FFMPEG_CROSS_OPTS: ${{ matrix.cross }}
+      FFMPEG_STRIP: ${{ matrix.strip }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 zig（linux-arm64 交叉用）
+        if: matrix.name == 'linux-arm64'
+        run: pip install ziglang
+
+      - name: 安装 msys2 工具链（windows）
+        if: matrix.os == 'windows-latest'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: mingw64
+          install: make mingw-w64-x86_64-toolchain
+
+      - name: 源码包缓存（按钉死哈希键）
+        id: srccache
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-src.tar.xz
+          key: ffmpeg-src-${{ hashFiles('tools/ffmpeg-pin.toml') }}
+
+      - name: 构建（msys2）
+        if: matrix.os == 'windows-latest'
+        shell: msys2 {0}
+        run: |
+          EXTRA=()
+          [ -f ffmpeg-src.tar.xz ] && EXTRA=(--tarball "$PWD/ffmpeg-src.tar.xz")
+          bash tools/build-ffmpeg.sh "${EXTRA[@]}" --out "$PWD/ffmpeg-out"
+
+      - name: 构建（linux / macOS）
+        if: matrix.os != 'windows-latest'
+        run: |
+          bash tools/build-ffmpeg.sh --out "$PWD/ffmpeg-out"
+
+      - name: 归位源码包缓存
+        shell: bash
+        run: |
+          SRC=$(ls ffmpeg-out/ffmpeg-*.tar.xz 2>/dev/null | head -1 || true)
+          [ -n "$SRC" ] && cp "$SRC" ffmpeg-src.tar.xz || true
+
+      - name: 上传组件
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-${{ matrix.name }}
+          path: ffmpeg-out/ffmpeg/
+
+      - name: 上传源码包（仅一处，发布附件用）
+        if: matrix.name == 'linux-x86_64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-src
+          path: ffmpeg-src.tar.xz
+          if-no-files-found: error
+
   build:
+    needs: build-ffmpeg
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -125,16 +214,22 @@ jobs:
       - name: 安装 Linux x86_64 工具链（zig + zigbuild + buster ALSA sysroot）
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
-          set -eux
-          curl -sL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | tar -xJ -C "$HOME"
+          set -euxo pipefail
+          # 供应链钉死：HTTPS + sha256 校验不符即失败（zig 哈希取自官方下载
+          # 索引 index.json；deb 哈希为经 HTTPS 取得时实测登记，换版须同步改）
+          curl -fsSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz -o /tmp/zig.tar.xz
+          echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  /tmp/zig.tar.xz" | sha256sum -c -
+          tar -xJf /tmp/zig.tar.xz -C "$HOME"
           echo "$HOME/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
-          cargo install cargo-zigbuild --locked
+          cargo install cargo-zigbuild --locked --version 0.23.4
           # runner（24.04）系统 libasound 按 glibc 2.34/2.38 构建，钉 2.17
           # 基线时版本化符号解析不了（CI 实测 undefined reference …GLIBC_2.34）；
           # 与 arm64 同源改用 buster 1.1.8 amd64 包构建 sysroot。
           mkdir -p sysroot/run sysroot/dev
-          curl -sL --retry 3 -o run.deb http://archive.debian.org/debian/pool/main/a/alsa-lib/libasound2_1.1.8-1_amd64.deb
-          curl -sL --retry 3 -o dev.deb http://archive.debian.org/debian/pool/main/a/alsa-lib/libasound2-dev_1.1.8-1_amd64.deb
+          curl -fsSL --retry 3 -o run.deb https://archive.debian.org/debian/pool/main/a/alsa-lib/libasound2_1.1.8-1_amd64.deb
+          echo "6cc281b4a6d1faffe4fc6d83ec71365c1af0ee6d7806fa122fef00f85a0dde62  run.deb" | sha256sum -c -
+          curl -fsSL --retry 3 -o dev.deb https://archive.debian.org/debian/pool/main/a/alsa-lib/libasound2-dev_1.1.8-1_amd64.deb
+          echo "efcae0522800ac0f32a72d7ac240375effde06473bb5aeabbe20d2d4057c185e  dev.deb" | sha256sum -c -
           (cd sysroot/run && ar x ../../run.deb && tar xf data.tar.xz)
           (cd sysroot/dev && ar x ../../dev.deb && tar xf data.tar.xz)
           # dev 包的 libasound.so 是指向运行包的悬空符号链接，补齐目标文件
@@ -148,13 +243,18 @@ jobs:
       - name: 安装 Linux arm64 工具链（zig + zigbuild + buster ALSA sysroot）
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
-          set -eux
-          curl -sL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | tar -xJ -C "$HOME"
+          set -euxo pipefail
+          # 供应链钉死：HTTPS + sha256 校验不符即失败（哈希来源同 x86_64 步注）
+          curl -fsSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz -o /tmp/zig.tar.xz
+          echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  /tmp/zig.tar.xz" | sha256sum -c -
+          tar -xJf /tmp/zig.tar.xz -C "$HOME"
           echo "$HOME/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
-          cargo install cargo-zigbuild --locked
+          cargo install cargo-zigbuild --locked --version 0.23.4
           mkdir -p sysroot/run sysroot/dev
-          curl -sL --retry 3 -o run.deb http://archive.debian.org/debian/pool/main/a/alsa-lib/libasound2_1.1.8-1_arm64.deb
-          curl -sL --retry 3 -o dev.deb http://archive.debian.org/debian/pool/main/a/alsa-lib/libasound2-dev_1.1.8-1_arm64.deb
+          curl -fsSL --retry 3 -o run.deb https://archive.debian.org/debian/pool/main/a/alsa-lib/libasound2_1.1.8-1_arm64.deb
+          echo "af663d07d10b085f590c539772dbf70b279df187210ea818446dfd896487adee  run.deb" | sha256sum -c -
+          curl -fsSL --retry 3 -o dev.deb https://archive.debian.org/debian/pool/main/a/alsa-lib/libasound2-dev_1.1.8-1_arm64.deb
+          echo "617ed035bd7caaab64c7f68e5b673bd60160eb536b9e7ca3c748cc9c46949ffe  dev.deb" | sha256sum -c -
           (cd sysroot/run && ar x ../../run.deb && tar xf data.tar.xz)
           (cd sysroot/dev && ar x ../../dev.deb && tar xf data.tar.xz)
           # dev 包的 libasound.so 是指向运行包的悬空符号链接，补齐目标文件
@@ -172,6 +272,18 @@ jobs:
       - name: 编译
         if: matrix.os != 'ubuntu-latest'
         run: cargo build --release --locked --target ${{ matrix.target }} -p tuneux -p tuneux-fx
+
+      - name: 下载 FFmpeg 组件
+        # windows-arm64 无对应组件（build-ffmpeg 矩阵不含该腿，属预期：该平台
+        # 回退系统 PATH 的 ffmpeg，CHANGELOG 已声明）。用显式 if 跳过整个下载步，
+        # 不依赖 action 对 if-no-files-found 的处理语义（该参数为 upload 口径），
+        # 使正确性与第三方 action 的实现解耦。
+        if: matrix.name != 'windows-arm64'
+        uses: actions/download-artifact@v4
+        with:
+          name: ffmpeg-${{ matrix.name }}
+          path: ffmpeg-dist
+          if-no-files-found: warn
 
       - name: 打包（Linux / macOS）
         if: matrix.ext == 'tar.gz'
@@ -191,6 +303,8 @@ jobs:
           cp -R locales pkg/tuneux/locales
           # 手册标题行注入版本号：__VERSION__ → 实际版本（来自 tag）
           sed -i.bak "s/__VERSION__/${VER}/" "pkg/tuneux/使用手册-tuneux.txt" && rm -f "pkg/tuneux/使用手册-tuneux.txt.bak"
+          # FFmpeg 组件（主程序同目录 ffmpeg/；无组件平台跳过）
+          if [ -d ffmpeg-dist/ffmpeg ]; then cp -R ffmpeg-dist/ffmpeg pkg/tuneux/ffmpeg; fi
           tar -czf "tuneux-${VER}-${{ matrix.name }}.tar.gz" -C pkg/tuneux .
 
           # 插件版：二进制 + 使用手册 + 插件开发指南 + plugins/ 插件目录
@@ -203,6 +317,7 @@ jobs:
           cp -R plugins pkg/tuneux-fx/plugins
           # 官方英文语言表（菜单「设置 → 语言」切换，即时生效）
           cp -R locales pkg/tuneux-fx/locales
+          if [ -d ffmpeg-dist/ffmpeg ]; then cp -R ffmpeg-dist/ffmpeg pkg/tuneux-fx/ffmpeg; fi
           tar -czf "tuneux-fx-${VER}-${{ matrix.name }}.tar.gz" -C pkg/tuneux-fx .
 
       - name: 打包（Windows）
@@ -222,6 +337,7 @@ jobs:
           Copy-Item -Recurse locales pkg/tuneux/locales
           $m = Get-Content "pkg/tuneux/使用手册-tuneux.txt" -Raw
           Set-Content "pkg/tuneux/使用手册-tuneux.txt" -Value ($m -replace '__VERSION__', $ver) -NoNewline -Encoding UTF8
+          if (Test-Path ffmpeg-dist/ffmpeg) { Copy-Item -Recurse ffmpeg-dist/ffmpeg pkg/tuneux/ffmpeg }
           Compress-Archive -Path pkg/tuneux/* -DestinationPath "tuneux-$ver-${{ matrix.name }}.zip"
 
           # 插件版：二进制 + 使用手册 + 插件开发指南 + plugins/ 插件目录
@@ -235,6 +351,7 @@ jobs:
           Copy-Item -Recurse plugins pkg/tuneux-fx/plugins
           # 官方英文语言表（菜单「设置 → 语言」切换，即时生效）
           Copy-Item -Recurse locales pkg/tuneux-fx/locales
+          if (Test-Path ffmpeg-dist/ffmpeg) { Copy-Item -Recurse ffmpeg-dist/ffmpeg pkg/tuneux-fx/ffmpeg }
           Compress-Archive -Path pkg/tuneux-fx/* -DestinationPath "tuneux-fx-$ver-${{ matrix.name }}.zip"
 
       - name: 上传产物
@@ -249,11 +366,17 @@ jobs:
           if-no-files-found: error
 
   build-max:
-    # tuneux-max 首发收敛四平台（003 批 B 口径）：mac 双架构 / win x64 /
-    # linux x64。ARM64 与老驱动上的 wgpu/Vulkan 兼容待真机验证后再开。
-    # linux 用 ubuntu 原生构建（winit/x11 交叉编译是深坑，不赌）；
+    needs: build-ffmpeg
+    # tuneux-max 平台面（2026-10-23 收窄）：mac 双架构 / win x64 共 3 包。
+    # ARM64 与老驱动上的 wgpu/Vulkan 兼容待真机验证后再开。
     # mac x86_64 在 ARM runner 上交叉（wgpu/metal 纯 Rust 绑定）。
-    # 0.5.x 线不随发（2026-10-08 版本线裁决）：仅 v0.6+ 标签构建；
+    # Linux 应用包后续支持：桌面集成打包（tools/package-linux-app.sh）尚未接线，
+    # 且原手写打包段存在缺陷（步骤顺序抢跑 ffmpeg 下载、.desktop 占位符未注入、
+    # 缺 plugins 与字体 OFL 文本、安装器不装 locales/ffmpeg 导致静默丢功能）。
+    # 恢复时：在下方 matrix 加回 linux-x86_64（os: ubuntu-latest /
+    # target: x86_64-unknown-linux-gnu / ext: tar.gz，ubuntu 原生构建——
+    # winit/x11 交叉编译是深坑，不赌），并接线该脚本。
+    # 0.5.x 线不随发（2026-10-08 版本线口径）：仅 v0.6+ 标签构建；
     # 手动触发按输入 tag 同样判定。
     if: ${{ !startsWith(github.ref, 'refs/tags/v0.5.') && !startsWith(github.event.inputs.tag, 'v0.5.') }}
     name: max-${{ matrix.name }}
@@ -262,10 +385,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            name: linux-x86_64
-            ext: tar.gz
           - os: macos-14
             target: aarch64-apple-darwin
             name: macos-arm64
@@ -292,22 +411,17 @@ jobs:
       - name: 编译
         run: cargo build --release --locked --target ${{ matrix.target }} -p tuneux-max
 
-      - name: 打包（Linux：二进制 + desktop 模板）
-        if: matrix.os == 'ubuntu-latest'
-        shell: bash
-        run: |
-          VER="${TAG#v}"
-          VER="${VER%%-*}"
-          BIN="target/${{ matrix.target }}/release"
-          mkdir -p pkg/tuneux-max
-          cp "$BIN/tuneux-max" pkg/tuneux-max/
-          cp 使用手册-tuneux-max.txt pkg/tuneux-max/
-          sed -i "s/__VERSION__/${VER}/" "pkg/tuneux-max/使用手册-tuneux-max.txt"
-          cp THIRD-PARTY-LICENSES.txt pkg/tuneux-max/
-          cp -R locales pkg/tuneux-max/locales
-          # 桌面集成模板：用户改 Exec 为实际路径后放 ~/.local/share/applications/
-          cp tools/tuneux-max.desktop pkg/tuneux-max/
-          tar -czf "tuneux-max-${VER}-${{ matrix.name }}.tar.gz" -C pkg/tuneux-max .
+      # Linux 打包段已移除（平台面收窄）：原手写段存在步骤顺序抢跑 ffmpeg
+      # 下载、.desktop 占位符未注入、缺 plugins 与字体 OFL 文本等缺陷，且始终
+      # 未接线 tools/package-linux-app.sh。恢复 Linux 应用包时按该脚本的
+      # prefix 布局重写（数据目录须与二进制同层，理由见该脚本头部说明）。
+
+      - name: 下载 FFmpeg 组件
+        uses: actions/download-artifact@v4
+        with:
+          name: ffmpeg-${{ matrix.name }}
+          path: ffmpeg-dist
+          if-no-files-found: error
 
       - name: 打包（macOS .app bundle，双击启动）
         if: matrix.os == 'macos-14'
@@ -316,9 +430,17 @@ jobs:
           VER="${TAG#v}"
           VER="${VER%%-*}"
           BIN="target/${{ matrix.target }}/release/tuneux-max"
-          bash tools/package-macos-app.sh "$BIN" "$VER" pkg
-          sed -i '' "s/__VERSION__/${VER}/" "pkg/tuneux-max.app/Contents/Resources/使用手册-tuneux-max.txt"
-          ditto -c -k --keepParent "pkg/tuneux-max.app" "tuneux-max-${VER}-${{ matrix.name }}.zip"
+          [ -d ffmpeg-dist/ffmpeg ] || { echo "❌ 缺少 ffmpeg 组件，发布链不允许无组件打包"; exit 1; }
+          # 脚本产出 pkg/tuneux-max.app + 同级使用手册（版本号已在脚本内注入，
+          # 两份同源同版：同级开箱可见，Resources 一份随 .app 单独流转）
+          bash tools/package-macos-app.sh "$BIN" "$VER" pkg "$PWD/ffmpeg-dist/ffmpeg"
+          # zip 外层包一层版本文件夹：.app 与使用手册同级（ditto 不支持
+          # 多源归档，用 staging 文件夹实现；解压即「文件夹内 app+手册」）
+          STAGE="pkg/stage/tuneux-max-${VER}-${{ matrix.name }}"
+          mkdir -p "$STAGE"
+          cp -R "pkg/tuneux-max.app" "$STAGE/"
+          cp "pkg/使用手册-tuneux-max.txt" "$STAGE/"
+          ditto -c -k --keepParent "$STAGE" "tuneux-max-${VER}-${{ matrix.name }}.zip"
 
       - name: 打包（Windows）
         if: matrix.ext == 'zip'
@@ -332,7 +454,18 @@ jobs:
           $m = Get-Content "pkg/tuneux-max/使用手册-tuneux-max.txt" -Raw
           Set-Content "pkg/tuneux-max/使用手册-tuneux-max.txt" -Value ($m -replace '__VERSION__', $ver) -NoNewline -Encoding UTF8
           Copy-Item THIRD-PARTY-LICENSES.txt pkg/tuneux-max/
+          # 内嵌字体 OFL 文本保留义务（Sarasa Mono SC 嵌入二进制）
+          Copy-Item crates/tuneux-max/assets/LICENSE-SarasaMonoSC-OFL.txt pkg/tuneux-max/
           Copy-Item -Recurse locales pkg/tuneux-max/locales
+          # 第一方插件随包（皮肤 / 均衡器 / 压缩器 / 可视化，各含 .wasm/.sig/.manifest）：
+          # max 的插件管理页为「只读 + 重载」、不能自行安装，故必须随包，否则插件页
+          # 恒为空清单（与 macOS bundle 的 Contents/MacOS/plugins/ 同口径——两者都
+          # 落在 exe 同目录，命中 config::plugins_dir() 的便携优先查找）。
+          Copy-Item -Recurse plugins pkg/tuneux-max/plugins
+          # FFmpeg 组件为发布链强制项（与 macOS 段同口径，缺件即失败）：
+          # 长尾格式与视频音轨全靠它，静默缺件会产出「能装能跑但格式全废」的包。
+          if (-not (Test-Path ffmpeg-dist/ffmpeg)) { throw "缺少 ffmpeg 组件，发布链不允许无组件打包" }
+          Copy-Item -Recurse ffmpeg-dist/ffmpeg pkg/tuneux-max/ffmpeg
           Compress-Archive -Path pkg/tuneux-max/* -DestinationPath "tuneux-max-$ver-${{ matrix.name }}.zip"
 
       - name: 上传产物
@@ -346,14 +479,29 @@ jobs:
 
   release:
     name: 发布
-    needs: [build, deny, checks, build-max]
+    needs: [build, deny, checks, build-max, build-ffmpeg]
+    # 发布环境保护：GitHub 侧 environment 首次使用时自动创建；在其上配置
+    # 必需审批人后即为人工放行关卡（手动触发任意 tag 也不再无审查直发）
+    environment: release
+    permissions:
+      contents: write
     # build-max 在 0.5.x 标签下被主动跳过（skipped）：其余关卡全绿即可发布；
     # 0.6+ 标签下 build-max 必须成功。
-    if: ${{ !cancelled() && needs.build.result == 'success' && needs.deny.result == 'success' && needs.checks.result == 'success' && (needs.build-max.result == 'success' || needs.build-max.result == 'skipped') }}
+    # 首条 startsWith(github.ref, 'refs/tags/')：仅「推送 tag」触发发布，
+    # workflow_dispatch 演练只验证构建链与产物、不创建 Release（免去演练后
+    # 手删 Release，也杜绝误批演练产物）。若确需经 dispatch 发布，去掉该条即可
+    # ——environment: release 的必需审批人仍是人工放行关卡。
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/') && needs.build.result == 'success' && needs.deny.result == 'success' && needs.checks.result == 'success' && needs.build-ffmpeg.result == 'success' && (needs.build-max.result == 'success' || needs.build-max.result == 'skipped') }}
     runs-on: ubuntu-latest
     env:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
+      - name: 版本标签格式校验
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]]; then
+            echo "❌ 非法版本标签：$TAG（仅允许 v0.5.5 / v0.6.0-rc.1 形式）"
+            exit 1
+          fi
       # 发布注记要从 CHANGELOG 提取，需检出仓库（本 job 其余步骤只用产物）
       - name: 检出代码
         uses: actions/checkout@v4
@@ -387,3 +535,29 @@ jobs:
               --notes-file release-notes.md
           fi
           gh release upload "$TAG" dist/*/* --clobber
+          # LGPL 源码要约第一通道：官方同哈希源码包随 Release 提供
+          if [ -f dist/ffmpeg-src/ffmpeg-*.tar.xz ]; then
+            gh release upload "$TAG" dist/ffmpeg-src/ffmpeg-*.tar.xz --clobber
+          fi
+
+      - name: 源码包同步 Gitee（要约第二通道；配置 GITEE_TOKEN 后生效）
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          if [ -z "$GITEE_TOKEN" ]; then
+            echo "⚠ 未配置 GITEE_TOKEN —— Gitee 源码附件跳过（建议在仓库 Secret 配置后生效）"
+            exit 0
+          fi
+          TARBALL="$(ls dist/ffmpeg-src/ffmpeg-*.tar.xz | head -1)"
+          # 创建或复用 Gitee Release（API v5）
+          REL_ID="$(curl -sf "https://gitee.com/api/v5/repos/Free_Youth_live/tuneux/releases/tags/$TAG" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' 2>/dev/null || true)"
+          if [ -z "$REL_ID" ]; then
+            REL_ID="$(curl -sf -X POST "https://gitee.com/api/v5/repos/Free_Youth_live/tuneux/releases" \
+              -d "access_token=$GITEE_TOKEN" -d "tag_name=$TAG" \
+              -d "name=$TAG" -d "body=源码附件与 GitHub Release 同步提供（LGPL 源码要约第二通道）" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+          fi
+          curl -sf -X POST "https://gitee.com/api/v5/repos/Free_Youth_live/tuneux/releases/$REL_ID/attach_files" \
+            -H "Authorization: token $GITEE_TOKEN" -F "file=@$TARBALL" >/dev/null
+          echo "✓ Gitee 附件已挂：$TARBALL"

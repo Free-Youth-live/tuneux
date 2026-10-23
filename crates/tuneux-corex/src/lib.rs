@@ -22,7 +22,7 @@
 mod audio;
 
 // 显式白名单（收官）：杜绝 glob 泄漏，公开面逐项冻结。
-// 死导出已收 pub(crate)（A2）：DecoderBackend / DecodeError /
+// 死导出已收 pub(crate)：DecoderBackend / DecodeError /
 // codec_name_or_ext / UnknownMedium 零外部消费方；open_backend 仅测试用，
 // 走 test-helpers feature。
 pub use audio::codec::decoder::open_backend;

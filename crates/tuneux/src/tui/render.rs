@@ -30,7 +30,7 @@ pub use self::layout::{layout_metrics, LayoutMetrics};
 use self::panels::{
     draw_browser, draw_cover_browser, draw_cover_panel, draw_lyrics_panel, draw_playlist,
 };
-use self::popup::draw_about;
+use self::popup::{draw_about, draw_properties};
 use self::spectrum::{draw_audio_panel, draw_band_column, draw_level_meter, draw_oscilloscope};
 use self::status::{draw_help_bar, draw_now_playing, draw_status_bar};
 
@@ -190,9 +190,12 @@ pub fn draw(
     );
     draw_help_bar(frame, vertical[3], app.focus, &app.i18n);
 
-    // —— 关于弹窗：最后绘制，覆盖在其它内容之上 ——
+    // —— 弹窗层：最后绘制，覆盖在其它内容之上 ——
     if app.about_visible {
         draw_about(frame, area, &app.i18n);
+    }
+    if app.properties_visible {
+        draw_properties(frame, area, app, &app.i18n);
     }
 }
 

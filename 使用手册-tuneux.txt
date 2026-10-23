@@ -12,8 +12,8 @@ tuneux 是「不羁的青春（FreeYouth）」的纯离线命令行音乐播放�
 
 - 核心格式纯 Rust 解码，无需任何系统编解码器：
   MP3 / FLAC / WAV / OGG / M4A / AAC / ALAC / Opus / WavPack。
-- 扩展格式（APE / WMA / FLV / TAK / AC3 / DTS / DSD 等）在系统装有
-  ffmpeg 时自动调用其解码，未装则跳过（详见「十二、FFmpeg 扩展格式」）。
+- 扩展格式（APE / WMA / FLV / TAK / AC3 / DTS / DSD 等）经 FFmpeg
+  进程外组件解码（合规引入，详见「十三、FFmpeg 扩展格式」）。
 - 纯离线：无任何联网功能、不收集任何数据。
 - 单文件便携：把可执行文件复制到 U 盘即可随身携带（Linux系统除外），配置自动就近保存。
 
@@ -95,6 +95,8 @@ tuneux 是「不羁的青春（FreeYouth）」的纯离线命令行音乐播放�
 
 【介质与其它】
   m                   切换介质风格（无 → 4 档磁带 → 4 档黑胶，只修饰声音）
+  i（或 Alt+Enter）    当前曲目属性弹窗（标签 / 技术参数 / 文件路径），
+                      再按关闭
   ?                   显示「关于」（版本号、简介、开源声明、版权），再按关闭
   q / Ctrl+C          退出（自动保存配置）
 
@@ -195,7 +197,12 @@ m 键在 9 档间循环，只修饰声音（DSP）、不占界面：
 在 tuneux.toml 的 [keymap] 段可重映射播放控制键。动作名：
 
   toggle_play（播放/暂停）、next（下一曲）、prev（上一曲）、
-  volume_up（音量+）、volume_down（音量−）
+  volume_up（音量+）、volume_down（音量−）、
+  cycle_repeat（循环模式）、toggle_shuffle（随机）、cycle_medium（介质）、
+  cycle_visual（频谱）、toggle_group_view（分组视图）、toggle_lyrics（歌词）、
+  cycle_cover（封面）、toggle_browser（浏览器）
+
+自定义映射为「加绑」语义：内置默认键始终有效，自定义键叠加生效。
 
 键描述语法：[shift+][ctrl+][alt+]<键名>，键名为单字符或
 space / tab / enter / esc / backspace / up / down / left / right / home / end。
@@ -220,20 +227,23 @@ space / tab / enter / esc / backspace / up / down / left / right / home / end。
 
 ────────────────────────────────────────────
 
-十三、FFmpeg 扩展格式（可选）
+十三、FFmpeg 扩展格式
 
-- 核心格式不需要 ffmpeg：MP3 / FLAC / WAV / OGG / M4A / AAC / ALAC /
+- 核心格式不需要它：MP3 / FLAC / WAV / OGG / M4A / AAC / ALAC /
   Opus / WavPack 全部纯 Rust 解码，自带、零依赖。
 - 扩展格式：APE / WMA / FLV / TAK / AC3 / DTS / DSD（DSF/DFF）等，
-  检测到系统 ffmpeg 就自动调用其解码，未装则跳过并提示，无需任何配置。
-- 安装：
+  检测到 FFmpeg 组件就自动调用其解码，缺席则跳过并提示，无需任何配置。
+- 合规说明：tuneux 在符合 FFmpeg 开源协议的前提下使用它——FFmpeg 是
+  进程外独立组件（不链接其库），随包附带时为官方源码的未修改 LGPL
+  构建，许可文本与版本登记见包内 ffmpeg/ 目录及 THIRD-PARTY-LICENSES.txt。
+- 组件获取：发布包随附时开箱即用；未随附时系统自装亦可：
   Windows：winget install ffmpeg（或到 ffmpeg.org 下载解压后把 bin 加入 PATH）
   macOS：  brew install ffmpeg
   Linux：  Debian/Ubuntu：sudo apt install ffmpeg
            Fedora：sudo dnf install ffmpeg
            Arch：sudo pacman -S ffmpeg
-- 安装后新开终端执行 ffmpeg -version 验证。
-- 只放扩展格式才需要 ffmpeg，不装不影响核心格式全部功能。
+- 系统自装后新开终端执行 ffmpeg -version 验证。
+- 只播扩展格式才需要 FFmpeg，没有它不影响核心格式全部功能。
 
 ────────────────────────────────────────────
 

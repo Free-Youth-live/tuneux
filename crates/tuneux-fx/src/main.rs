@@ -159,7 +159,8 @@ fn run(
             });
             if let Some(bands) = bands {
                 // 多个可视化插件时取最后一个产出的画面（当前随包一个）。
-                for p in &mut app.visual_plugins {
+                for v in &mut app.visual_plugins {
+                    let p = &mut v.plugin;
                     p.set_meter(&bands);
                     if p.call_tick().is_ok() {
                         if let Some(text) = p.read_visual() {
@@ -203,6 +204,11 @@ fn run(
                 Event::Mouse(me) => {
                     app.handle_mouse(me, config);
                     config.last_dir = Some(app.browser.cwd().to_path_buf());
+                    // 菜单「文件 › 退出」经鼠标路径触发时走标志位退出
+                    //（键盘路径由 handle_key 直接返回 false）。
+                    if app.quit_requested {
+                        break;
+                    }
                 }
                 _ => {}
             }

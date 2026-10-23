@@ -91,6 +91,61 @@ impl SplitMix64 {
 /// 持有条目集合、播放状态（current）、已播历史（history）、随机开关与
 /// LCG 状态，以及「下一首 / 上一首 / 显示序 / 去重」等导航逻辑。
 /// 不含任何 UI 呈现状态。
+/// 随机模式（2026-10-09 扩容；serde 表示冻结为 snake_case 四值）。
+///
+/// - `Off`：顺序播放；
+/// - `Tracks`：曲目袋式——全列表随机、一轮内不重复（v0.5.x 的 `shuffle = true` 同义）；
+/// - `TrueRandom`：真随机——均匀抽取、允许跨轮即时重复（排除当前曲防连播死循环）；
+/// - `Albums`：专辑袋式——随机选专辑、专辑内按曲序播完整张，再换下一张
+///   （专辑分组按 `PlaylistItem::album`，未知专辑各自成组）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShuffleMode {
+    /// 关闭（顺序播放）。
+    #[default]
+    Off,
+    /// 曲目袋式（不重复袋）。
+    Tracks,
+    /// 真随机（均匀，允许重复）。
+    TrueRandom,
+    /// 专辑袋式（整张连播）。
+    Albums,
+}
+
+impl ShuffleMode {
+    /// 冻结的 serde 字符串表示。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShuffleMode::Off => "off",
+            ShuffleMode::Tracks => "tracks",
+            ShuffleMode::TrueRandom => "true_random",
+            ShuffleMode::Albums => "albums",
+        }
+    }
+    /// 从冻结字符串解析（配置加载用）；未知值回落 Off。
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "tracks" => ShuffleMode::Tracks,
+            "true_random" => ShuffleMode::TrueRandom,
+            "albums" => ShuffleMode::Albums,
+            _ => ShuffleMode::Off,
+        }
+    }
+    /// 循环到下一档（`s` 键轻量循环：关→曲目→专辑→真随机→关）。
+    pub fn next(self) -> Self {
+        match self {
+            ShuffleMode::Off => ShuffleMode::Tracks,
+            ShuffleMode::Tracks => ShuffleMode::Albums,
+            ShuffleMode::Albums => ShuffleMode::TrueRandom,
+            ShuffleMode::TrueRandom => ShuffleMode::Off,
+        }
+    }
+    /// 是否处于任一随机档（状态栏 / 预载逻辑判定用）。
+    pub fn is_on(self) -> bool {
+        !matches!(self, ShuffleMode::Off)
+    }
+}
+
+/// 播放导航核心（媒体层）——条目集合 + 播放状态 + 随机模式 + 导航逻辑。
 #[derive(Debug, Clone)]
 pub struct PlaylistCore {
     items: Vec<PlaylistItem>,
@@ -98,7 +153,7 @@ pub struct PlaylistCore {
     current: Option<usize>,
     /// 已播历史（最近的在末尾），用于 shuffle 模式下的 prev 撤回。
     history: Vec<usize>,
-    shuffle: bool,
+    shuffle: ShuffleMode,
     rng: SplitMix64,
     /// 显示序缓存：`display_order()` 的结果，列表变更时置 None 失效。
     display_order_cache: std::cell::RefCell<Option<Vec<usize>>>,
@@ -117,7 +172,7 @@ impl PlaylistCore {
             items: Vec::new(),
             current: None,
             history: Vec::new(),
-            shuffle: false,
+            shuffle: ShuffleMode::Off,
             rng: SplitMix64::new(),
             display_order_cache: std::cell::RefCell::new(None),
         }
@@ -129,7 +184,7 @@ impl PlaylistCore {
             items: Vec::new(),
             current: None,
             history: Vec::new(),
-            shuffle: false,
+            shuffle: ShuffleMode::Off,
             rng: SplitMix64::with_seed(seed),
             display_order_cache: std::cell::RefCell::new(None),
         }
@@ -227,9 +282,14 @@ impl PlaylistCore {
         self.items.is_empty()
     }
 
-    /// 全部条目（只读视图）。
     /// 可变访问全部条目（排序 / 批量修改用）。
+    ///
+    /// 经此入口的物理重排/批量修改会使显示序缓存失真，此处一律先失效
+    /// 缓存（O(1)），下次 `display_order()` 惰性重算。调用方无需再手动
+    /// 处理缓存——曾因某条排序入口漏失效，导致显示行与物理条目错位
+    /// （删 A 行删到 B 曲）。
     pub fn items_mut(&mut self) -> &mut [PlaylistItem] {
+        self.invalidate_display_order();
         &mut self.items
     }
 
@@ -244,17 +304,32 @@ impl PlaylistCore {
     }
 
     /// 是否随机播放。
-    pub fn is_shuffle(&self) -> bool {
+    pub fn shuffle_mode(&self) -> ShuffleMode {
         self.shuffle
+    }
+
+    /// 是否处于任一随机档（兼容视图：`shuffle_mode().is_on()` 的简写）。
+    pub fn is_shuffle(&self) -> bool {
+        self.shuffle.is_on()
     }
 
     /// 切换随机模式。开 → 启用并清空 history（让"未播"从全集开始）。
     pub fn set_shuffle(&mut self, on: bool) {
-        if self.shuffle == on {
+        self.set_shuffle_mode(if on {
+            ShuffleMode::Tracks
+        } else {
+            ShuffleMode::Off
+        });
+    }
+
+    /// 设定随机模式（曲目袋式 / 真随机 / 专辑袋式 / 关）。
+    /// 切换即清空撤回历史（各模式的「已播」语义不同，跨模式历史无意义）。
+    pub fn set_shuffle_mode(&mut self, mode: ShuffleMode) {
+        if self.shuffle == mode {
             return;
         }
-        self.shuffle = on;
-        if on {
+        self.shuffle = mode;
+        if mode.is_on() {
             self.history.clear();
         }
     }
@@ -289,7 +364,7 @@ impl PlaylistCore {
         if self.items.is_empty() {
             return None;
         }
-        if matches!(repeat, RepeatMode::Single) || self.shuffle || self.items.len() == 1 {
+        if matches!(repeat, RepeatMode::Single) || self.shuffle.is_on() || self.items.len() == 1 {
             return None;
         }
         let order = self.display_order();
@@ -316,18 +391,8 @@ impl PlaylistCore {
             return NavOutcome::Repeat;
         }
 
-        let next_idx = if self.shuffle {
-            match self.pick_random_unplayed() {
-                Some(i) => Some(i),
-                None if matches!(repeat, RepeatMode::List) => {
-                    self.history.clear();
-                    if let Some(c) = self.current {
-                        self.history.push(c);
-                    }
-                    self.pick_random_unplayed()
-                }
-                None => None,
-            }
+        let next_idx = if self.shuffle.is_on() {
+            self.pick_by_shuffle_mode(repeat)
         } else {
             let order = self.display_order();
             match self
@@ -365,7 +430,7 @@ impl PlaylistCore {
             return NavOutcome::Repeat;
         }
 
-        let prev_idx = if self.shuffle {
+        let prev_idx = if self.shuffle.is_on() {
             self.history.pop()
         } else {
             let order = self.display_order();
@@ -467,13 +532,119 @@ impl PlaylistCore {
         true
     }
 
-    /// 清空已播历史（随机模式的撤回栈）。列表整体重排后历史索引尖效，
-    /// 调用方应先清空再继续导航（现代列头排序用）。
+    /// 清空已播历史（随机模式的撤回栈）。物理重排后历史索引失效，
+    /// 调用方应先清空再继续导航（现代列头排序用）；显示序缓存由
+    /// [`Self::items_mut`] 自行失效，调用方无需关心。
     pub fn clear_history(&mut self) {
         self.history.clear();
     }
 
     /// 从"未播"集合（不含 current 和 history）随机抽一个。
+    /// 按随机模式抽下一曲（next() 的 shuffle 分支唯一入口）。
+    fn pick_by_shuffle_mode(&mut self, repeat: RepeatMode) -> Option<usize> {
+        match self.shuffle {
+            ShuffleMode::TrueRandom => self.pick_true_random(),
+            ShuffleMode::Albums => self.pick_album_shuffle(repeat),
+            _ => self.pick_tracks_bag(repeat),
+        }
+    }
+
+    /// 真随机：全体（除当前曲）均匀抽取；一轮播完不清袋——连续两抽可能同曲。
+    fn pick_true_random(&mut self) -> Option<usize> {
+        let cands: Vec<usize> = (0..self.items.len())
+            .filter(|i| Some(*i) != self.current)
+            .collect();
+        if cands.is_empty() {
+            None
+        } else {
+            Some(cands[self.rng.gen_range(cands.len())])
+        }
+    }
+
+    /// 曲目袋式（原 pick_random_unplayed 语义 + List 循环清袋）。
+    fn pick_tracks_bag(&mut self, repeat: RepeatMode) -> Option<usize> {
+        match self.pick_random_unplayed() {
+            Some(i) => Some(i),
+            None if matches!(repeat, RepeatMode::List) => {
+                self.history.clear();
+                if let Some(c) = self.current {
+                    self.history.push(c);
+                }
+                self.pick_random_unplayed()
+            }
+            None => None,
+        }
+    }
+
+    /// 专辑袋式：当前专辑未播完则按曲序续播；否则随机抽一张未播专辑播其首曲。
+    /// 「已播」判定沿用条目级 history（专辑内全部条目进过 history 即视作播过）。
+    fn pick_album_shuffle(&mut self, repeat: RepeatMode) -> Option<usize> {
+        let groups = self.album_groups();
+        // 当前曲所在组的剩余未播（组内按曲序）
+        if let Some(cur) = self.current {
+            if let Some(g) = groups.iter().find(|g| g.contains(&cur)) {
+                let rest: Vec<usize> = g
+                    .iter()
+                    .copied()
+                    .filter(|i| Some(*i) != self.current && !self.history.contains(i))
+                    .collect();
+                if let Some(next) = rest.first() {
+                    return Some(*next);
+                }
+            }
+        }
+        // 抽未播组（组内存在未播条目）
+        let fresh: Vec<&Vec<usize>> = groups
+            .iter()
+            .filter(|g| {
+                g.iter()
+                    .any(|i| Some(*i) != self.current && !self.history.contains(i))
+            })
+            .collect();
+        if fresh.is_empty() {
+            if matches!(repeat, RepeatMode::List) {
+                self.history.clear();
+                if let Some(c) = self.current {
+                    self.history.push(c);
+                }
+                return self.pick_album_shuffle(RepeatMode::Off);
+            }
+            return None;
+        }
+        let g = fresh[self.rng.gen_range(fresh.len())];
+        g.iter()
+            .copied()
+            .find(|i| Some(*i) != self.current && !self.history.contains(i))
+    }
+
+    /// 专辑分组：按 `PlaylistItem::album` 字符串分组（None 各自成组），
+    /// 组内按（曲序, 路径序）稳定排序——专辑内按曲序连播。
+    fn album_groups(&self) -> Vec<Vec<usize>> {
+        let mut keyed: Vec<(Option<&str>, usize)> = self
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, it)| (it.album.as_deref(), i))
+            .collect();
+        keyed.sort_by(|a, b| {
+            a.0.cmp(&b.0).then_with(|| {
+                let ta = self.items[a.1].track_number.unwrap_or(u32::MAX);
+                let tb = self.items[b.1].track_number.unwrap_or(u32::MAX);
+                ta.cmp(&tb).then_with(|| a.1.cmp(&b.1))
+            })
+        });
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for (album, idx) in keyed {
+            match groups.last_mut() {
+                Some(g) if g.iter().any(|i| self.items[*i].album.as_deref() == album) => {
+                    g.push(idx)
+                }
+                _ => groups.push(vec![idx]),
+            }
+        }
+        groups
+    }
+
     fn pick_random_unplayed(&mut self) -> Option<usize> {
         let unplayed: Vec<usize> = (0..self.items.len())
             .filter(|i| Some(*i) != self.current && !self.history.contains(i))
@@ -681,6 +852,57 @@ mod tests {
         assert_eq!(p.display_order().len(), 0);
         assert!(p.add_dedup(item(Some("A"), Some(1), "/a1.mp3")));
         assert_eq!(p.display_order().len(), 1);
+    }
+
+    // —— items_mut 物理重排的缓存失效回归（2026-10-13）——
+
+    /// 与显示序同口径的物理重排：重排后 display_order 必须是恒等排列。
+    /// 修复前此处返回预热阶段的旧缓存（[2,3,1,0]），行↔曲错位。
+    #[test]
+    fn items_mut_canonical_resort_invalidates_display_order_cache() {
+        let mut p = PlaylistCore::new();
+        p.add(item(Some("B"), Some(1), "/b1.mp3"));
+        p.add(item(Some("A"), Some(3), "/a3.mp3"));
+        p.add(item(Some("A"), Some(1), "/a1.mp3"));
+        p.add(item(Some("A"), Some(2), "/a2.mp3"));
+        // 预热缓存（模拟排序前已渲染过列表）
+        let warmed = p.display_order();
+        assert_eq!(warmed, vec![2, 3, 1, 0]);
+        // 列表排序的真实路径：经 items_mut 物理重排
+        PlaylistCore::sort_items(p.items_mut());
+        p.clear_history();
+        // 物理序已与显示序口径一致，显示序必须是恒等排列
+        let after = p.display_order();
+        assert_eq!(after, vec![0, 1, 2, 3]);
+        let names: Vec<&str> = after
+            .iter()
+            .map(|&i| p.items()[i].path.to_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["/a1.mp3", "/a2.mp3", "/a3.mp3", "/b1.mp3"]);
+    }
+
+    /// 与显示序不同口径的物理重排（如按标题列头倒序）：display_order
+    /// 必须按新物理序重算，而非返回旧缓存。这是误删/误播场景的直接回归。
+    #[test]
+    fn items_mut_custom_sort_recomputes_display_order() {
+        let mut p = PlaylistCore::new();
+        p.add(item(Some("A"), Some(1), "/x.mp3"));
+        p.add(item(Some("A"), Some(2), "/y.mp3"));
+        p.add(item(Some("A"), Some(3), "/z.mp3"));
+        let warmed = p.display_order();
+        assert_eq!(warmed, vec![0, 1, 2]);
+        // 模拟按标题倒序列头排序：物理序变为 [z, y, x]
+        p.items_mut().sort_by(|a, b| b.path.cmp(&a.path));
+        p.clear_history();
+        // 显示序按 (album, track) 对新物理序重算：
+        // track 1/2/3 现在分别位于物理索引 2/1/0
+        let after = p.display_order();
+        assert_eq!(after, vec![2, 1, 0]);
+        let tracks: Vec<u32> = after
+            .iter()
+            .map(|&i| p.items()[i].track_number.unwrap())
+            .collect();
+        assert_eq!(tracks, vec![1, 2, 3]);
     }
 
     #[test]

@@ -1,0 +1,30 @@
+# FFmpeg 构建钉子（单一真相源）
+# =============================================================================
+# tools/build-ffmpeg.sh 唯一读取此文件；改动本文件 = 改变全部平台构建输入，
+# 须核对版本哈希与许可条款（LGPL 纯度两禁由构建与运行双层校验保证）。
+# 素材区原件：<素材区>/ffmpeg/ffmpeg-9.0.2.tar.xz（同哈希；路径由
+#   --tarball / FFMPEG_TARBALL 指定，不在此写死本机绝对路径）
+# =============================================================================
+
+# 版本号（发布标签）
+version = "9.0.2"
+
+# 官方源码包
+url = "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz"
+
+# 源码包 SHA-256（官方发布页口径；素材区原件与官方下载双渠道核验一致）
+sha256 = "8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e"
+
+# GPG 签名（可选二次校验；素材区已归档同名 .asc）
+asc_url = "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz.asc"
+
+# 构建配置（LGPL 纯度：不出现 --enable-gpl / --enable-nonfree）
+# 全量原生组件 + 禁外部库自动探测：许可合规由配置保证，不依赖构建机环境
+configure_args = [
+    "--disable-network",
+    "--disable-doc",
+    "--disable-debug",
+    "--disable-ffplay",
+    "--enable-ffprobe",
+    "--disable-autodetect",
+]

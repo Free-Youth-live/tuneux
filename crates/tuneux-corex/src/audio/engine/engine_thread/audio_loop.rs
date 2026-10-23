@@ -383,6 +383,7 @@ pub(super) fn audio_loop(
                 // 仍显示上一曲时长 / 技术参数行残留直通亮色"
                 state.set_duration(0.0);
                 state.set_bitstream(false);
+                state.set_src_params(None);
                 // 停止后清空播放路径——设备热切换时无路径可重建（正确行为）
                 current_playback_path = None;
             }

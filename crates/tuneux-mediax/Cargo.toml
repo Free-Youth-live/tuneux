@@ -20,7 +20,7 @@ encoding_rs.workspace = true
 tuneux-corex = { path = "../tuneux-corex" }
 crossbeam-channel.workspace = true
 # 封面解码（artwork）：image 已在 workspace 构建图中（三产品各自在用），
-# 收进 mediax 不新增依赖边（评审 R1 #9 裁决）。
+# 收进 mediax 不新增依赖边（人工评审后收编）。
 image = { workspace = true }
 
 # dev 依赖仅用于冻结表示的契约测试（serde 往返经 toml 验证）

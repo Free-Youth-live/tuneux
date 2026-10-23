@@ -99,6 +99,96 @@ impl App {
         })
     }
 
+    pub(crate) fn action_cycle_cover(&mut self, config: &mut Config) {
+        // c：Hidden → Cover → CoverBrowser → Hidden（互斥：开封面会关掉浏览器）。
+        // 封面/封面浏览不是可聚焦面板，显示时焦点归回播放列表。
+        self.left_panel = match self.left_panel {
+            LeftPanel::Cover => LeftPanel::CoverBrowser,
+            LeftPanel::CoverBrowser => LeftPanel::Hidden,
+            _ => LeftPanel::Cover,
+        };
+        if self.left_panel != LeftPanel::Hidden {
+            self.focus = playlist::Panel::Playlist;
+        }
+        config.left_panel = self.left_panel;
+    }
+
+    pub(crate) fn action_cycle_medium(&mut self, config: &mut Config) {
+        // m：循环播放介质风格（无 → 4 磁带 → 4 黑胶 → 无），只改声音，
+        // 用 corex 的 ALL 单一真源，新增介质无需改此处。
+        let all = audio::PlaybackMedium::ALL;
+        let idx = all
+            .iter()
+            .position(|&m| m == self.playback_medium)
+            .unwrap_or(0);
+        self.playback_medium = all[(idx + 1) % all.len()];
+        // 介质只改声音（corex DSP），不占界面、不动左面板。
+        if let Some(engine) = &self.engine {
+            engine.set_medium(self.playback_medium);
+        }
+        config.playback_medium = self.playback_medium.as_str().to_string();
+        // 界面不再显示介质，状态栏提示当前档位（声音变化不易一眼看出）。
+        self.last_error = Some(format!(
+            "{}：{}",
+            self.i18n.t("msg.medium"),
+            self.i18n.t(medium_display_name(self.playback_medium))
+        ));
+        self.last_error_at = Some(std::time::Instant::now());
+    }
+
+    pub(crate) fn action_cycle_repeat(&mut self, config: &mut Config) {
+        config.repeat = config.repeat.next();
+        // 循环模式变了，刷新预载目标：顺序模式预载下一曲，
+        // 单曲/随机清掉旧预载（否则旧预载曲会在切曲时抢先播放，声音与界面错位）。
+        self.refresh_preload(config);
+    }
+
+    pub(crate) fn action_cycle_visual(&mut self, config: &mut Config) {
+        self.spectrum_mode = self.spectrum_mode.next();
+        config.spectrum_mode = self.spectrum_mode;
+    }
+
+    pub(crate) fn action_toggle_browser(&mut self, config: &mut Config) {
+        // b：Hidden ↔ Browser（互斥：开浏览器会关掉封面）
+        if self.left_panel == LeftPanel::Browser {
+            self.left_panel = LeftPanel::Hidden;
+            self.focus = playlist::Panel::Playlist;
+        } else {
+            self.left_panel = LeftPanel::Browser;
+            self.focus = playlist::Panel::Browser;
+        }
+        config.left_panel = self.left_panel;
+    }
+
+    pub(crate) fn action_toggle_group_view(&mut self, config: &mut Config) {
+        // g：切换播放列表视图（平铺 ↔ 按专辑分组），并记入配置。
+        self.playlist.toggle_view();
+        config.playlist_view = self.playlist.view();
+    }
+
+    pub(crate) fn action_toggle_lyrics(&mut self, config: &mut Config) {
+        // l：切换歌词（显示/隐藏），可与频谱共存。
+        self.lyrics_mode = self.lyrics_mode.next();
+        config.lyrics_mode = self.lyrics_mode;
+    }
+
+    pub(crate) fn action_toggle_shuffle(&mut self, config: &mut Config) {
+        let mode = self.playlist.shuffle_mode().next();
+        self.playlist.set_shuffle_mode(mode);
+        config.shuffle = mode.is_on();
+        config.shuffle_mode = mode.as_str().to_string();
+        let name = match mode {
+            tuneux_mediax::ShuffleMode::Off => "shuffle.off",
+            tuneux_mediax::ShuffleMode::Tracks => "shuffle.tracks",
+            tuneux_mediax::ShuffleMode::TrueRandom => "shuffle.true_random",
+            tuneux_mediax::ShuffleMode::Albums => "shuffle.albums",
+        };
+        let msg = self.i18n.t(name).into_owned();
+        self.flash_message(&msg);
+        // 随机模式变了，同样刷新预载目标。
+        self.refresh_preload(config);
+    }
+
     /// 执行一个自定义动作，返回 true 表示按键已被消费。
     ///
     /// 未知动作名返回 false，调用方据此回退到硬编码默认键。
@@ -125,6 +215,39 @@ impl App {
             }
             "volume_down" => {
                 self.volume_down();
+                true
+            }
+            // 模式 / 面板动作（2026-10-09 扩容；与硬编码默认键同一方法，单一实现）
+            "cycle_repeat" => {
+                self.action_cycle_repeat(config);
+                true
+            }
+            "toggle_shuffle" => {
+                self.action_toggle_shuffle(config);
+                true
+            }
+            "cycle_medium" => {
+                self.action_cycle_medium(config);
+                true
+            }
+            "cycle_visual" => {
+                self.action_cycle_visual(config);
+                true
+            }
+            "toggle_group_view" => {
+                self.action_toggle_group_view(config);
+                true
+            }
+            "toggle_lyrics" => {
+                self.action_toggle_lyrics(config);
+                true
+            }
+            "cycle_cover" => {
+                self.action_cycle_cover(config);
+                true
+            }
+            "toggle_browser" => {
+                self.action_toggle_browser(config);
                 true
             }
             // 未知动作名：忽略，回退默认键
@@ -197,6 +320,11 @@ impl App {
         // —— 关于弹窗（最优先：任意键关闭并吃掉，避免误触发其它操作）——
         if self.about_visible {
             self.about_visible = false;
+            return true;
+        }
+        // 属性弹窗同款：任意键关闭并吃掉。
+        if self.properties_visible {
+            self.properties_visible = false;
             return true;
         }
 
@@ -313,17 +441,11 @@ impl App {
                 return true;
             }
             KeyCode::Char('r') => {
-                config.repeat = config.repeat.next();
-                // 循环模式变了，刷新预载目标：顺序模式预载下一曲，
-                // 单曲/随机清掉旧预载（否则旧预载曲会在切曲时抢先播放，声音与界面错位）。
-                self.refresh_preload(config);
+                self.action_cycle_repeat(config);
                 return true;
             }
             KeyCode::Char('s') => {
-                config.shuffle = !config.shuffle;
-                self.playlist.set_shuffle(config.shuffle);
-                // 随机开关变了，同样刷新预载目标。
-                self.refresh_preload(config);
+                self.action_toggle_shuffle(config);
                 return true;
             }
             KeyCode::Char('n') => {
@@ -373,49 +495,19 @@ impl App {
                 return true;
             }
             KeyCode::Char('b') => {
-                // b：Hidden ↔ Browser（互斥：开浏览器会关掉封面）
-                if self.left_panel == LeftPanel::Browser {
-                    self.left_panel = LeftPanel::Hidden;
-                    self.focus = playlist::Panel::Playlist;
-                } else {
-                    self.left_panel = LeftPanel::Browser;
-                    self.focus = playlist::Panel::Browser;
-                }
-                config.left_panel = self.left_panel;
+                self.action_toggle_browser(config);
                 return true;
             }
             KeyCode::Char('v') => {
-                self.spectrum_mode = self.spectrum_mode.next();
-                config.spectrum_mode = self.spectrum_mode;
+                self.action_cycle_visual(config);
                 return true;
             }
             KeyCode::Char('l') => {
-                // l：切换歌词（显示/隐藏），可与频谱共存。
-                self.lyrics_mode = self.lyrics_mode.next();
-                config.lyrics_mode = self.lyrics_mode;
+                self.action_toggle_lyrics(config);
                 return true;
             }
             KeyCode::Char('m') => {
-                // m：循环播放介质风格（无 → 4 磁带 → 4 黑胶 → 无），只改声音，
-                // 用 corex 的 ALL 单一真源，新增介质无需改此处。
-                let all = audio::PlaybackMedium::ALL;
-                let idx = all
-                    .iter()
-                    .position(|&m| m == self.playback_medium)
-                    .unwrap_or(0);
-                self.playback_medium = all[(idx + 1) % all.len()];
-                // 介质只改声音（corex DSP），不占界面、不动左面板。
-                if let Some(engine) = &self.engine {
-                    engine.set_medium(self.playback_medium);
-                }
-                config.playback_medium = self.playback_medium.as_str().to_string();
-                // 界面不再显示介质，状态栏提示当前档位（声音变化不易一眼看出）。
-                self.last_error = Some(format!(
-                    "{}：{}",
-                    self.i18n.t("msg.medium"),
-                    self.i18n.t(medium_display_name(self.playback_medium))
-                ));
-                self.last_error_at = Some(std::time::Instant::now());
+                self.action_cycle_medium(config);
                 return true;
             }
             KeyCode::Char('x') => {
@@ -440,27 +532,27 @@ impl App {
                 return true;
             }
             KeyCode::Char('g') => {
-                // g：切换播放列表视图（平铺 ↔ 按专辑分组），并记入配置。
-                self.playlist.toggle_view();
-                config.playlist_view = self.playlist.view();
+                self.action_toggle_group_view(config);
                 return true;
             }
             KeyCode::Char('c') => {
-                // c：Hidden → Cover → CoverBrowser → Hidden（互斥：开封面会关掉浏览器）。
-                // 封面/封面浏览不是可聚焦面板，显示时焦点归回播放列表。
-                self.left_panel = match self.left_panel {
-                    LeftPanel::Cover => LeftPanel::CoverBrowser,
-                    LeftPanel::CoverBrowser => LeftPanel::Hidden,
-                    _ => LeftPanel::Cover,
-                };
-                if self.left_panel != LeftPanel::Hidden {
-                    self.focus = playlist::Panel::Playlist;
-                }
-                config.left_panel = self.left_panel;
+                self.action_cycle_cover(config);
                 return true;
             }
             KeyCode::Char('?') => {
+                // ? = 关于/帮助（2026-10-14 快捷键规则：F 键不作任何功能的绑定）。
                 self.about_visible = !self.about_visible;
+                return true;
+            }
+            KeyCode::Char('i') => {
+                // 当前曲目属性弹窗：`i` 主键；Alt+Enter 为 fb2k 肌肉记忆别名。
+                // （三平台考量：Windows 旧 conhost 的 Alt+Enter 被控制台截走切全屏、
+                // macOS 终端 Option 组合受终端设置影响——普通键 i 保底恒可用。）
+                self.properties_visible = !self.properties_visible;
+                return true;
+            }
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.properties_visible = !self.properties_visible;
                 return true;
             }
             _ => {}

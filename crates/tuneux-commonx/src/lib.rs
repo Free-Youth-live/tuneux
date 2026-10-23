@@ -33,6 +33,7 @@
 //（生产路径零 unwrap 由 workspace lints 强制）。
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+pub mod config_status;
 pub mod float;
 pub mod fs_browser;
 pub mod gauge;

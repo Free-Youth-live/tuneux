@@ -8,9 +8,48 @@
 //! zh 内置语言表只收录新 UI 实际引用的词条（词条集与 app_v2 同步维护，
 //! 反向完整性由 tools/check-i18n-keys.sh 守护）。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
+
+use tuneux_commonx::config_status::backup_corrupt_file;
+/// 加载状态与损坏备份口径已下沉 commonx（三端共用）；再导出保持
+/// `crate::config::LoadStatus` 引用不变。
+pub use tuneux_commonx::config_status::LoadStatus;
+
+/// 配置损坏停写锁（tuneux-max.toml 维度）：置位后本会话一切保存入口跳过。
+static CONFIG_SAVE_LOCKED: AtomicBool = AtomicBool::new(false);
+/// 播放状态损坏停写锁（tuneux-max-playlist.toml 维度）。
+static STATE_SAVE_LOCKED: AtomicBool = AtomicBool::new(false);
+
+/// 播放列表列开关（列头右键配置；默认全开）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PlaylistCols {
+    /// 序号列（#）。
+    pub num: bool,
+    /// 标题列。
+    pub title: bool,
+    /// 艺术家列。
+    pub artist: bool,
+    /// 专辑列（分组视图下组头已有专辑名，平铺视图此列有价值）。
+    pub album: bool,
+    /// 时长列。
+    pub duration: bool,
+}
+
+impl Default for PlaylistCols {
+    fn default() -> Self {
+        Self {
+            num: true,
+            title: true,
+            artist: true,
+            album: false,
+            duration: true,
+        }
+    }
+}
 
 /// max 配置（新 UI 最小集；功能落地时再按需增补字段）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,7 +64,8 @@ pub struct MaxConfig {
     /// 界面主题名（内置主题 id）。
     #[serde(default = "default_theme")]
     pub theme: String,
-    /// 界面字体名（字体目录里的显示名；内置文泉驿为默认）。
+    /// 界面字体名（字体目录里的显示名；内置 Sarasa Mono SC 为默认，
+    /// fonts/ 目录自投字体按文件名入列）。
     #[serde(default = "default_font")]
     pub font: String,
     /// 循环模式（媒体层枚举，serde 表示冻结为 off/single/list）。
@@ -37,6 +77,9 @@ pub struct MaxConfig {
     /// 用户自定义，右键/菜单切换写入；换肤时该皮肤的覆盖自动生效。
     #[serde(default)]
     pub mod_over: std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
+    /// 播放列表列开关（列头右键配置）。
+    #[serde(default)]
+    pub pl_cols: PlaylistCols,
     /// 停靠布局树（叶 = 模块，内节点 = 可拖分割）；None = 全关空 dock。
     #[serde(default = "default_dock")]
     pub dock: Option<crate::dock::DockNode>,
@@ -46,11 +89,6 @@ pub struct MaxConfig {
     /// 书签（mediax BookmarkList serde 直存；命令 bm/bm-jump/bm-del 操作）。
     #[serde(default)]
     pub bookmarks: tuneux_mediax::bookmark::BookmarkList,
-    /// 现代界面开关（true = 纯图形观感：圆角卡片 / 矢量控件 / 鼠标
-    /// 全覆盖；false = 经典 fx TUI 观感）。默认关闭——现状行为不变；
-    /// 视图菜单 / `:modern` 命令随时切换，互切零丢失。
-    #[serde(default)]
-    pub modern: bool,
 }
 
 impl Default for MaxConfig {
@@ -64,26 +102,30 @@ impl Default for MaxConfig {
             repeat: tuneux_mediax::RepeatMode::Off,
             view: default_view(),
             mod_over: std::collections::BTreeMap::new(),
+            pl_cols: PlaylistCols::default(),
             dock: default_dock(),
             dock_presets: std::collections::BTreeMap::new(),
             bookmarks: tuneux_mediax::bookmark::BookmarkList::default(),
-            modern: false,
         }
     }
 }
 
 /// 默认 dock：浏览器 | （列表 / 封面 上下）——与重写前默认观感对齐。
 fn default_dock() -> Option<crate::dock::DockNode> {
+    // 默认布局 = fx TUI 同构（2026-10-09 定为默认口径）：
+    // 左浏览器（约 1/3）+ 右播放列表（约 2/3，主区）；歌词模块
+    // 常驻右下（fx 的 l 面板对应物）。其余模块（频谱/EQ/封面等）
+    // 经右键菜单或「视图→模块」按需加装。
     use crate::dock::{DockNode, ModuleId};
     Some(DockNode::Split {
         side_by_side: true,
-        ratio: 0.24,
+        ratio: 0.35,
         a: Box::new(DockNode::leaf(ModuleId::Browser)),
         b: Box::new(DockNode::Split {
             side_by_side: false,
-            ratio: 0.62,
+            ratio: 0.72,
             a: Box::new(DockNode::leaf(ModuleId::Playlist)),
-            b: Box::new(DockNode::leaf(ModuleId::Cover)),
+            b: Box::new(DockNode::leaf(ModuleId::Lyrics)),
         }),
     })
 }
@@ -97,7 +139,8 @@ fn default_font() -> String {
 }
 
 fn default_view() -> tuneux_mediax::PlaylistView {
-    tuneux_mediax::PlaylistView::Flat
+    // 2026-10-09 起默认按专辑分组（产品口径：加入即分组、按曲序排）。
+    tuneux_mediax::PlaylistView::ByAlbum
 }
 
 /// 配置文件路径（exe 同目录优先，回退系统配置目录）。
@@ -107,18 +150,50 @@ pub fn config_path() -> PathBuf {
 
 /// 加载配置：缺失 / 解析失败回退默认，绝不 panic、绝不阻塞启动。
 /// 音量做 NaN/越界净化（损坏配置不得产生无声或爆音启动）。
+///
+/// 文件损坏（存在但解析失败）时：先备份原文件为 `.corrupt.bak`，再锁死
+/// 本会话的保存入口——默认值只在内存兜底运行，绝不落盘覆写用户原文件。
 pub fn load() -> MaxConfig {
-    let mut cfg = std::fs::read_to_string(config_path())
-        .ok()
-        .and_then(|t| toml::from_str::<MaxConfig>(&t).ok())
-        .unwrap_or_default();
+    let path = config_path();
+    let mut cfg = if path.exists() {
+        match std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| toml::from_str::<MaxConfig>(&t).ok())
+        {
+            Some(cfg) => cfg,
+            None => {
+                let bak = backup_corrupt_file(&path);
+                CONFIG_SAVE_LOCKED.store(true, Ordering::SeqCst);
+                eprintln!(
+                    "[配置] 解析失败，本次会话使用默认值且不会自动保存（{}）",
+                    path.display()
+                );
+                match bak {
+                    Some(b) => eprintln!("[配置] 原文件已备份到 {}，请修复配置后重启", b.display()),
+                    None => eprintln!("[配置] 原文件备份失败，请立即手工复制保存原文件"),
+                }
+                MaxConfig::default()
+            }
+        }
+    } else {
+        MaxConfig::default()
+    };
     cfg.volume = tuneux_commonx::sanitize_f32(cfg.volume, 0.8).clamp(0.0, 1.0);
     cfg
 }
 
 /// 保存配置（原子写：临时文件 + rename）。失败静默（配置丢失不致命）。
+/// 损坏停写锁置位时（加载发现原文件损坏）整体跳过，见 [`load`]。
 pub fn save(cfg: &MaxConfig) {
-    atomic_write(&config_path(), cfg);
+    atomic_write_if_unlocked(&config_path(), cfg, &CONFIG_SAVE_LOCKED);
+}
+
+/// 带停写锁检查的原子写（锁与路径均可注入，便于单元测试）。
+fn atomic_write_if_unlocked<T: Serialize>(path: &Path, value: &T, locked: &AtomicBool) {
+    if locked.load(Ordering::SeqCst) {
+        return;
+    }
+    atomic_write(path, value);
 }
 
 /// 插件目录：exe 同目录 plugins/（便携口径）优先，安装态回退配置目录。
@@ -147,17 +222,36 @@ pub fn state_path() -> PathBuf {
     tuneux_commonx::portable_path("tuneux-max-playlist.toml", "tuneux-max")
 }
 
-/// 加载播放状态：缺失 / 解析失败回退空态。
-pub fn load_state() -> tuneux_mediax::PlaylistState {
-    std::fs::read_to_string(state_path())
+/// 加载播放状态并报告加载状态（供 UI 弹出损坏提示）。
+///
+/// 缺失 / 解析失败回退空态，绝不 panic。损坏时与 [`load`] 同口径：
+/// 备份原文件为 `.corrupt.bak` 并锁死本会话播放状态写回——绝不用内存
+/// 空列表覆写磁盘上的用户列表。
+pub fn load_state_with_status() -> (tuneux_mediax::PlaylistState, LoadStatus) {
+    let path = state_path();
+    if !path.exists() {
+        return (tuneux_mediax::PlaylistState::default(), LoadStatus::Missing);
+    }
+    let parsed = std::fs::read_to_string(&path)
         .ok()
-        .and_then(|t| toml::from_str(&t).ok())
-        .unwrap_or_default()
+        .and_then(|t| toml::from_str(&t).ok());
+    match parsed {
+        Some(st) => (st, LoadStatus::Ok),
+        None => {
+            let backup = backup_corrupt_file(&path);
+            STATE_SAVE_LOCKED.store(true, Ordering::SeqCst);
+            (
+                tuneux_mediax::PlaylistState::default(),
+                LoadStatus::Corrupt { backup },
+            )
+        }
+    }
 }
 
-/// 保存播放状态（原子写）。
+/// 保存播放状态（原子写）。损坏停写锁置位时整体跳过，
+/// 见 [`load_state_with_status`]。
 pub fn save_state(st: &tuneux_mediax::PlaylistState) {
-    atomic_write(&state_path(), st);
+    atomic_write_if_unlocked(&state_path(), st, &STATE_SAVE_LOCKED);
 }
 
 /// 原子写：先写 .tmp 再 rename（半截文件不得替换旧配置）。
@@ -222,6 +316,7 @@ menu.ctx_open = \"打开\"\n\
 menu.ctx_add_dir = \"加入此目录\"\n\
 menu.ctx_add_play = \"加入并播放\"\n\
 menu.ctx_add_only = \"仅加入\"\n\
+menu.ctx_reveal = \"在文件管理器中显示\"\n\
 medium.none = \"关（原声）\"\n\
 medium.tape_clear = \"磁带·清（Hi-Fi）\"\n\
 medium.tape_white = \"磁带·白（清新）\"\n\
@@ -305,6 +400,8 @@ msg.m3u_empty = \"播放列表为空，无需保存\"\n\
 msg.save_fail = \"保存失败\"\n\
 msg.loaded = \"已加载 {} 首\"\n\
 msg.load_fail = \"读取失败\"\n\
+msg.state_corrupt = \"播放列表文件损坏：已备份为 {}，本次会话不会自动保存\"\n\
+msg.state_corrupt_nobackup = \"播放列表文件损坏且自动备份失败：请立即手工复制保存原文件；本次会话不会自动保存\"\n\
 msg.bm_added = \"已加书签\"\n\
 msg.bm_updated = \"书签已更新\"\n\
 msg.bm_deleted = \"已删书签：{}\"\n\
@@ -345,26 +442,26 @@ btn.ok = \"确定\"\n\
 btn.volume = \"音量\"\n\
 btn.shuffle = \"随机\"\n\
 fkey.menu = \"菜单\"\n\
-fkey.panels = \"面板开合\"\n\
 fkey.eq = \"均衡器\"\n\
 fkey.help = \"帮助\"\n\
-menu.modern_ui = \"现代界面\"\n\
 menu.add_bookmark = \"添加书签（当前位置）\"\n\
-msg.modern_on = \"已切换现代界面（纯图形呈现）\"\n\
-msg.modern_off = \"已切回经典界面\"\n\
+col.num = \"序号\"\n\
 col.album = \"专辑\"\n\
-modern.up = \"上级目录\"\n\
-modern.home = \"主目录\"\n\
-modern.volume = \"音量\"\n\
-modern.mute = \"静音\"\n\
+browser.up = \"上级目录\"\n\
+browser.home = \"主目录\"\n\
 panel.about = \"关于\"\n\
 about.brand = \"tuneux-max · FreeYouth\"\n\
+popup.properties = \"属性\"\n\
+prop.codec = \"编码\"\n\
+prop.channels = \"声道\"\n\
+prop.duration = \"时长\"\n\
+prop.path = \"路径\"\n\
 about.tagline = \"插件化图形音乐播放器\"\n\
 about.plugins_cat = \"插件\"\n\
 about.formats = \"支持 MP3 · FLAC · WAV · OGG · OPUS · WV · M4A · AAC · ALAC\"\n\
 about.keys1 = \"空格 播放/暂停 · n/p 下一曲/上一曲 · ←→ ±5秒 · +/- 音量\"\n\
 about.keys2 = \"b 浏览器 · c 封面 · l 歌词 · v 频谱/示波器 · g 分组 · a 加入 · / 搜索\"\n\
-about.keys3 = \"F10/1-8 菜单 · m 介质 · x两次 清空 · ? 关于 · q 退出\"\n\
+about.keys3 = \"1-8 菜单 · e 均衡器 · m 介质 · x两次 清空 · ? 关于 · q 退出\"\n\
 about.deps = \"基于以下开源项目构建：\"\n\
 panel.eq = \"均衡器\"\n\
 panel.compressor = \"压缩器\"\n\
@@ -374,6 +471,43 @@ eq.on = \"EQ 开关\"\n\
 eq.reset = \"重置\"\n\
 about.license = \"本项目采用木兰宽松许可证 v2（MulanPSL-2.0）\"\n\
 about.offline = \"纯离线 · 不收集任何数据\"\n\
+menu.edit = \"编辑\"\n\
+menu.audio = \"音效\"\n\
+menu.add_selection = \"加入浏览器选中项\"\n\
+menu.save_playlist = \"保存播放列表…\"\n\
+menu.load_playlist = \"载入播放列表…\"\n\
+menu.remove_selected = \"移除选中\"\n\
+menu.search = \"搜索\"\n\
+menu.properties = \"属性\"\n\
+menu.seek_back = \"快退\"\n\
+menu.seek_forward = \"快进\"\n\
+menu.play_order = \"播放顺序\"\n\
+order.sequential = \"顺序\"\n\
+order.repeat_one = \"单曲循环\"\n\
+order.repeat_all = \"列表循环\"\n\
+order.shuffle_tracks = \"随机曲目\"\n\
+order.shuffle_albums = \"随机专辑\"\n\
+order.true_random = \"真随机\"\n\
+menu.mute = \"静音\"\n\
+menu.bookmarks = \"书签\"\n\
+menu.bookmark_list = \"列表…\"\n\
+menu.bookmark_delete = \"删除…\"\n\
+menu.filter = \"滤波器\"\n\
+menu.plugin_manager = \"插件管理…\"\n\
+menu.command_bar = \"命令输入条\"\n\
+menu.open_config_dir = \"打开配置目录\"\n\
+menu.shortcuts = \"快捷键一览…\"\n\
+menu.manual = \"使用手册\"\n\
+menu.reload_plugins = \"重载插件\"\n\
+plugins.dir = \"插件目录\"\n\
+plugins.log = \"装载日志\"\n\
+plugins.loaded = \"已装载\"\n\
+plugins.not_loaded = \"未装载\"\n\
+plugins.none = \"（无插件文件——把 .wasm 放入插件目录后重载）\"\n\
+plugins.pending_empty = \"待确认：（空）\"\n\
+msg.dir_open_fail = \"无法打开\"\n\
+msg.manual_missing = \"使用手册随发行包附带（安装目录内 使用手册-tuneux-max.txt）\"\n\
+bm.hint = \"Enter 跳转 · ✕ 删除 · Esc 关闭\"\n\
 ",
     )
 }
@@ -419,10 +553,10 @@ mod tests {
             repeat: tuneux_mediax::RepeatMode::List,
             view: tuneux_mediax::PlaylistView::ByAlbum,
             mod_over: std::collections::BTreeMap::new(),
+            pl_cols: PlaylistCols::default(),
             dock: default_dock(),
             dock_presets: std::collections::BTreeMap::new(),
             bookmarks: tuneux_mediax::bookmark::BookmarkList::default(),
-            modern: true,
         };
         let text = toml::to_string_pretty(&cfg).expect("serialize");
         let back: MaxConfig = toml::from_str(&text).expect("deserialize");
@@ -433,15 +567,14 @@ mod tests {
         assert_eq!(back.font, "更纱黑体等宽");
         assert_eq!(back.repeat, tuneux_mediax::RepeatMode::List);
         assert_eq!(back.view, tuneux_mediax::PlaylistView::ByAlbum);
-        assert!(back.modern, "modern 字段应往返保留");
     }
 
-    /// 旧配置（无 modern 字段）加载后 modern = false——现状用户不受影响。
+    /// 旧配置兼容：含已废弃 modern 字段的配置文件正常加载（serde 忽略
+    /// 未知字段，不报错不迁移——现代模式已删，该值无意义）。
     #[test]
-    fn legacy_config_without_modern_defaults_off() {
-        let text = "lang = \"zh\"\nvolume = 0.7\n";
-        let cfg: MaxConfig = toml::from_str(text).expect("旧配置应可加载");
-        assert!(!cfg.modern, "无 modern 字段时必须回退经典界面");
+    fn legacy_config_with_modern_field_still_loads() {
+        let cfg: MaxConfig = toml::from_str("modern = true\n").unwrap();
+        assert!((cfg.volume - 0.8).abs() < 1e-6, "其余字段默认值不受影响");
     }
 
     /// 旧配置文件带已删除字段（layout 等）仍可加载（serde 忽略未知字段）。
@@ -459,5 +592,51 @@ mod tests {
         let cfg: MaxConfig = toml::from_str("").expect("空串应得默认");
         assert_eq!(cfg.lang, "zh");
         assert_eq!(cfg.theme, "dos");
+    }
+
+    // —— 损坏配置保护（2026-10-13，与双 TUI 同源修复）——
+
+    /// 损坏文件备份：生成 .corrupt.bak 且内容与原文件一致；
+    /// 已有备份时不得覆盖（保留最早现场）。
+    #[test]
+    fn corrupt_file_backed_up_once() {
+        let tmp = std::env::temp_dir().join("tuneux_max_test_corrupt_backup.toml");
+        let bak = PathBuf::from(format!("{}.corrupt.bak", tmp.display()));
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&bak);
+        std::fs::write(&tmp, "not = [valid").expect("写入损坏配置");
+        let first = backup_corrupt_file(&tmp).expect("首次备份应成功");
+        assert_eq!(first, bak);
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), "not = [valid");
+        // 第二次损坏内容不同，备份不得覆盖
+        std::fs::write(&tmp, "other = [broken").expect("改写损坏配置");
+        let second = backup_corrupt_file(&tmp).expect("已有备份仍返回路径");
+        assert_eq!(
+            std::fs::read_to_string(&second).unwrap(),
+            "not = [valid",
+            "已有备份不得被覆盖"
+        );
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&bak);
+    }
+
+    /// 停写锁：置位后配置/播放状态保存整体跳过（不落盘、不建文件）。
+    #[test]
+    fn save_skipped_when_locked() {
+        let tmp = std::env::temp_dir().join("tuneux_max_test_save_locked.toml");
+        let _ = std::fs::remove_file(&tmp);
+        let locked = AtomicBool::new(true);
+        atomic_write_if_unlocked(&tmp, &MaxConfig::default(), &locked);
+        assert!(!tmp.exists(), "锁定态不得创建/改写配置文件");
+        // 播放状态维度同口径
+        let ptmp = std::env::temp_dir().join("tuneux_max_test_save_locked_playlist.toml");
+        let _ = std::fs::remove_file(&ptmp);
+        atomic_write_if_unlocked(&ptmp, &tuneux_mediax::PlaylistState::default(), &locked);
+        assert!(!ptmp.exists(), "锁定态不得创建/改写播放状态文件");
+        // 未置位时正常落盘
+        locked.store(false, Ordering::SeqCst);
+        atomic_write_if_unlocked(&tmp, &MaxConfig::default(), &locked);
+        assert!(tmp.exists(), "未锁定应正常落盘");
+        let _ = std::fs::remove_file(&tmp);
     }
 }

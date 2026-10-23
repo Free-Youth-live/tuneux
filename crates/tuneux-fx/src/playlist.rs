@@ -178,6 +178,16 @@ impl Playlist {
         self.core.is_shuffle()
     }
 
+    /// 随机模式（转发 PlaylistCore）。
+    pub fn shuffle_mode(&self) -> tuneux_mediax::ShuffleMode {
+        self.core.shuffle_mode()
+    }
+
+    /// 设定随机模式（转发）。
+    pub fn set_shuffle_mode(&mut self, mode: tuneux_mediax::ShuffleMode) {
+        self.core.set_shuffle_mode(mode);
+    }
+
     /// 切换随机模式。
     pub fn set_shuffle(&mut self, on: bool) {
         self.core.set_shuffle(on);

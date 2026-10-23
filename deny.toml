@@ -14,13 +14,24 @@
 # unmaintained/unsound 用 Scope（all/workspace/transitive/none）：检查全部依赖
 unmaintained = "all"
 unsound = "all"
-# yanked：警告即可
-yanked = "warn"
+# yanked：硬拒绝——发布链路不放过已撤回版本；ci.yml 已加周度定时全量
+# 核查，撤回/漏洞不等人推送才被发现
+yanked = "deny"
 # 白名单豁免（逐条登记理由，跟踪上游动态，可移除时即移除）：
 # - RUSTSEC-2026-0192（ttf-parser 作者声明不再维护）：egui 字体解析栈
 #  （epaint → ab_glyph）的传递依赖，无已知漏洞、仅维护状态声明，
 #   GUI 生态暂无替代；漏洞类（vulnerability）仍硬拒绝不受此影响。
-ignore = ["RUSTSEC-2026-0192"]
+# - RUSTSEC-2026-0370 / 0371 / 0372（zvariant / zbus_names / zvariant_derive
+#   作者已停止独立维护，并回 zbus 6 的 wire/names 模块）：egui 无障碍链
+#  （eframe → accesskit → atspi-common）的传递依赖，无已知漏洞、仅
+#   维护状态声明；上游 accesskit 迁移 zbus 6 前无升级路径，迁完即删
+#   本三条例外（2026-10-20 依赖通告例行核查加入）。
+ignore = [
+    "RUSTSEC-2026-0192",
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
+]
 
 [licenses]
 # 白名单：MulanPSL-2.0 自身 + 依赖常见宽松许可；MPL-2.0 为 symphonia（兼容）

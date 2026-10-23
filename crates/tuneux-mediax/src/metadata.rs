@@ -68,6 +68,18 @@ pub enum ChannelsDisplay {
     Unknown,
 }
 
+/// 采样率 kHz 格式化（如 44100 → "44.1 kHz"，352800 → "352.8 kHz"）。
+/// 引擎实测回落路径与 [`TrackMetadata::sample_rate_label`] 共用本函数——
+/// 三端技术参数行的采样率格式单一来源（元数据与引擎回落同格式）。
+pub fn sample_rate_khz_label(rate: u32) -> String {
+    let khz = rate as f64 / 1000.0;
+    if (khz.fract()).abs() < 1e-3 {
+        format!("{khz:.0} kHz")
+    } else {
+        format!("{khz:.1} kHz")
+    }
+}
+
 /// 一首曲目的完整元数据（标签 + 技术参数）。
 ///
 /// 字符串字段用 `Option<String>`：None 表示该标签缺失（如现场录音可能无专辑名），
@@ -277,15 +289,7 @@ impl TrackMetadata {
     /// 采样率格式化（如 "44.1 kHz"、"48 kHz"），未知返回 "未知"。
     pub fn sample_rate_label(&self) -> String {
         match self.sample_rate {
-            Some(sr) => {
-                // 44100 → "44.1 kHz"，48000 → "48 kHz"
-                let khz = sr as f64 / 1000.0;
-                if (khz.fract()).abs() < 1e-3 {
-                    format!("{:.0} kHz", khz)
-                } else {
-                    format!("{:.1} kHz", khz)
-                }
-            }
+            Some(sr) => sample_rate_khz_label(sr),
             None => "未知".to_string(),
         }
     }
@@ -315,6 +319,72 @@ impl TrackMetadata {
             Some(n) => format!("{n} 声道"),
             None => "未知".to_string(),
         }
+    }
+
+    /// 引擎回落（纯函数口径）：FFmpeg 长尾曲目的文件探测只有兜底记录
+    ///（技术字段全 None），用后端 open 实测的源参数补齐 codec / 采样率 /
+    /// 声道 / 位深 / 时长。已有值不覆盖（元数据优先）；码率无引擎侧
+    /// 来源不补（保持元数据单源）。与 max 属性弹窗同一语义。
+    pub fn overlay_engine_params(
+        mut self,
+        codec: Option<String>,
+        rate: Option<u32>,
+        channels: Option<u16>,
+        bits: Option<u32>,
+        duration: Option<f64>,
+    ) -> Self {
+        self.codec = self.codec.or(codec);
+        self.sample_rate = self.sample_rate.or(rate);
+        self.channels = self.channels.or(channels);
+        self.bits_per_sample = self.bits_per_sample.or(bits);
+        self.duration = self.duration.or(duration);
+        self
+    }
+
+    /// 引擎回落便捷封装：以引擎实测源参数快照（后端 open 时的
+    /// `AudioParams`）补缺（字段语义见 [`Self::overlay_engine_params`]；
+    /// 时长仅取有效正值）；无快照时原样返回。TUI 双端属性弹窗共用
+    /// 本入口，避免回落逻辑双份实现。
+    pub fn overlaid_with_engine_params(self, params: Option<AudioParams>) -> Self {
+        let Some(p) = params else {
+            return self;
+        };
+        self.overlay_engine_params(
+            Some(p.codec_name),
+            p.sample_rate,
+            p.channels,
+            p.bits_per_sample,
+            p.duration.filter(|d| *d > 0.0),
+        )
+    }
+
+    /// 技术参数行文本（编码 · 码率 · 采样率 · 位深）：元数据优先，
+    /// 缺失段回落引擎实测源参数（FFmpeg 长尾格式探测为空时仍显示真实
+    /// 参数）；引擎侧也无值时维持原降级文案。码率无引擎侧来源不补。
+    /// `unknown_format` 为编码名缺失时的本地化占位（如 i18n
+    /// `msg.unknown_format`）。tuneux / tuneux-fx 双端共用本函数，
+    /// 保证回落口径一致。
+    pub fn tech_line_with_engine(
+        &self,
+        eng_codec: Option<&str>,
+        eng_rate: Option<u32>,
+        eng_bits: Option<u32>,
+        unknown_format: &str,
+    ) -> String {
+        let codec = self
+            .codec
+            .as_deref()
+            .or(eng_codec)
+            .unwrap_or(unknown_format);
+        let rate = match self.sample_rate.or(eng_rate) {
+            Some(r) => sample_rate_khz_label(r),
+            None => self.sample_rate_label(),
+        };
+        let bits = match self.bits_per_sample.or(eng_bits) {
+            Some(b) => format!("{b} bit"),
+            None => self.bits_label(),
+        };
+        format!("{} · {} · {} · {}", codec, self.bitrate_label(), rate, bits)
     }
     /// 采样率语义标签（产品据此本地化，替代 *_label 的中文硬编码）。
     #[cfg(test)]
@@ -447,6 +517,104 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(md.tech_summary(), "MP3 · 320 kbps · 44.1 kHz · 立体声");
+    }
+
+    /// kHz 格式单一来源：DSD→PCM 出口率 352800 应为 "352.8 kHz"
+    ///（与 sample_rate_label 同格式，引擎回落路径复用）。
+    #[test]
+    fn sample_rate_khz_label_formats() {
+        assert_eq!(sample_rate_khz_label(44_100), "44.1 kHz");
+        assert_eq!(sample_rate_khz_label(48_000), "48 kHz");
+        assert_eq!(sample_rate_khz_label(352_800), "352.8 kHz");
+        assert_eq!(sample_rate_khz_label(2_822_400), "2822.4 kHz");
+    }
+
+    /// 引擎回落：缺失字段补齐、已有字段不覆盖（元数据优先于引擎实测）。
+    #[test]
+    fn overlay_engine_params_fills_missing_keeps_existing() {
+        let md = TrackMetadata {
+            sample_rate: Some(44_100),
+            ..Default::default()
+        };
+        let out = md.overlay_engine_params(
+            Some("dsd_lsbf_planar".into()),
+            Some(352_800),
+            Some(2),
+            Some(32),
+            Some(10.0),
+        );
+        assert_eq!(out.codec.as_deref(), Some("dsd_lsbf_planar"));
+        assert_eq!(out.channels, Some(2));
+        assert_eq!(out.bits_per_sample, Some(32));
+        assert_eq!(out.duration, Some(10.0));
+        assert_eq!(out.sample_rate, Some(44_100), "已有字段不被覆盖");
+        // 引擎全空时为 no-op
+        let md = TrackMetadata {
+            title: Some("x".into()),
+            ..Default::default()
+        };
+        let out = md.overlay_engine_params(None, None, None, None, None);
+        assert_eq!(out.codec, None);
+        assert_eq!(out.title.as_deref(), Some("x"));
+    }
+
+    /// AudioParams 快照回落：整包字段映射、非正时长滤除、无快照原样返回。
+    #[test]
+    fn overlaid_with_engine_params_maps_fields() {
+        let p = AudioParams::new(
+            Some(352_800),
+            Some(2),
+            Some(32),
+            "dts".into(),
+            0,
+            Some(12.5),
+        );
+        let out = TrackMetadata::default().overlaid_with_engine_params(Some(p));
+        assert_eq!(out.codec.as_deref(), Some("dts"));
+        assert_eq!(out.sample_rate, Some(352_800));
+        assert_eq!(out.duration, Some(12.5));
+        // 零时长不补（与 max 属性弹窗 >0.0 口径一致）
+        let p = AudioParams::new(None, None, None, "x".into(), 0, Some(0.0));
+        let out = TrackMetadata::default().overlaid_with_engine_params(Some(p));
+        assert_eq!(out.duration, None);
+        // 无快照：no-op
+        let md = TrackMetadata {
+            title: Some("t".into()),
+            ..Default::default()
+        };
+        let out = md.overlaid_with_engine_params(None);
+        assert_eq!(out.title.as_deref(), Some("t"));
+        assert_eq!(out.codec, None);
+    }
+
+    /// 技术行回落：元数据缺失段用引擎实测值；码率保持元数据单源；
+    /// 引擎也缺时维持原降级文案。
+    #[test]
+    fn tech_line_engine_fallback() {
+        // FFmpeg 长尾兜底记录（全 None）→ 引擎实测值补齐
+        let md = TrackMetadata::default();
+        assert_eq!(
+            md.tech_line_with_engine(Some("dts"), Some(96_000), Some(32), "未知格式"),
+            "dts · 未知 · 96 kHz · 32 bit"
+        );
+        // 元数据优先：已有字段不被引擎值覆盖
+        let md = TrackMetadata {
+            codec: Some("FLAC".into()),
+            bitrate: Some(900_000),
+            sample_rate: Some(44_100),
+            bits_per_sample: Some(16),
+            ..Default::default()
+        };
+        assert_eq!(
+            md.tech_line_with_engine(Some("dts"), Some(96_000), Some(32), "未知格式"),
+            "FLAC · 900 kbps · 44.1 kHz · 16 bit"
+        );
+        // 双缺：维持原降级文案（有损 = 位深未知语义）
+        let md = TrackMetadata::default();
+        assert_eq!(
+            md.tech_line_with_engine(None, None, None, "未知格式"),
+            "未知格式 · 未知 · 未知 · 有损"
+        );
     }
 
     #[test]

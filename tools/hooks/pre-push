@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 # =============================================================================
-# tuneux · pre-push 检查钩子 v3.2（源码入库：tools/hooks/pre-push）
+# tuneux · pre-push 检查钩子 v3.3（源码入库：tools/hooks/pre-push）
+#
+# v3.3（2026-10-13）相对 v3.2 的变更：
+#   1. R5 改为对「被推树」执法：临时 worktree 检出待推 main 提交跑
+#      tools/guard.sh，堵「提交违规改动→工作区改回→工作树全绿→推送
+#      通过」的绕过面；本地未提交改动不再影响推送判定（执法对象是推送
+#      内容本身）；需要检查工作树时手动跑 guard.sh 即可；
+#   2. R2b 去掉 fail-open 的 `2>/dev/null || true`：diff-tree 失败即拒推
+#      （失败关闭），并补 --root 覆盖根提交；
 #
 # v3.2（2026-10-09）相对 v3.1 的变更：
 #   1. R2b 二进制资产冻结：ttf/otf/woff(2)/icns/ico 禁就地修改（M），
@@ -32,7 +40,7 @@
 #       扫描失败（退出码 ≥2）拒推（失败关闭）
 #   R3  推送范围内每个新提交的树路径：全部命中白名单（default-deny）
 #   R4  推送范围内 commit message：铁证词零命中
-#   R5（v3）工作树治理：tools/guard.sh 全过
+#   R5（v3.3）被推树治理：临时 worktree 检出待推 main 提交，跑 tools/guard.sh 全过
 #
 # 主防线是纪律（开发分支永不推送 + squash 发布），本钩子是机器化第二道保险。
 # =============================================================================
@@ -81,11 +89,15 @@ scan_commit() { # scan_commit <sha>：R2 + R2b + R3（退出码：0=命中/违�
   # R2b（2026-10-09）二进制资产冻结：ttf/otf/woff(2)/icns/ico 只许首入(A)与
   # 删除(D)，禁就地修改(M)——git 对二进制无增量，每改一次全量进历史。
   # 换版本 = 新文件名（建议含版本号）+ 删旧文件；纪律细则见 006 二进制资产冻结节。
-  hits=$(git diff-tree --no-commit-id --name-status -r "$c" -- \
-    '*.ttf' '*.otf' '*.woff' '*.woff2' '*.icns' '*.ico' 2>/dev/null | grep -E '^M' || true)
-  if [ -n "$hits" ]; then
+  # v3.3：去掉 fail-open 的 `2>/dev/null || true`，diff-tree 失败即拒推
+  # （失败关闭）；--root 让根提交也出全量 diff（首入按 A 计，不误伤）。
+  hits=$(git diff-tree --root --no-commit-id --name-status -r "$c" -- \
+    '*.ttf' '*.otf' '*.woff' '*.woff2' '*.icns' '*.ico'); rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "❌ [$c] 二进制资产扫描失败（git diff-tree 错误码 $rc）——失败关闭"; fail=1
+  elif mods=$(printf '%s\n' "$hits" | grep -E '^M'); then
     echo "❌ [$c] 就地修改了已入库的二进制资产（冻结纪律：换版本=新文件名+删旧文件）："
-    echo "$hits" | head -5; fail=1
+    printf '%s\n' "$mods" | head -5; fail=1
   fi
   # R3 路径白名单（先取树再过滤：pipefail 会把 ls-tree 失败掩成「干净」，必须分开判）
   tree=$(git -c core.quotePath=false ls-tree -r --name-only "$c"); rc=$?
@@ -116,19 +128,37 @@ scan_messages() { # scan_messages <range…>：R4 commit message（铁证词，�
   fi
 }
 
-# —— R5 治理接线：工作树 guard 全过才允许推送（失败关闭）——
-if [ -f "$ROOT/tools/guard.sh" ]; then
-  if ! bash "$ROOT/tools/guard.sh"; then
-    echo "❌ 分层守卫未通过（R5），拒推"; fail=1
+# —— R5（v3.3）治理接线：对「被推树」跑分层守卫（失败关闭）——
+# 工作树检查存在「提交违规改动→工作区改回→全绿放行」的绕过面（推送的
+# 是提交树，不是工作树）；改为临时 worktree 检出待推提交，对该树全量
+# 执法。worktree 用后即删；guard 在检出树内用其自带的 tools/guard.sh。
+# 需要检查本地未提交改动时，手动跑 bash tools/guard.sh 即可。
+r5_tree_guard() { # r5_tree_guard <sha>：待推树上跑 guard.sh，不过即返回 1
+  local sha="$1" wt
+  wt="$(mktemp -d "${TMPDIR:-/tmp}/tuneux-pushguard.XXXXXX")" || {
+    echo "❌ [R5] 临时目录创建失败——失败关闭"; return 1; }
+  if ! git worktree add --quiet --detach "$wt" "$sha" >/dev/null 2>&1; then
+    echo "❌ [R5] 待推树检出失败（$sha）——失败关闭"
+    rm -rf "$wt"; return 1
   fi
-else
-  echo "❌ tools/guard.sh 缺失（治理脚本必须在仓），拒推"; fail=1
-fi
+  if [ ! -f "$wt/tools/guard.sh" ]; then
+    echo "❌ [R5] 待推树缺少 tools/guard.sh（治理脚本必须在仓）"
+    git worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "$wt"; return 1
+  fi
+  if ! (cd "$wt" && bash tools/guard.sh); then
+    echo "❌ 分层守卫未通过（R5·被推树 $sha）"
+    git worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "$wt"; return 1
+  fi
+  git worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "$wt"
+  return 0
+}
 
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ "$local_sha" = "$ZERO" ] && continue          # 删除远程引用：放行
   case "$local_ref" in
-    refs/heads/main) ;;                            # R1 白名单：唯一允许推送的分支
+    refs/heads/main)                              # R1 白名单：唯一允许推送的分支
+      r5_tree_guard "$local_sha" || fail=1        # R5（v3.3）：对被推树执法
+      ;;
     refs/heads/*)                                  # 其余分支一律本地（含 fx-dev 及将来的新分支）
       echo "❌ 只允许推送 main；开发分支（${local_ref}）禁止推送任何远程"; fail=1; continue ;;
     refs/tags/*)                                   # R1b：tag 只允许指向 main 已发布的提交

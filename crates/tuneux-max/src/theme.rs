@@ -6,9 +6,10 @@
 //! 纪律：调色板是唯一色彩来源——渲染层只读 Palette 字段取色，
 //! 不得私藏硬编码色（语义阈值色 level_* 也入板）。
 //!
-//! 字体：内置文泉驿微米黑等宽面（assets/wqy-microhei-mono.ttf）作
-//! CJK 主回退，系统字体二级回退；Proportional / Monospace 两族都挂
-//! （egui 默认只带拉丁字体，不挂 CJK 回退中文全是豆腐块）。
+//! 字体：内置 Sarasa Mono SC（assets/SarasaMonoSC-Regular.ttf，
+//! v1.0.42 官方原件，OFL）作主字体，系统字体二级回退；Proportional /
+//! Monospace 两族都挂（egui 默认只带拉丁字体，不挂 CJK 回退中文全是
+//! 豆腐块）。用户可向 fonts/ 目录投放自定义字体，经字体菜单切换。
 
 use eframe::egui::{self, Color32, CornerRadius, Stroke};
 
@@ -147,17 +148,38 @@ pub fn builtin(id: &str) -> Option<Palette> {
             bar_style: tuneux_mediax::BarStyle::Blocks,
             tui_chrome: false,
         }),
+        // 科技深色（2026-10-09 第一批）：电光青强调 + 冷灰蓝底。
+        "tech-dark" => Some(Palette {
+            bg: Color32::from_rgb(26, 29, 36),
+            panel_bg: Color32::from_rgb(20, 22, 28),
+            fg: Color32::from_rgb(220, 224, 232),
+            fg_weak: Color32::from_rgb(107, 114, 128),
+            accent: Color32::from_rgb(0, 212, 255),
+            sel_bg: Color32::from_rgb(0, 45, 68),
+            border: Color32::from_rgb(42, 46, 56),
+            grid: Color32::from_rgb(38, 42, 52),
+            spec_bar: Color32::from_rgb(0, 180, 220),
+            peak_fg: Color32::WHITE,
+            pass_fg: Color32::from_rgb(144, 238, 144),
+            resample_fg: Color32::from_rgb(80, 86, 96),
+            level_low: Color32::from_rgb(0, 200, 100),
+            level_mid: Color32::from_rgb(255, 179, 0),
+            level_high: Color32::from_rgb(255, 61, 61),
+            bar_style: tuneux_mediax::BarStyle::Matrix,
+            tui_chrome: false,
+        }),
         _ => None,
     }
 }
 
 /// 内置主题目录（id, 显示名）——皮肤选择菜单用；显示名为专名不译。
-pub fn builtin_list() -> [(&'static str, &'static str); 4] {
+pub fn builtin_list() -> [(&'static str, &'static str); 5] {
     [
         ("dos", "fx DOS"),
         ("term", "Terminal"),
         ("f2k", "f2k 暗色"),
         ("f2k-light", "f2k 经典浅色"),
+        ("tech-dark", "科技深色"),
     ]
 }
 
@@ -167,7 +189,7 @@ pub fn builtin_list() -> [(&'static str, &'static str); 4] {
 pub fn default_modules(id: &str) -> &'static [(&'static str, bool)] {
     match id {
         // f2k 双肤同默认集：现代 GUI 结构模块全开
-        "f2k" | "f2k-light" => &[
+        "f2k" | "f2k-light" | "tech-dark" => &[
             ("transport", true),
             ("col_header", true),
             ("status_tech", true),
@@ -307,11 +329,13 @@ pub fn apply_visuals(ctx: &egui::Context, pal: &Palette) {
     ctx.set_visuals(v);
 }
 
-/// 内置中文字体：文泉驿微米黑等宽面（WenQuanYi Micro Hei Mono）。
-pub static EMBEDDED_CJK_FONT: &[u8] = include_bytes!("../assets/wqy-microhei-mono.ttf");
+/// 内置主字体：Sarasa Mono SC Regular（更纱黑体·等宽简体）。
+/// v1.0.42 官方发布原件（SHA-256 82e09460f6f55010…，24.4MB 未子集化）；
+/// 拉丁出自 Iosevka、CJK 出自思源黑体，半角/全角宽度严格 2:1。
+pub static EMBEDDED_CJK_FONT: &[u8] = include_bytes!("../assets/SarasaMonoSC-Regular.ttf");
 
 /// 内置字体的显示名。
-pub const EMBEDDED_FONT_NAME: &str = "文泉驿等宽微米黑";
+pub const EMBEDDED_FONT_NAME: &str = "Sarasa Mono SC";
 
 /// 一个可用字体（显示名 + 字体文件字节）。
 pub struct FontEntry {
@@ -337,7 +361,7 @@ fn font_dirs() -> Vec<std::path::PathBuf> {
     dirs
 }
 
-/// 字体目录：内置文泉驿恒在首位，随后是 fonts/ 目录扫描结果（按名排序）。
+/// 字体目录：内置 Sarasa Mono SC 恒在首位，随后是 fonts/ 目录扫描结果（按名排序）。
 /// 损坏 / 不可读的文件静默跳过（字体缺失不致命，回退内置）。
 pub fn font_catalog() -> Vec<FontEntry> {
     let mut out = vec![FontEntry {
@@ -383,15 +407,16 @@ pub fn build_fonts_with(data: &[u8]) -> egui::FontDefinitions {
     );
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         let list = defs.families.entry(family).or_default();
+        // app-cjk = 当前主字体槽位名；wqy-cjk 为旧内置名的遗留防御性过滤
         list.retain(|n| n != "app-cjk" && n != "wqy-cjk");
         list.insert(0, "app-cjk".to_owned());
     }
     defs
 }
 
-/// 构建字体定义：文泉驿微米黑等宽面为两族**主字体**，内置面退居回退。
+/// 构建字体定义：Sarasa Mono SC 为两族**主字体**，系统面退居回退。
 ///
-/// 主副次序是列对齐的关键：全部字形（拉丁 + CJK）统一出自文泉驿等宽面，
+/// 主副次序是列对齐的关键：全部字形（拉丁 + CJK）统一出自更纱等宽面，
 /// 其 CJK 字宽 = 2×拉丁字宽严格成立，按显示宽度补空格的列才能像素级对齐
 /// （真 TUI 规整感）。若拉丁走 Hack、CJK 走回退，两面字宽比不是精确 2:1，
 /// 混排行必然错位——spike 期实测踩坑，勿回退主副次序。
@@ -417,7 +442,7 @@ mod tests {
 
     #[test]
     fn all_builtin_ids_resolve() {
-        for id in ["dos", "term", "f2k", "f2k-light"] {
+        for id in ["dos", "term", "f2k", "f2k-light", "tech-dark"] {
             assert!(builtin(id).is_some(), "内置主题 {id} 应可解析");
         }
         // 亮色皮肤亮度走 light 分支（apply_visuals 前置条件自检）
@@ -433,9 +458,10 @@ mod tests {
         assert!(builtin("no-such-theme").is_none());
     }
 
-    /// 字体链：文泉驿必须是两族主字体（列对齐的根基）。
+    /// 字体链：内置 Sarasa Mono SC（槽位名 app-cjk）必须是两族主字体
+    ///（列对齐的根基——半角/全角 2:1）。
     #[test]
-    fn font_chain_wqy_is_primary() {
+    fn font_chain_builtin_is_primary() {
         let defs = build_fonts();
         for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
             let list = &defs.families[&family];

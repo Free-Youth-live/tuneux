@@ -104,6 +104,13 @@ pub struct PlaybackStatus {
     pub medium: PlaybackMedium,
     /// 是否原生采样率直通（无重采样；DSP 仍生效，非 bit-perfect）。
     pub bitstream: bool,
+    /// 当前曲目源参数（后端 open 实测）：采样率 Hz。元数据探测缺失时
+    /// （FFmpeg 长尾格式）UI 技术参数行回落显示此值。
+    pub src_sample_rate: Option<u32>,
+    /// 源声道数（2 = 立体声）。
+    pub src_channels: Option<u16>,
+    /// 源位深（如 16/24/32）。
+    pub src_bits: Option<u32>,
 }
 
 /// 主线程 → 音频线程 的控制命令。
@@ -264,6 +271,12 @@ pub(super) struct SharedState {
     /// false=降级（设备不支持文件采样率，走 rubato 软件重采样）。
     /// 音频线程换曲时设置，主线程读取用于 UI：直通时技术参数行亮色，降级暗色。
     bitstream: AtomicBool,
+    /// 当前曲目源参数快照：后端 open 成功后由解码线程写入（实测值）。
+    /// UI 技术参数行在元数据探测缺失时回落显示——FFmpeg 长尾格式在
+    /// 文件探测层返回 None，真实参数只有解码后端知道（否则该行空白）。
+    /// 锁只被解码线程（换曲瞬间）与主线程（status 读取）触碰，不进
+    /// 实时回调路径。
+    src_params: Mutex<Option<crate::audio::codec::decoder::AudioParams>>,
     /// 当前播放介质风格（判别值存 u32，见 `playback_medium::PlaybackMedium`）。
     /// 主线程设置（切换介质），音频回调读取后分发到对应效果器。
     medium: AtomicU32,
@@ -305,6 +318,7 @@ impl Default for SharedState {
             stream_channels: AtomicU32::new(0),
             stream_format: AtomicU8::new(0),
             bitstream: AtomicBool::new(false),
+            src_params: Mutex::new(None),
             medium: AtomicU32::new(PlaybackMedium::None.discriminant()),
             filter_slots: std::array::from_fn(|_| {
                 std::sync::Arc::new(self::filter::FilterParams::default())
@@ -541,6 +555,18 @@ impl SharedState {
     pub(super) fn bitstream(&self) -> bool {
         self.bitstream.load(Ordering::Relaxed)
     }
+
+    /// 写入/清除源参数快照（换曲时解码线程调用；None = 无有效源）。
+    pub(super) fn set_src_params(&self, p: Option<crate::audio::codec::decoder::AudioParams>) {
+        if let Ok(mut g) = self.src_params.lock() {
+            *g = p;
+        }
+    }
+
+    /// 读源参数快照（主线程 status() 用；克隆小结构，短锁）。
+    pub(super) fn src_params(&self) -> Option<crate::audio::codec::decoder::AudioParams> {
+        self.src_params.lock().ok().and_then(|g| g.clone())
+    }
     /// 设置当前播放介质风格（主线程调用）。
     pub(super) fn set_medium(&self, medium: PlaybackMedium) {
         self.medium.store(medium.discriminant(), Ordering::Relaxed);
@@ -717,6 +743,7 @@ impl Engine {
     /// 消除三端各自多次读原子量的竞态窗口（读 position 后 duration 已变），
     /// 同时减少每帧原子读次数。position 为原始累计帧数换算，无平滑。
     pub fn status(&self) -> PlaybackStatus {
+        let src = self.state.src_params();
         PlaybackStatus {
             position: self.position(),
             duration: self.duration(),
@@ -724,7 +751,24 @@ impl Engine {
             at_eof: self.at_eof(),
             medium: self.medium(),
             bitstream: self.bitstream(),
+            src_sample_rate: src.as_ref().and_then(|p| p.sample_rate),
+            src_channels: src.as_ref().and_then(|p| p.channels),
+            src_bits: src.as_ref().and_then(|p| p.bits_per_sample),
         }
+    }
+
+    /// 当前曲目源编码名（如 "FLAC" / "dsd_lsbf_planar"）；无有效源为 None。
+    /// 与 `status()` 分设：PlaybackStatus 保持 Copy（全 Copy 字段），
+    /// String 走单独访问器。
+    pub fn src_codec(&self) -> Option<String> {
+        self.state.src_params().map(|p| p.codec_name)
+    }
+
+    /// 当前曲目源参数完整快照（后端 open 实测的 `AudioParams` 克隆）；
+    /// 无有效源为 None。UI 属性弹窗引擎回落用（时长等字段在
+    /// PlaybackStatus 之外，整包取走免逐字段加访问器）。
+    pub fn src_params(&self) -> Option<crate::audio::codec::decoder::AudioParams> {
+        self.state.src_params()
     }
 
     /// 枚举系统可用的音频输出设备名（当前设备在前）。

@@ -1,7 +1,8 @@
 //! # 弹窗绘制
 //!
 //! 覆盖在主界面之上的弹窗组件：关于（draw_about，? 键唤起，任意键关闭）、
-//! 均衡器（draw_equalizer）、压缩器（draw_compressor）。
+//! 均衡器（draw_equalizer）、压缩器（draw_compressor）、皮肤/语言选择器、
+//! 属性、快捷键一览（菜单表生成）、书签列表、插件管理页。
 
 use ratatui::{
     layout::{Alignment, Rect},
@@ -486,4 +487,315 @@ pub(super) fn draw_lang_picker(frame: &mut ratatui::Frame, area: Rect, app: &App
             },
         );
     }
+}
+
+/// 按 unicode 显示宽截断（CJK 算 2 列）。
+fn trunc_w(s: &str, w: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if used + cw > w.saturating_sub(1) {
+            out.push('…');
+            return out;
+        }
+        out.push(ch);
+        used += cw;
+    }
+    out
+}
+
+/// 当前曲目属性弹窗（i / Alt+Enter）：标签 + 技术参数 + 路径。
+pub(super) fn draw_properties(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    app: &crate::tui::app::App,
+    pal: &Palette,
+) {
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Borders, Paragraph};
+    let box_w = area.width.min(64);
+    let box_h = area.height.min(15);
+    let box_area = Rect {
+        x: area.x + (area.width.saturating_sub(box_w)) / 2,
+        y: area.y + (area.height.saturating_sub(box_h)) / 2,
+        width: box_w,
+        height: box_h,
+    };
+    frame.render_widget(ratatui::widgets::Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(pal.border_type)
+        .border_style(ratatui::style::Style::default().fg(pal.border.unwrap_or(Color::Cyan)))
+        .title(format!(" {} ", app.i18n.t("popup.properties")));
+    let inner = block.inner(box_area);
+    frame.render_widget(block, box_area);
+
+    let i18n = &app.i18n;
+    let w = inner.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    // 引擎回落（与基础版 / max 同口径）：FFmpeg 长尾曲目的元数据兜底
+    // 记录缺技术字段时，以引擎实测源参数补缺。弹窗只针对当前播放曲目。
+    let src_params = app.engine.as_ref().and_then(|e| e.src_params());
+    let overlaid = match src_params {
+        Some(p) => app
+            .current_metadata
+            .clone()
+            .map(|md| md.overlaid_with_engine_params(Some(p))),
+        None => app.current_metadata.clone(),
+    };
+    match &overlaid {
+        None => lines.push(Line::styled(
+            i18n.t("msg.empty").into_owned(),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Some(md) => {
+            let unknown = |k: &str| i18n.t(k).into_owned();
+            lines.push(Line::styled(
+                trunc_w(
+                    &md.title
+                        .clone()
+                        .unwrap_or_else(|| unknown("metadata.unknown_title")),
+                    w,
+                ),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            lines.push(Line::from(Span::raw(format!(
+                "{}{}",
+                i18n.t("metadata.artist_label"),
+                trunc_w(
+                    &md.artist
+                        .clone()
+                        .unwrap_or_else(|| unknown("metadata.unknown_artist")),
+                    w
+                )
+            ))));
+            lines.push(Line::from(Span::raw(format!(
+                "{}{}",
+                i18n.t("metadata.album_label"),
+                trunc_w(
+                    &md.album
+                        .clone()
+                        .unwrap_or_else(|| unknown("metadata.unknown_album")),
+                    w
+                )
+            ))));
+            let tech = format!(
+                "{} {} · {} · {} · {} · {} {}",
+                i18n.t("prop.codec"),
+                md.codec.as_deref().unwrap_or(&i18n.t("msg.unknown_format")),
+                md.bitrate_label(),
+                md.sample_rate_label(),
+                md.bits_label(),
+                i18n.t("prop.channels"),
+                md.channels.unwrap_or(0),
+            );
+            lines.push(Line::styled(
+                trunc_w(&tech, w),
+                Style::default().fg(Color::DarkGray),
+            ));
+            let dur = md
+                .duration
+                .map(super::fmt_time)
+                .unwrap_or_else(|| "??:??".into());
+            lines.push(Line::styled(
+                format!("{}{}", i18n.t("prop.duration"), dur),
+                Style::default().fg(Color::DarkGray),
+            ));
+            if let Some(idx) = app.playlist.current_index() {
+                if let Some(it) = app.playlist.items().get(idx) {
+                    lines.push(Line::styled(
+                        format!(
+                            "{}{}",
+                            i18n.t("prop.path"),
+                            trunc_w(&it.path.display().to_string(), w)
+                        ),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+            }
+        }
+    }
+    lines.push(Line::styled(
+        i18n.t("about.close").into_owned(),
+        Style::default().fg(Color::DarkGray),
+    ));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// 快捷键一览弹窗：内容从菜单静态表生成（`menu::shortcut_rows`），
+/// 键位定义只有菜单表一处真相源，本弹窗不手写第二份清单。任意键关闭。
+pub(super) fn draw_shortcuts(frame: &mut ratatui::Frame, area: Rect, app: &App, pal: &Palette) {
+    let groups = crate::tui::app::menu::shortcut_rows();
+    let box_w = area.width.min(46);
+    let box_h = area.height.min(30);
+    let box_area = Rect {
+        x: area.x + (area.width.saturating_sub(box_w)) / 2,
+        y: area.y + (area.height.saturating_sub(box_h)) / 2,
+        width: box_w,
+        height: box_h,
+    };
+    draw_shadow(frame, box_area);
+    frame.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(pal.border_type)
+        .border_style(panel_border(pal, true))
+        .title(format!(" {} ", app.i18n.t("panel.shortcuts")))
+        .style(pal_style(None, pal.bg));
+    let inner = block.inner(box_area);
+    frame.render_widget(block, box_area);
+
+    let fg = pal_style(pal.fg, pal.bg);
+    let dim = fg.add_modifier(Modifier::DIM);
+    let accent = pal_style(pal.border, pal.bg).add_modifier(Modifier::BOLD);
+    let mut lines: Vec<Line> = Vec::new();
+    for (title_key, rows) in &groups {
+        lines.push(Line::from(Span::styled(
+            app.i18n.t(title_key).into_owned(),
+            accent,
+        )));
+        for (key, label_key) in rows {
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {key:>6}  "), fg),
+                Span::styled(app.i18n.t(label_key).into_owned(), fg),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        app.i18n.t("about.close").into_owned(),
+        dim,
+    )));
+    // 超高内容在小终端自然截断（Paragraph 不换行、超出裁剪）。
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// 书签列表弹窗：↑/↓ 选中、Enter 跳转、d 删除、Esc 关闭。
+pub(super) fn draw_bookmarks(frame: &mut ratatui::Frame, area: Rect, app: &App, pal: &Palette) {
+    let bms = &app.playlist_state.bookmarks.items;
+    let box_w = area.width.min(56);
+    let box_h = area.height.min((bms.len() as u16 + 4).max(6));
+    let box_area = Rect {
+        x: area.x + (area.width.saturating_sub(box_w)) / 2,
+        y: area.y + (area.height.saturating_sub(box_h)) / 2,
+        width: box_w,
+        height: box_h,
+    };
+    draw_shadow(frame, box_area);
+    frame.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(pal.border_type)
+        .border_style(panel_border(pal, true))
+        .title(format!(" {} ", app.i18n.t("panel.bookmarks")))
+        .style(pal_style(None, pal.bg));
+    let inner = block.inner(box_area);
+    frame.render_widget(block, box_area);
+
+    let fg = pal_style(pal.fg, pal.bg);
+    let dim = fg.add_modifier(Modifier::DIM);
+    let mut lines: Vec<Line> = Vec::new();
+    if bms.is_empty() {
+        lines.push(Line::from(Span::styled(
+            app.i18n.t("msg.bm_empty").into_owned(),
+            dim,
+        )));
+    } else {
+        let w = inner.width as usize;
+        for (i, b) in bms.iter().enumerate() {
+            let cursor = if i == app.bookmark_sel { "▶ " } else { "  " };
+            let text = trunc_w(
+                &format!("{cursor}{}: {} @ {:.0}s", i, b.label, b.position_secs),
+                w,
+            );
+            let st = if i == app.bookmark_sel {
+                fg.add_modifier(Modifier::REVERSED)
+            } else {
+                fg
+            };
+            lines.push(Line::from(Span::styled(text, st)));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        app.i18n.t("msg.bm_hint").into_owned(),
+        dim,
+    )));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// 插件管理页（只读）：plugins/ 目录扫描结果 + 类型 + 加载状态；
+/// 页内 u 重载已装插件、Esc 关闭。空态显示目录路径与装载方式提示。
+pub(super) fn draw_plugin_manager(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    app: &App,
+    pal: &Palette,
+) {
+    let box_w = area.width.min(64);
+    let box_h = area.height.min((app.plugin_rows.len() as u16 + 6).max(8));
+    let box_area = Rect {
+        x: area.x + (area.width.saturating_sub(box_w)) / 2,
+        y: area.y + (area.height.saturating_sub(box_h)) / 2,
+        width: box_w,
+        height: box_h,
+    };
+    draw_shadow(frame, box_area);
+    frame.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(pal.border_type)
+        .border_style(panel_border(pal, true))
+        .title(format!(" {} ", app.i18n.t("panel.plugin_mgr")))
+        .style(pal_style(None, pal.bg));
+    let inner = block.inner(box_area);
+    frame.render_widget(block, box_area);
+
+    let fg = pal_style(pal.fg, pal.bg);
+    let dim = fg.add_modifier(Modifier::DIM);
+    let accent = pal_style(pal.border, pal.bg);
+    let w = inner.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        trunc_w(
+            &app.i18n.t("msg.pm_dir").replace("{}", &app.plugin_dir_text),
+            w,
+        ),
+        dim,
+    )));
+    lines.push(Line::from(""));
+    if app.plugin_rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            app.i18n.t("msg.pm_empty").into_owned(),
+            fg,
+        )));
+    } else {
+        for row in &app.plugin_rows {
+            let state = if row.loaded {
+                app.i18n.t("msg.pm_loaded").into_owned()
+            } else {
+                app.i18n.t("msg.pm_not_loaded").into_owned()
+            };
+            let state_style = if row.loaded { accent } else { dim };
+            let text = trunc_w(
+                &format!("{}  [{}]", row.name, app.i18n.t(row.kind_key)),
+                w.saturating_sub(8),
+            );
+            lines.push(Line::from(vec![
+                Span::styled(text, fg),
+                Span::styled(format!("  {state}"), state_style),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        app.i18n.t("msg.pm_hint").into_owned(),
+        dim,
+    )));
+    frame.render_widget(Paragraph::new(lines), inner);
 }
