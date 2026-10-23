@@ -95,16 +95,19 @@ jobs:
         include:
           - os: ubuntu-latest
             name: linux-x86_64
-          - os: ubuntu-latest
-            name: linux-arm64
-            cc: "zig cc -target aarch64-linux-musl"
-            cross: "--arch=aarch64 --target-os=linux --enable-cross-compile"
-            strip: "true"
+          # linux-arm64 腿暂缓（2026-10-23）：zig cc 交叉的 C 编译器测试失败
+          #（"unable to create an executable file"），调通成本高；TUI 打包对
+          # 缺组件腿走软守卫（包内不带 ffmpeg，回退系统 PATH），已知限制同步
+          # 声明。修复路线归 T77：GitHub 原生 arm64 linux runner（免交叉）或 zig 调通。
           - os: macos-14
             name: macos-arm64
           - os: macos-14
             name: macos-x86_64
-            cross: "--arch=x86_64 --target-os=darwin --enable-cross-compile"
+            # --disable-asm：Apple clang 21 对 x86 内联汇编约束检查收紧，
+            # FFmpeg 9.0.2 的 mathops.h 内联汇编（"c" 约束）编译报错；
+            # 关闭全部汇编走 C 回退——本用途为纯音频解码，性能影响可忽略
+            #（x86asm 已禁，此处余下的是 C 内嵌 asm）。gcc 系（linux/win）不受影响。
+            cross: "--arch=x86_64 --target-os=darwin --enable-cross-compile --disable-asm"
           - os: windows-latest
             name: windows-x86_64
     env:
