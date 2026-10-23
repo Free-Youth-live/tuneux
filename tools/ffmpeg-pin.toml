@@ -20,7 +20,10 @@ asc_url = "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz.asc"
 
 # 构建配置（LGPL 纯度：不出现 --enable-gpl / --enable-nonfree）
 # 全量原生组件 + 禁外部库自动探测：许可合规由配置保证，不依赖构建机环境
+# --disable-x86asm：CI runner 不保证装 nasm/yasm（x86 汇编器），禁用后走
+# C 实现——本用途为纯音频解码，性能影响可忽略；也免去各平台装汇编器依赖
 configure_args = [
+    "--disable-x86asm",
     "--disable-network",
     "--disable-doc",
     "--disable-debug",
