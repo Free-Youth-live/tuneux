@@ -156,18 +156,17 @@ jobs:
           [ -n "$SRC" ] && cp "$SRC" ffmpeg-src.tar.xz || true
 
       - name: 上传组件
-        # 多路径声明：v4 以「全部路径的最小公共祖先」为包内根——三条子路径
-        # 的公共祖先 = ffmpeg-out，包内首层即 ffmpeg/。
-        # ⚠ 单路径（无论尾斜杠与否）一律按目录内容打包，丢失 ffmpeg/ 层级，
-        #   下游守卫按 ffmpeg-dist/ffmpeg 判定会全数落空（run 15/16 两次
-        #   实证：max 硬守卫全炸、TUI 软守卫静默缺件）。
+        # 扁平契约（run 15–17 三轮实证层级方案不可行）：upload-artifact v4 的包内根
+        # = 路径的「最小公共祖先」，单路径必剥掉末层目录、多路径的共同祖先
+        # 若就是该目录本身同样剥层——无法保留 ffmpeg/ 这一层。
+        # 故约定：artifact 内容 = ffmpeg 目录本身（bin/ licenses/ VERSIONS.txt
+        # 直接位于包根）。下载到 ffmpeg-dist 后，ffmpeg-dist 即 ffmpeg 目录，
+        # 消费方一律按「ffmpeg-dist/bin 存在」判定、把 ffmpeg-dist 整体拷为
+        # 包内 ffmpeg/。
         uses: actions/upload-artifact@v4
         with:
           name: ffmpeg-${{ matrix.name }}
-          path: |
-            ffmpeg-out/ffmpeg/bin
-            ffmpeg-out/ffmpeg/licenses
-            ffmpeg-out/ffmpeg/VERSIONS.txt
+          path: ffmpeg-out/ffmpeg/
 
       - name: 上传源码包（仅一处，发布附件用）
         if: matrix.name == 'linux-x86_64'
@@ -319,7 +318,7 @@ jobs:
           # 手册标题行注入版本号：__VERSION__ → 实际版本（来自 tag）
           sed -i.bak "s/__VERSION__/${VER}/" "pkg/tuneux/使用手册-tuneux.txt" && rm -f "pkg/tuneux/使用手册-tuneux.txt.bak"
           # FFmpeg 组件（主程序同目录 ffmpeg/；无组件平台跳过）
-          if [ -d ffmpeg-dist/ffmpeg ]; then cp -R ffmpeg-dist/ffmpeg pkg/tuneux/ffmpeg; fi
+          if [ -d ffmpeg-dist/bin ]; then cp -R ffmpeg-dist pkg/tuneux/ffmpeg; fi
           tar -czf "tuneux-${VER}-${{ matrix.name }}.tar.gz" -C pkg/tuneux .
 
           # 插件版：二进制 + 使用手册 + 插件开发指南 + plugins/ 插件目录
@@ -332,7 +331,7 @@ jobs:
           cp -R plugins pkg/tuneux-fx/plugins
           # 官方英文语言表（菜单「设置 → 语言」切换，即时生效）
           cp -R locales pkg/tuneux-fx/locales
-          if [ -d ffmpeg-dist/ffmpeg ]; then cp -R ffmpeg-dist/ffmpeg pkg/tuneux-fx/ffmpeg; fi
+          if [ -d ffmpeg-dist/bin ]; then cp -R ffmpeg-dist pkg/tuneux-fx/ffmpeg; fi
           tar -czf "tuneux-fx-${VER}-${{ matrix.name }}.tar.gz" -C pkg/tuneux-fx .
 
       - name: 打包（Windows）
@@ -352,7 +351,7 @@ jobs:
           Copy-Item -Recurse locales pkg/tuneux/locales
           $m = Get-Content "pkg/tuneux/使用手册-tuneux.txt" -Raw
           Set-Content "pkg/tuneux/使用手册-tuneux.txt" -Value ($m -replace '__VERSION__', $ver) -NoNewline -Encoding UTF8
-          if (Test-Path ffmpeg-dist/ffmpeg) { Copy-Item -Recurse ffmpeg-dist/ffmpeg pkg/tuneux/ffmpeg }
+          if (Test-Path ffmpeg-dist/bin) { Copy-Item -Recurse ffmpeg-dist pkg/tuneux/ffmpeg }
           Compress-Archive -Path pkg/tuneux/* -DestinationPath "tuneux-$ver-${{ matrix.name }}.zip"
 
           # 插件版：二进制 + 使用手册 + 插件开发指南 + plugins/ 插件目录
@@ -366,7 +365,7 @@ jobs:
           Copy-Item -Recurse plugins pkg/tuneux-fx/plugins
           # 官方英文语言表（菜单「设置 → 语言」切换，即时生效）
           Copy-Item -Recurse locales pkg/tuneux-fx/locales
-          if (Test-Path ffmpeg-dist/ffmpeg) { Copy-Item -Recurse ffmpeg-dist/ffmpeg pkg/tuneux-fx/ffmpeg }
+          if (Test-Path ffmpeg-dist/bin) { Copy-Item -Recurse ffmpeg-dist pkg/tuneux-fx/ffmpeg }
           Compress-Archive -Path pkg/tuneux-fx/* -DestinationPath "tuneux-fx-$ver-${{ matrix.name }}.zip"
 
       - name: 上传产物
@@ -445,10 +444,10 @@ jobs:
           VER="${TAG#v}"
           VER="${VER%%-*}"
           BIN="target/${{ matrix.target }}/release/tuneux-max"
-          [ -d ffmpeg-dist/ffmpeg ] || { echo "❌ 缺少 ffmpeg 组件，发布链不允许无组件打包"; exit 1; }
+          [ -d ffmpeg-dist/bin ] || { echo "❌ 缺少 ffmpeg 组件，发布链不允许无组件打包"; exit 1; }
           # 脚本产出 pkg/tuneux-max.app + 同级使用手册（版本号已在脚本内注入，
           # 两份同源同版：同级开箱可见，Resources 一份随 .app 单独流转）
-          bash tools/package-macos-app.sh "$BIN" "$VER" pkg "$PWD/ffmpeg-dist/ffmpeg"
+          bash tools/package-macos-app.sh "$BIN" "$VER" pkg "$PWD/ffmpeg-dist"
           # zip 外层包一层版本文件夹：.app 与使用手册同级（ditto 不支持
           # 多源归档，用 staging 文件夹实现；解压即「文件夹内 app+手册」）
           STAGE="pkg/stage/tuneux-max-${VER}-${{ matrix.name }}"
@@ -479,8 +478,8 @@ jobs:
           Copy-Item -Recurse plugins pkg/tuneux-max/plugins
           # FFmpeg 组件为发布链强制项（与 macOS 段同口径，缺件即失败）：
           # 长尾格式与视频音轨全靠它，静默缺件会产出「能装能跑但格式全废」的包。
-          if (-not (Test-Path ffmpeg-dist/ffmpeg)) { throw "缺少 ffmpeg 组件，发布链不允许无组件打包" }
-          Copy-Item -Recurse ffmpeg-dist/ffmpeg pkg/tuneux-max/ffmpeg
+          if (-not (Test-Path ffmpeg-dist/bin)) { throw "缺少 ffmpeg 组件，发布链不允许无组件打包" }
+          Copy-Item -Recurse ffmpeg-dist pkg/tuneux-max/ffmpeg
           Compress-Archive -Path pkg/tuneux-max/* -DestinationPath "tuneux-max-$ver-${{ matrix.name }}.zip"
 
       - name: 上传产物
