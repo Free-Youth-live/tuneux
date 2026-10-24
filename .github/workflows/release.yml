@@ -318,7 +318,7 @@ jobs:
           # 手册标题行注入版本号：__VERSION__ → 实际版本（来自 tag）
           sed -i.bak "s/__VERSION__/${VER}/" "pkg/tuneux/使用手册-tuneux.txt" && rm -f "pkg/tuneux/使用手册-tuneux.txt.bak"
           # FFmpeg 组件（主程序同目录 ffmpeg/；无组件平台跳过）
-          if [ -d ffmpeg-dist/bin ]; then cp -R ffmpeg-dist pkg/tuneux/ffmpeg; fi
+          if [ -d ffmpeg-dist/bin ]; then cp -R ffmpeg-dist pkg/tuneux/ffmpeg; chmod +x pkg/tuneux/ffmpeg/bin/*; fi
           tar -czf "tuneux-${VER}-${{ matrix.name }}.tar.gz" -C pkg/tuneux .
 
           # 插件版：二进制 + 使用手册 + 插件开发指南 + plugins/ 插件目录
@@ -331,7 +331,7 @@ jobs:
           cp -R plugins pkg/tuneux-fx/plugins
           # 官方英文语言表（菜单「设置 → 语言」切换，即时生效）
           cp -R locales pkg/tuneux-fx/locales
-          if [ -d ffmpeg-dist/bin ]; then cp -R ffmpeg-dist pkg/tuneux-fx/ffmpeg; fi
+          if [ -d ffmpeg-dist/bin ]; then cp -R ffmpeg-dist pkg/tuneux-fx/ffmpeg; chmod +x pkg/tuneux-fx/ffmpeg/bin/*; fi
           tar -czf "tuneux-fx-${VER}-${{ matrix.name }}.tar.gz" -C pkg/tuneux-fx .
 
       - name: 打包（Windows）

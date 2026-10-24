@@ -122,6 +122,10 @@ if [ -d "$FFMPEG_DIR" ] && [ -f "$FFMPEG_DIR/bin/ffmpeg" ]; then
   rm -rf "$APP/Contents/Resources/ffmpeg"
   mkdir -p "$APP/Contents/Resources"
   cp -R -L "$FFMPEG_DIR" "$APP/Contents/Resources/ffmpeg"
+  # download-artifact v4 不保留可执行位（run 18 实证 exit 126）：拷入后
+  # 显式补齐——下方闸门自检要执行它，随包分发的二进制更必须带执行位
+  chmod +x "$APP/Contents/Resources/ffmpeg/bin/ffmpeg" \
+           "$APP/Contents/Resources/ffmpeg/bin/ffprobe"
   FFV="$APP/Contents/Resources/ffmpeg/bin/ffmpeg"
   WANT_F="$(grep -E '^  ffmpeg  = ' "$FFMPEG_DIR/VERSIONS.txt" | awk '{print $3}')"
   WANT_P="$(grep -E '^  ffprobe = ' "$FFMPEG_DIR/VERSIONS.txt" | awk '{print $3}')"
