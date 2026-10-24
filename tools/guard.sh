@@ -34,7 +34,7 @@ assert_no_dep() {
   tree="$(cargo tree -p "$crate" --edges all 2>/dev/null)"
   rc=$?
   if [ $rc -ne 0 ] || [ -z "$tree" ]; then
-    echo "❌ 依赖断言无法执行：cargo tree -p $crate 失败（rc=$rc）——失败关闭，拒绝放行"
+    echo "❌ 依赖断言无法执行：cargo tree -p $crate 失败（rc=${rc}）——失败关闭，拒绝放行"
     fail=1
     return
   fi
@@ -137,7 +137,7 @@ while IFS= read -r f; do
   case "$f" in THIRD-PARTY-LICENSES*) continue ;; esac
   h=$(grep -IiE -e "$CONTENT_RE" -e "$SENS_RE" "$f" 2>/dev/null); rc=$?
   if [ $rc -ge 2 ]; then
-    echo "❌ 敏感词扫描失败：$f（grep 错误码 $rc）——失败关闭"
+    echo "❌ 敏感词扫描失败：$f（grep 错误码 ${rc}）——失败关闭"
     sens_fail=1; fail=1
   elif [ $rc -eq 0 ]; then
     sens_hits="${sens_hits}${f}: ${h}"$'\n'

@@ -75,14 +75,14 @@ scan_commit() { # scan_commit <sha>：R2 + R2b + R3（退出码：0=命中/违�
   # R2 内容黑名单（退出码 ≥2 必须拒推，不得静默放行）
   hits=$(git -c core.quotePath=false grep -IiE "$CONTENT_RE" "$c" -- .); rc=$?
   if [ $rc -ge 2 ]; then
-    echo "❌ [$c] 内容扫描失败（git grep 错误码 $rc）"; fail=1
+    echo "❌ [$c] 内容扫描失败（git grep 错误码 ${rc}）"; fail=1
   elif [ $rc -eq 0 ]; then
     echo "❌ [$c] 树内容含工具名/署名/AI 词/内部代号/禁用词："; echo "$hits" | head -5; fail=1
   fi
   # R2 敏感内容
   hits=$(git -c core.quotePath=false grep -IiE "$SENS_RE" "$c" -- .); rc=$?
   if [ $rc -ge 2 ]; then
-    echo "❌ [$c] 敏感内容扫描失败（git grep 错误码 $rc）"; fail=1
+    echo "❌ [$c] 敏感内容扫描失败（git grep 错误码 ${rc}）"; fail=1
   elif [ $rc -eq 0 ]; then
     echo "❌ [$c] 树内容含敏感信息（私钥/本机路径/旧种子名）："; echo "$hits" | head -5; fail=1
   fi
@@ -94,7 +94,7 @@ scan_commit() { # scan_commit <sha>：R2 + R2b + R3（退出码：0=命中/违�
   hits=$(git diff-tree --root --no-commit-id --name-status -r "$c" -- \
     '*.ttf' '*.otf' '*.woff' '*.woff2' '*.icns' '*.ico'); rc=$?
   if [ $rc -ne 0 ]; then
-    echo "❌ [$c] 二进制资产扫描失败（git diff-tree 错误码 $rc）——失败关闭"; fail=1
+    echo "❌ [$c] 二进制资产扫描失败（git diff-tree 错误码 ${rc}）——失败关闭"; fail=1
   elif mods=$(printf '%s\n' "$hits" | grep -E '^M'); then
     echo "❌ [$c] 就地修改了已入库的二进制资产（冻结纪律：换版本=新文件名+删旧文件）："
     printf '%s\n' "$mods" | head -5; fail=1
@@ -102,13 +102,13 @@ scan_commit() { # scan_commit <sha>：R2 + R2b + R3（退出码：0=命中/违�
   # R3 路径白名单（先取树再过滤：pipefail 会把 ls-tree 失败掩成「干净」，必须分开判）
   tree=$(git -c core.quotePath=false ls-tree -r --name-only "$c"); rc=$?
   if [ $rc -ge 2 ]; then
-    echo "❌ [$c] 路径扫描失败（ls-tree 错误码 $rc）"; fail=1
+    echo "❌ [$c] 路径扫描失败（ls-tree 错误码 ${rc}）"; fail=1
   elif [ -n "$tree" ]; then
     bad=$(printf '%s\n' "$tree" | grep -vE "$PATH_ALLOW"); rc=$?
     if [ $rc -eq 0 ]; then
       echo "❌ [$c] 含白名单之外的路径（新增合法路径请先更新本钩子）："; echo "$bad" | head -5; fail=1
     elif [ $rc -ge 2 ]; then
-      echo "❌ [$c] 路径过滤失败（grep 错误码 $rc）"; fail=1
+      echo "❌ [$c] 路径过滤失败（grep 错误码 ${rc}）"; fail=1
     fi
   fi
 }
@@ -117,14 +117,14 @@ scan_messages() { # scan_messages <range…>：R4 commit message（铁证词，�
   local hits rc
   hits=$(git log --format='%h %B' "$@" 2>/dev/null); rc=$?
   if [ $rc -ne 0 ]; then
-    echo "❌ message 扫描失败（git log 错误码 $rc）"; fail=1; return
+    echo "❌ message 扫描失败（git log 错误码 ${rc}）"; fail=1; return
   fi
   [ -z "$hits" ] && return
   hits=$(printf '%s\n' "$hits" | grep -iE "$MSG_RE"); rc=$?
   if [ $rc -eq 0 ]; then
     echo "❌ 推送范围内 commit message 含工具名/署名/AI 词/内部代号/禁用词："; echo "$hits" | head -5; fail=1
   elif [ $rc -ge 2 ]; then
-    echo "❌ message 过滤失败（grep 错误码 $rc）"; fail=1
+    echo "❌ message 过滤失败（grep 错误码 ${rc}）"; fail=1
   fi
 }
 
@@ -138,7 +138,7 @@ r5_tree_guard() { # r5_tree_guard <sha>：待推树上跑 guard.sh，不过即�
   wt="$(mktemp -d "${TMPDIR:-/tmp}/tuneux-pushguard.XXXXXX")" || {
     echo "❌ [R5] 临时目录创建失败——失败关闭"; return 1; }
   if ! git worktree add --quiet --detach "$wt" "$sha" >/dev/null 2>&1; then
-    echo "❌ [R5] 待推树检出失败（$sha）——失败关闭"
+    echo "❌ [R5] 待推树检出失败（${sha}）——失败关闭"
     rm -rf "$wt"; return 1
   fi
   if [ ! -f "$wt/tools/guard.sh" ]; then
@@ -146,7 +146,7 @@ r5_tree_guard() { # r5_tree_guard <sha>：待推树上跑 guard.sh，不过即�
     git worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "$wt"; return 1
   fi
   if ! (cd "$wt" && bash tools/guard.sh); then
-    echo "❌ 分层守卫未通过（R5·被推树 $sha）"
+    echo "❌ 分层守卫未通过（R5·被推树 ${sha}）"
     git worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "$wt"; return 1
   fi
   git worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "$wt"
