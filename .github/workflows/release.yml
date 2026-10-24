@@ -548,7 +548,11 @@ jobs:
               --title "不羁的青春（FreeYouth）" \
               --notes-file release-notes.md
           fi
-          gh release upload "$TAG" dist/*/* --clobber
+          # 按扩展名圈定发布资产：组件 artifact（扁平契约）的包内文件
+          # （VERSIONS.txt / bin / licenses）不能当资产——五份同名
+          # VERSIONS.txt 并发互撞即 404（run 19 实证）；发布资产只有
+          # 三产品的 tar.gz/zip，源码包由下方专用步骤上传
+          gh release upload "$TAG" dist/*/*.tar.gz dist/*/*.zip --clobber
           # LGPL 源码要约第一通道：官方同哈希源码包随 Release 提供
           if [ -f dist/ffmpeg-src/ffmpeg-*.tar.xz ]; then
             gh release upload "$TAG" dist/ffmpeg-src/ffmpeg-*.tar.xz --clobber
