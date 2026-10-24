@@ -156,10 +156,13 @@ jobs:
           [ -n "$SRC" ] && cp "$SRC" ffmpeg-src.tar.xz || true
 
       - name: 上传组件
+        # path 不带尾斜杠：v4 对「dir/」按目录内容打包（下载后丢失 ffmpeg/
+        # 这一层，下游守卫按 ffmpeg-dist/ffmpeg 判定会全数落空）；「dir」
+        # 保留层级（最小公共祖先 = ffmpeg-out，包内首层即 ffmpeg/）
         uses: actions/upload-artifact@v4
         with:
           name: ffmpeg-${{ matrix.name }}
-          path: ffmpeg-out/ffmpeg/
+          path: ffmpeg-out/ffmpeg
 
       - name: 上传源码包（仅一处，发布附件用）
         if: matrix.name == 'linux-x86_64'
