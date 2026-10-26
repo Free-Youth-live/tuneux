@@ -130,6 +130,22 @@ impl BiquadChannel {
         if cutoff == self.coef_cutoff && q == self.coef_q && sample_rate == self.coef_sr {
             return; // 系数未变，复用缓存
         }
+        // Nyquist bypass：截止频率接近或超过 Nyquist（0.95×sr/2）时滤波
+        // 退化为直通。不做 bypass 的话，低采样率下（22.05k/24k/32k 与
+        // 默认 20kHz 截止的组合）butterworth 极点会跑到单位圆外（|a2/a0|>1）
+        // → 数样本后 Inf → NaN，且 `f32::clamp` 对 NaN 原样放行 → F32
+        // 设备 NaN 直入 DAC，整首报废。与均衡器的同名保护同口径。
+        if cutoff >= 0.95 * (sample_rate.max(1.0) / 2.0) || !cutoff.is_finite() {
+            self.b0 = 1.0;
+            self.b1 = 0.0;
+            self.b2 = 0.0;
+            self.a1 = 0.0;
+            self.a2 = 0.0;
+            self.coef_cutoff = cutoff;
+            self.coef_q = q;
+            self.coef_sr = sample_rate;
+            return;
+        }
         let omega = 2.0 * std::f32::consts::PI * cutoff / sample_rate;
         let alpha = omega.sin() / (2.0 * q);
         let cos_w = omega.cos();
@@ -157,6 +173,16 @@ impl BiquadChannel {
         let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
             - self.a1 * self.y1
             - self.a2 * self.y2;
+        // 非有限出口守卫：一旦出现 NaN/Inf（参数极端组合、上游 NaN 输入）
+        // 清空内部状态并直通当前输入——不清状态的话 y1/y2 的 NaN 会自我
+        // 维持到下一次 reset，整首报废。与均衡器的同名守卫同口径。
+        if !y.is_finite() {
+            self.x1 = 0.0;
+            self.x2 = 0.0;
+            self.y1 = 0.0;
+            self.y2 = 0.0;
+            return x;
+        }
         self.x2 = self.x1;
         self.x1 = x;
         self.y2 = self.y1;

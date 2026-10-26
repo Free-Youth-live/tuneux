@@ -112,7 +112,7 @@ impl Default for MaxConfig {
 
 /// 默认 dock：浏览器 | （列表 / 封面 上下）——与重写前默认观感对齐。
 fn default_dock() -> Option<crate::dock::DockNode> {
-    // 默认布局 = fx TUI 同构（2026-10-09 定为默认口径）：
+    // 默认布局 = fx TUI 同构：
     // 左浏览器（约 1/3）+ 右播放列表（约 2/3，主区）；歌词模块
     // 常驻右下（fx 的 l 面板对应物）。其余模块（频谱/EQ/封面等）
     // 经右键菜单或「视图→模块」按需加装。
@@ -274,7 +274,7 @@ fn atomic_write<T: Serialize>(path: &std::path::Path, value: &T) {
 /// 内置中文语言表（新 UI 词条全集）。
 pub fn zh_table() -> tuneux_commonx::LangTable {
     tuneux_commonx::LangTable::parse(
-        "\
+    "\
 menu.file = \"文件\"\n\
 menu.play = \"播放\"\n\
 menu.medium = \"介质\"\n\
@@ -509,7 +509,7 @@ msg.dir_open_fail = \"无法打开\"\n\
 msg.manual_missing = \"使用手册随发行包附带（安装目录内 使用手册-tuneux-max.txt）\"\n\
 bm.hint = \"Enter 跳转 · ✕ 删除 · Esc 关闭\"\n\
 ",
-    )
+  )
 }
 
 #[cfg(test)]
@@ -594,7 +594,7 @@ mod tests {
         assert_eq!(cfg.theme, "dos");
     }
 
-    // —— 损坏配置保护（2026-10-13，与双 TUI 同源修复）——
+    // —— 损坏配置保护——
 
     /// 损坏文件备份：生成 .corrupt.bak 且内容与原文件一致；
     /// 已有备份时不得覆盖（保留最早现场）。

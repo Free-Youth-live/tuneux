@@ -98,7 +98,7 @@ jobs:
           # linux-arm64 腿暂缓（2026-10-23）：zig cc 交叉的 C 编译器测试失败
           #（"unable to create an executable file"），调通成本高；TUI 打包对
           # 缺组件腿走软守卫（包内不带 ffmpeg，回退系统 PATH），已知限制同步
-          # 声明。修复路线归待办项：GitHub 原生 arm64 linux runner（免交叉）或 zig 调通。
+          # 声明。修复路线：GitHub 原生 arm64 linux runner（免交叉）或 zig 调通。
           - os: macos-14
             name: macos-arm64
           - os: macos-14

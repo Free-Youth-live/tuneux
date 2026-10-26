@@ -267,6 +267,9 @@ fn process_sample(
     if out.is_finite() {
         out
     } else {
+        // 清 env：不清的话 NaN 会让 `NaN > threshold` 恒假 → gain_db=0、
+        // 输出有限、守卫不再触发 → 该声道压缩器永久静默失效直到 reset。
+        *env = 0.0;
         x
     }
 }

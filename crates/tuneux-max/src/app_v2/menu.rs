@@ -43,7 +43,7 @@ pub(super) enum MenuAction {
     NextTrack,
     SeekBack,
     SeekForward,
-    /// 播放顺序六档单选：写入（循环, 随机）定值组合（2026-10-14 定稿映射表）。
+    /// 播放顺序六档单选：写入（循环, 随机）定值组合。
     SetPlayOrder(RepeatMode, ShuffleMode),
     VolumeUp,
     VolumeDown,
@@ -171,7 +171,7 @@ impl MenuEntry {
 
 /// 静态菜单表：八栏，序即数字键 1–8 的映射序。
 ///
-/// 播放顺序六档写入表（2026-10-14 定稿）：随机三档的循环定值取「列表」
+/// 播放顺序六档写入表：随机三档的循环定值取「列表」
 /// （一轮播完重洗再播的不间断预期）；r/s 键的循环切换行为不变。
 pub(super) fn menus() -> &'static [TopMenu] {
     static MENUS: &[TopMenu] = &[
@@ -429,14 +429,14 @@ fn item_text(
 ) -> String {
     let prefix = match checked_of(snap, action) {
         Some(true) => "√ ",
-        Some(false) => "  ",
+        Some(false) => " ",
         None => "",
     };
     let sc = shortcut_text(action, shortcut);
     if sc.is_empty() {
         format!("{prefix}{}", i18n.t(label))
     } else {
-        format!("{prefix}{}  {sc}", i18n.t(label))
+        format!("{prefix}{} {sc}", i18n.t(label))
     }
 }
 
@@ -497,7 +497,7 @@ fn render_dyn(ui: &mut Ui, i18n: &I18n, snap: &MenuSnap, d: DynMenu, acts: &mut 
     ui.menu_button(title, |ui| match d {
         DynMenu::Medium => {
             for &m in PlaybackMedium::ALL.iter() {
-                let prefix = if m == snap.cur_medium { "√ " } else { "  " };
+                let prefix = if m == snap.cur_medium { "√ " } else { " " };
                 push_item(
                     ui,
                     format!("{prefix}{}", i18n.t(medium_key(m))),
@@ -508,7 +508,7 @@ fn render_dyn(ui: &mut Ui, i18n: &I18n, snap: &MenuSnap, d: DynMenu, acts: &mut 
         }
         DynMenu::Modules => {
             for (key, label, on) in &snap.mods {
-                let prefix = if *on { "√ " } else { "  " };
+                let prefix = if *on { "√ " } else { " " };
                 push_item(
                     ui,
                     format!("{prefix}{label}"),
@@ -518,7 +518,7 @@ fn render_dyn(ui: &mut Ui, i18n: &I18n, snap: &MenuSnap, d: DynMenu, acts: &mut 
             }
             ui.separator();
             for m in dock::ModuleId::ALL {
-                let prefix = if snap.dock_on(m) { "√ " } else { "  " };
+                let prefix = if snap.dock_on(m) { "√ " } else { " " };
                 let label = i18n.t(m.label_key()).into_owned();
                 push_item(
                     ui,
@@ -550,7 +550,7 @@ fn render_dyn(ui: &mut Ui, i18n: &I18n, snap: &MenuSnap, d: DynMenu, acts: &mut 
         }
         DynMenu::Skins => {
             for (id, name) in &snap.themes {
-                let prefix = if *id == snap.cur_theme { "√ " } else { "  " };
+                let prefix = if *id == snap.cur_theme { "√ " } else { " " };
                 push_item(
                     ui,
                     format!("{prefix}{name}"),
@@ -561,7 +561,7 @@ fn render_dyn(ui: &mut Ui, i18n: &I18n, snap: &MenuSnap, d: DynMenu, acts: &mut 
         }
         DynMenu::Langs => {
             for (id, name) in &snap.langs {
-                let prefix = if *id == snap.cur_lang { "√ " } else { "  " };
+                let prefix = if *id == snap.cur_lang { "√ " } else { " " };
                 push_item(
                     ui,
                     format!("{prefix}{name}"),
@@ -572,7 +572,7 @@ fn render_dyn(ui: &mut Ui, i18n: &I18n, snap: &MenuSnap, d: DynMenu, acts: &mut 
         }
         DynMenu::Fonts => {
             for (i, name) in snap.fonts.iter().enumerate() {
-                let prefix = if i == snap.font_idx { "√ " } else { "  " };
+                let prefix = if i == snap.font_idx { "√ " } else { " " };
                 push_item(ui, format!("{prefix}{name}"), MenuAction::SetFont(i), acts);
             }
         }
@@ -684,11 +684,11 @@ impl MaxAppV2 {
                             TextFormat::simple(mono(FONT), pal.fg_weak),
                         );
                         job.append(
-                            &format!("{title}  "),
+                            &format!("{title} "),
                             0.0,
                             TextFormat::simple(mono(FONT), pal.fg),
                         );
-                        let label_text = format!("{} {title}  ", idx + 1);
+                        let label_text = format!("{} {title} ", idx + 1);
                         let r = ui.menu_button(job, |ui| {
                             render_entries(ui, i18n, &snap, top.entries, &mut acts);
                         });

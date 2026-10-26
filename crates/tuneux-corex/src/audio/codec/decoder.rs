@@ -44,7 +44,7 @@ use super::wavpack::{is_wavpack_path, WavPackBackend};
 pub const KNOWN_AUDIO_EXTS: &[&str] = &[
     // 原生进程内：symphonia / Opus / WavPack
     "mp3", "flac", "wav", "ogg", "m4a", "aac", "alac", "opus", "wv",
-    // ffmpeg 桥接长尾：随包附带或系统已装的 ffmpeg 才能播（既定方案口径）
+    // ffmpeg 桥接长尾：随包附带或系统已装的 ffmpeg 才能播
     "ape", "wma", "flv", "tak", "mpc", "shn", "ac3", "dts", "tta", "dsf", "dff", "mkv", "avi", "ts",
     "m2ts", "wmv", "mpg", "mpeg", "vob", "mp4", "mov", "rmvb",
 ];

@@ -179,13 +179,26 @@ fn parse_header(file: &mut File) -> Result<WavHeader, DecodeError> {
             "block_align 与通道数/位深不符（头部损坏）".into(),
         ));
     }
-    // 上界：正常等于 min_align，仅允许少量对齐填充。过大视为头部损坏——
-    // 否则 decode_next 按 frames×align 分配，block_align=0xFFFF、frames≤4096
-    // 时单次分配可达约 268MB（旧缺陷：小文件头即可触发）。
+    // 上界：分两级。
+    // ① 绝对上限 8 MiB/块——`min_align` 本身来自文件（channels 也可能被
+    //    伪造，如 channels=8000 / bits=64 → min_align 就已经是 64000），
+    //    只比 min_align 不能拦住全部攻击面；
+    // ② 相对上限：正常等于 min_align，仅允许 2 倍对齐填充（针对真实
+    //    文件的对齐情况）。
+    if (block_align as u32) > 8 * 1024 * 1024 {
+        return Err(DecodeError::Decode(
+            "block_align 超绝对上限（头部损坏）".into(),
+        ));
+    }
     if (block_align as u32) > min_align.saturating_mul(2) {
         return Err(DecodeError::Decode(
             "block_align 异常偏大（头部损坏）".into(),
         ));
+    }
+    // channels 上限：真实音频设备不超过 64 声道，伪造的 channels=8000
+    // 让 min_align 本身爆炸（min_align = ch × bytes_per_sample）。
+    if channels > 64 {
+        return Err(DecodeError::Decode("channels 超 64（头部损坏）".into()));
     }
     Ok(WavHeader {
         format,

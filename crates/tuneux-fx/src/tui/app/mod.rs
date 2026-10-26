@@ -127,6 +127,8 @@ pub struct App {
     pub cover_browser_scroll: usize,
     /// 鼠标命中矩形（渲染层每帧写；Cell 使 &App 可写）。
     pub browser_list_rect: std::cell::Cell<ratatui::layout::Rect>,
+    /// 主菜单下拉的命中矩形（渲染侧每帧写入，鼠标侧判定用；与浏览器/列表面板同款）。
+    pub menu_dropdown_rect: std::cell::Cell<ratatui::layout::Rect>,
     pub playlist_list_rect: std::cell::Cell<ratatui::layout::Rect>,
     /// 上次左键点击（时刻 + 坐标）——双击判定。
     last_click: Option<(std::time::Instant, u16, u16)>,
@@ -717,6 +719,7 @@ impl App {
             cover_browser_sel: 0,
             cover_browser_scroll: 0,
             browser_list_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            menu_dropdown_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             playlist_list_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             last_click: None,
             cover_browser_visible: 0,

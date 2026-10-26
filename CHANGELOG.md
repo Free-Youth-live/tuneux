@@ -28,7 +28,7 @@
 - **max 并行标签预读**：加入目录不阻塞 UI（目录遍历 + 标签工人池多线程并行），标签渐进回填
 - **max 内置 Sarasa Mono SC 等宽字体**（Sarasa Gothic v1.0.42 / SarasaMonoSC-Regular.ttf，OFL，官方原件未修改未子集化，许可文本随包 + SHA-256 登记）：无系统 CJK 字体的环境不再豆腐块；fonts/ 自投字体机制保留；「设置 › 字体」菜单在仅一款内置字体时自动隐藏
 - **max 属性弹窗**（`i` / Alt+Enter）+ 右键菜单统一重写（快捷键列、子菜单、靠边自动翻转防出屏、键盘导航）+ 浏览器行与播放列表行「在文件管理器中显示」
-- **max 皮肤系统**：内置五主题（fx DOS / Terminal / classic-dark 暗色 / classic-dark 经典浅色 / 科技深色）+ 插件皮肤（plugins/「皮肤-*」wasm，与 fx 同协议同验签，OFFICIAL_PUBKEY 单一事实源收归 pinx）
+- **max 皮肤系统**：内置五主题（fx DOS / Terminal / 经典暗色 / 经典浅色 / 科技深色）+ 插件皮肤（plugins/「皮肤-*」wasm，与 fx 同协议同验签，OFFICIAL_PUBKEY 单一事实源收归 pinx）
 - **max 原生文件对话框**：文件菜单「打开文件…/打开目录…」（rfd 0.15；Linux 走 xdg-portal 纯 Rust 不引 GTK 运行时）
 - **commonx `FsBrowser::select`**：目录浏览鼠标点选入口（GUI 发行版驱动）
 
@@ -226,7 +226,7 @@
 - **内嵌歌词**：读取歌曲内嵌歌词标签（ID3 USLT / Vorbis LYRICS 等）
 - **播放列表增强**：去重开关 + 排序 API
 
-### 质量（第一批/第二批）
+### 质量与安全
 
 - / 状态机单测、断点续播测试、回调零分配化、布局单一真相源（LayoutMetrics）
 - render.rs 拆分（1681 行 → 主入口 + 5 子模块）

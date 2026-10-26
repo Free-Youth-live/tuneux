@@ -55,7 +55,7 @@ impl Default for SplitMix64 {
 }
 
 impl SplitMix64 {
-    /// 默认种子：固定常量。洗牌会话间不可复现但单测可设自己的种子。
+    /// 默认种子：固定常量。单测用（确定性）；产品侧应改用 `new_random()`。
     pub fn new() -> Self {
         Self {
             state: 0x1234567890abcdef,
@@ -91,7 +91,7 @@ impl SplitMix64 {
 /// 持有条目集合、播放状态（current）、已播历史（history）、随机开关与
 /// LCG 状态，以及「下一首 / 上一首 / 显示序 / 去重」等导航逻辑。
 /// 不含任何 UI 呈现状态。
-/// 随机模式（2026-10-09 扩容；serde 表示冻结为 snake_case 四值）。
+/// 随机模式。
 ///
 /// - `Off`：顺序播放；
 /// - `Tracks`：曲目袋式——全列表随机、一轮内不重复（v0.5.x 的 `shuffle = true` 同义）；
@@ -176,6 +176,20 @@ impl PlaylistCore {
             rng: SplitMix64::new(),
             display_order_cache: std::cell::RefCell::new(None),
         }
+    }
+
+    /// 以运行时熵构造（每次进程启动得到不同洗牌序）。
+    /// 种子 = SystemTime 纳秒 ^ 进程内静态递增计数，不引外部依赖；
+    /// 需要确定性的测试请用 `new_with_seed`。
+    pub fn new_random() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+        Self::new_with_seed(time ^ count.wrapping_mul(0x9E3779B97F4A7C15))
     }
 
     /// 用固定种子构造（确定性复现用，供产品测试 / 对拍）。
@@ -636,7 +650,14 @@ impl PlaylistCore {
         let mut groups: Vec<Vec<usize>> = Vec::new();
         for (album, idx) in keyed {
             match groups.last_mut() {
-                Some(g) if g.iter().any(|i| self.items[*i].album.as_deref() == album) => {
+                // 并组条件：专辑名相同**且**非 None——None（无专辑标签）时
+                // `as_deref() == None` 恒等（同一侧都是 None），若不加
+                // `is_some()` 守卫会把全部无标签曲目并进同一组（退化为
+                // 一大张顺序连播）。约定：无专辑条目各自成组。
+                Some(g)
+                    if album.is_some()
+                        && g.iter().any(|i| self.items[*i].album.as_deref() == album) =>
+                {
                     g.push(idx)
                 }
                 _ => groups.push(vec![idx]),
@@ -854,7 +875,7 @@ mod tests {
         assert_eq!(p.display_order().len(), 1);
     }
 
-    // —— items_mut 物理重排的缓存失效回归（2026-10-13）——
+    // —— items_mut 物理重排的缓存失效回归——
 
     /// 与显示序同口径的物理重排：重排后 display_order 必须是恒等排列。
     /// 修复前此处返回预热阶段的旧缓存（[2,3,1,0]），行↔曲错位。

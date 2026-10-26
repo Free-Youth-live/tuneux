@@ -507,7 +507,7 @@ impl FfmpegBackend {
             child: None,
             ffmpeg_bin: ffmpeg,
             params,
-            pcm_buf: vec![0u8; (rate * 2 * 4 / 10).max(4096)], // 100ms 立体声 f32le
+            pcm_buf: vec![0u8; ((rate * 2 * 4 / 10).max(4096)) & !3], // 100ms 立体声 f32le（对齐到 4 的倍数：f32le 样本 4 字节，非对齐的缓冲尾数会被 as_chunks 丢弃导致永久字节错位）
             pending: Vec::new(),
             pending_pos: 0,
             header_done: false,

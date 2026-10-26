@@ -148,7 +148,7 @@ impl DockNode {
         }
     }
 
-    /// 在 target 叶处拆分并插入新模块（classic-dark Split horizontally/vertically：
+    /// 在 target 叶处拆分并插入新模块（水平/垂直分割：
     /// 原叶居 a 侧、新叶居 b 侧，五五开）。
     pub fn split_insert(&mut self, target: ModuleId, new: ModuleId, side_by_side: bool) {
         fn go(node: &mut DockNode, target: ModuleId, new: ModuleId, sbs: bool) -> bool {
@@ -172,7 +172,7 @@ impl DockNode {
         go(self, target, new, side_by_side);
     }
 
-    /// 原位更换模块（classic-dark Change panel to…）。
+    /// 原位更换模块（面板更换语义）。
     pub fn replace_leaf(&mut self, target: ModuleId, new: ModuleId) {
         fn go(node: &mut DockNode, target: ModuleId, new: ModuleId) {
             match node {

@@ -51,7 +51,7 @@ pub struct Palette {
     /// 面板框饰风格：true = TUI 制框（标题嵌上边线、底色断线的
     /// ratatui Block 风）；false = GUI 头部条（完整边框 + panel_bg
     /// 标题带，彻底去 TUI 观感）。dos/term 与皮肤插件为 true；
-    /// classic-dark 系为 false。
+    /// 经典浅色系为 false。
     pub tui_chrome: bool,
 }
 
@@ -100,9 +100,9 @@ pub fn builtin(id: &str) -> Option<Palette> {
             resample_fg: Color32::from_rgb(105, 105, 105),
             ..Palette::default()
         }),
-        // classic-dark 风格：Win 经典浅灰底 + 蓝色高亮（亮色皮肤；
+        // 经典暗色风格：Win 经典浅灰底 + 蓝色高亮（亮色皮肤；
         // apply_visuals 按底色亮度自动切换亮/暗控件基底）。
-        // classic-dark 暗色风格（参照真实 classic-dark 暗色配置截图）：近黑底、
+        // 经典暗色风格：近黑底、
         // 浅灰字、蓝色强调/分组头、银灰反色选中、列头带、技术状态栏、
         // 频谱坐标轴——结构特征全部调色板驱动，dos/term 不受影响。
         "classic-dark" => Some(Palette {
@@ -124,10 +124,10 @@ pub fn builtin(id: &str) -> Option<Palette> {
             bar_style: tuneux_mediax::BarStyle::Matrix,
             tui_chrome: false,
         }),
-        // classic-dark 经典浅色：参照 classic-dark v1.x 默认 DUI（Win32 经典控件风）——
+        // 经典浅色：Win32 经典控件风——
         // 白色播放列表为主体、#F0F0F0 经典 3D 面板灰作工具/沉底、深蓝强调、
         // 淡蓝选中（经典“选中但未聚焦”色）、绿色频谱柱。亮色皮肤，
-        // apply_visuals 按底色亮度自动切亮色控件基底，与 classic-dark 暗色互为表里；
+        // apply_visuals 按底色亮度自动切亮色控件基底，与经典暗色互为表里；
         // dos/term 不受影响。
         "classic-light" => Some(Palette {
             bg: Color32::from_rgb(255, 255, 255),
@@ -148,7 +148,7 @@ pub fn builtin(id: &str) -> Option<Palette> {
             bar_style: tuneux_mediax::BarStyle::Blocks,
             tui_chrome: false,
         }),
-        // 科技深色（2026-10-09 第一批）：电光青强调 + 冷灰蓝底。
+        // 科技深色：电光青强调 + 冷灰蓝底。
         "tech-dark" => Some(Palette {
             bg: Color32::from_rgb(26, 29, 36),
             panel_bg: Color32::from_rgb(20, 22, 28),
@@ -177,18 +177,18 @@ pub fn builtin_list() -> [(&'static str, &'static str); 5] {
     [
         ("dos", "fx DOS"),
         ("term", "Terminal"),
-        ("classic-dark", "classic-dark 暗色"),
-        ("classic-light", "classic-dark 经典浅色"),
+        ("classic-dark", "经典暗色"),
+        ("classic-light", "经典浅色"),
         ("tech-dark", "科技深色"),
     ]
 }
 
 /// 皮肤默认模块集（结构模块开关）：dos/term = fx 极简集（全关，
-/// 开箱即 fx 观感）；classic-dark = 现代 GUI 集（全开）。用户经右键/菜单的
+/// 开箱即 fx 观感）；经典双肤 = 现代 GUI 集（全开）。用户经右键/菜单的
 /// 加装记录存配置 mod_over（按皮肤分桶），换肤自动套用该皮肤默认+覆盖。
 pub fn default_modules(id: &str) -> &'static [(&'static str, bool)] {
     match id {
-        // classic-dark 双肤同默认集：现代 GUI 结构模块全开
+        // 经典双肤同默认集：现代 GUI 结构模块全开
         "classic-dark" | "classic-light" | "tech-dark" => &[
             ("transport", true),
             ("col_header", true),
@@ -287,7 +287,7 @@ pub fn skin_name(text: &str) -> Option<String> {
 
 /// 调色板 → egui Visuals（每帧下发，主题切换即时生效）。
 pub fn apply_visuals(ctx: &egui::Context, pal: &Palette) {
-    // 亮/暗基底按底色亮度选（classic-dark = 亮色，dos/term = 暗色）
+    // 亮/暗基底按底色亮度选（classic = 亮色，dos/term = 暗色）
     let lum = (pal.bg.r() as u32 * 299 + pal.bg.g() as u32 * 587 + pal.bg.b() as u32 * 114) / 1000;
     let mut v = if lum > 140 {
         egui::Visuals::light()
@@ -419,7 +419,7 @@ pub fn build_fonts_with(data: &[u8]) -> egui::FontDefinitions {
 /// 主副次序是列对齐的关键：全部字形（拉丁 + CJK）统一出自更纱等宽面，
 /// 其 CJK 字宽 = 2×拉丁字宽严格成立，按显示宽度补空格的列才能像素级对齐
 /// （真 TUI 规整感）。若拉丁走 Hack、CJK 走回退，两面字宽比不是精确 2:1，
-/// 混排行必然错位——原型 期实测踩坑，勿回退主副次序。
+/// 混排行必然错位——早期实测踩坑，勿回退主副次序。
 pub fn build_fonts() -> egui::FontDefinitions {
     build_fonts_with(EMBEDDED_CJK_FONT)
 }

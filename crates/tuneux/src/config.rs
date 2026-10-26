@@ -10,9 +10,9 @@
 //!    单文件就是一个完整播放器，配置随身携带。
 //! 2. **回退**：若 exe 同目录不可写（只读 U 盘、装到 `/usr/local/bin` 等系统位置），
 //!    配置改存到系统标准配置目录：
-//!    - Windows：`%APPDATA%\tuneux\tuneux.toml`
-//!    - macOS：`~/Library/Application Support/tuneux/tuneux.toml`
-//!    - Linux：`~/.config/tuneux/tuneux.toml`
+//!  - Windows：`%APPDATA%\tuneux\tuneux.toml`
+//!  - macOS：`~/Library/Application Support/tuneux/tuneux.toml`
+//!  - Linux：`~/.config/tuneux/tuneux.toml`
 //!
 //! ## 容错原则
 //!
@@ -60,7 +60,7 @@ pub fn repeat_key(mode: RepeatMode) -> &'static str {
 /// 注意：新增 UI 文案时在此追加 key，并同步 `locales/en.txt`（官方英文）。
 pub(crate) fn zh_table() -> tuneux_commonx::LangTable {
     tuneux_commonx::LangTable::parse(
-        "\
+    "\
 # —— 面板标题 ——\n\
 panel.current_track = \"当前曲目\"\n\
 panel.status = \"状态\"\n\
@@ -103,11 +103,11 @@ about.formats = \"支持 MP3 · FLAC · WAV · OGG · OPUS · WV · M4A · AAC �
 about.offline = \"纯离线 · 不收集任何数据\"\n\
 about.license = \"本项目采用木兰宽松许可证 v2（MulanPSL-2.0）\"\n\
 about.deps = \"基于以下开源项目构建：\"\n\
-about.dep_audio = \"音频  cpal · symphonia · opus-decoder · rubato · rustfft · ringbuf\"\n\
-about.dep_ui = \"界面  ratatui · crossterm · image · unicode-width\"\n\
-about.dep_common = \"通用  serde · toml · dirs · encoding_rs · crossbeam-channel\"\n\
-about.dep_plugin = \"插件  wasmi · ed25519-dalek\"\n\
-about.dep_platform = \"平台  zbus（Linux）· rdev（Windows）\"\n\
+about.dep_audio = \"音频 cpal · symphonia · opus-decoder · rubato · rustfft · ringbuf\"\n\
+about.dep_ui = \"界面 ratatui · crossterm · image · unicode-width\"\n\
+about.dep_common = \"通用 serde · toml · dirs · encoding_rs · crossbeam-channel\"\n\
+about.dep_plugin = \"插件 wasmi · ed25519-dalek\"\n\
+about.dep_platform = \"平台 zbus（Linux）· rdev（Windows）\"\n\
 about.close = \"按任意键关闭\"\n\
 popup.properties = \"属性\"\n\
 prop.codec = \"编码\"\n\
@@ -161,7 +161,7 @@ group.unknown_artist = \"未知艺人\"\n\
 group.unknown_album = \"未知专辑\"\n\
 group.track_count = \"{}首\"\n\
 ",
-    )
+  )
 }
 
 /// 构建 i18n 查询器：请求语言表（`locales/<lang>.txt`，exe 同目录）+ zh 内置兜底。
@@ -498,7 +498,7 @@ const KEYMAP_ACTIONS: &[&str] = &[
     "prev",
     "volume_up",
     "volume_down",
-    // 模式 / 面板键（2026-10-09 扩容：键位即用户资产，默认键不变、用户映射叠加）
+    // 模式 / 面板键
     "cycle_repeat",
     "toggle_shuffle",
     "cycle_medium",
@@ -1231,7 +1231,7 @@ mod tests {
         assert_eq!(cfg.lang, "en");
     }
 
-    // —— 损坏配置保护（2026-10-13：损坏文件不得被默认值覆写）——
+    // —— 损坏配置保护——
 
     /// 损坏文件备份：生成 .corrupt.bak 且内容与原文件一致；
     /// 已有备份时不得覆盖（保留最早现场）。

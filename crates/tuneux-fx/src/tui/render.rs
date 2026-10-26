@@ -189,6 +189,7 @@ pub fn draw(
     let area = frame.area();
     // 鼠标命中矩形每帧重置（本帧未画的面板 = 不命中）
     app.browser_list_rect.set(ratatui::layout::Rect::default());
+    app.menu_dropdown_rect.set(ratatui::layout::Rect::default());
     app.playlist_list_rect.set(ratatui::layout::Rect::default());
     let m = layout_metrics(
         (area.width, area.height),
@@ -528,6 +529,10 @@ fn draw_menu_list(
         .style(pal_style(None, pal.menu_bg));
     let inner = block.inner(box_area);
     frame.render_widget(block, box_area);
+
+    // 命中矩形写入（鼠标层据此判定点击是否在下拉内；主下拉与子菜单均写，
+    // 后写覆盖先写——只有最新渲染的下拉可被点击）。
+    app.menu_dropdown_rect.set(inner);
 
     let inner_w = inner.width as usize;
     let lines: Vec<Line> = items

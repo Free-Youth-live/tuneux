@@ -38,4 +38,4 @@ pub mod verify;
 pub use caps::{parse_manifest, CapError, Capability};
 pub use ids::{COMP_ID, EQ_ID, SKIN_ID};
 pub use runtime::{HostError, HostState, LoadedPlugin, WasmHost};
-pub use verify::{classify, verify_signature, LoadPolicy, Tristate, TrustList};
+pub use verify::{classify, verify_signature, LoadPolicy, Tristate, TrustList, OFFICIAL_PUBKEY};

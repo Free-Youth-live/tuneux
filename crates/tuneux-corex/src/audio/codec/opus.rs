@@ -292,13 +292,21 @@ impl DecoderBackend for OpusBackend {
         let index = match &self.seek_index {
             Some(idx) => idx.clone(),
             None => {
+                // 必须从流首扫描：scan_seek_index 从当前文件指针开始，
+                // 从中段扫描会导致 prev_granule 初值错误（硬编码 0 只有
+                // 从流首扫描才成立）→ 向后 seek 的 prev_granule 恒为 0
+                // → skip = target − 0，实际落点比请求值多出「已播时长」。
+                // 扫完后 seek_to 会重置流状态，无需恢复位置。
+                self.reader.rewind()?;
                 let idx = self.reader.scan_seek_index()?;
                 self.seek_index = Some(idx.clone());
                 idx
             }
         };
 
-        // 找第一个 granule_position >= 目标的页（二分思想：索引 granule 单调不减）。
+        // 找第一个 granule_position >= 目标的页（线性查找：索引 granule
+        // 单调不减，页数级别可接受；二分是可选优化）。
+        // 用该页的 prev_granule（页内首包起点）换算需丢弃的前导样本。
         // 用该页的 prev_granule（页内首包起点）换算需丢弃的前导样本。
         let found = index
             .iter()
@@ -323,7 +331,13 @@ impl DecoderBackend for OpusBackend {
                 let mut skipped = 0u64;
                 loop {
                     let Some(packet) = self.reader.next_packet()? else {
-                        return Err(DecodeError::Seek("目标位置超出文件末尾".to_string()));
+                        // 流已到末尾：统一后端契约——越界钳到末尾返回 Ok
+                        //（与 wav/flac/wavpack/cdda 同口径；原返回 Err
+                        // 会让调用方吞掉后直接 EOF 播放静默终止）。
+                        let rate = f64::from(self.params.sample_rate.unwrap_or(48_000));
+                        let end_secs =
+                            point.granule_position as f64 / 48_000.0 * (rate / 48_000.0).min(1.0); // 页级 granule 即近末尾
+                        return Ok(end_secs);
                     };
                     if is_header_packet(&packet) {
                         continue;

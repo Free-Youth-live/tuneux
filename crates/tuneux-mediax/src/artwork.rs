@@ -59,6 +59,15 @@ fn to_cover(img: image::DynamicImage) -> Option<CoverImage> {
 
 /// 三层回退解码为 DynamicImage（内部实现）。
 fn decode_dynamic(bytes: &[u8], mime_hint: Option<&str>) -> Option<image::DynamicImage> {
+    // 解码输入上限（防解压炸弹）：JPEG/PNG 声明巨尺寸的压缩文件
+    // 物理上至少需要与其像素复杂度成比例的字节数——1.2MB 输入对应
+    // 约 64MB RGBA 输出的极端下限并留 4 倍余量。超限直接放弃，
+    // 避免 image::load 的巨分配触发不可捕获的分配失败 abort。
+    const DECODE_INPUT_LIMIT: usize = 1_200_000;
+    if bytes.len() > DECODE_INPUT_LIMIT {
+        return None;
+    }
+
     // 1) MIME 提示（来自容器标签的 media_type 字段）
     if let Some(mime) = mime_hint {
         if let Some(fmt) = image::ImageFormat::from_mime_type(mime) {

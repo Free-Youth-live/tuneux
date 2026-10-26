@@ -54,6 +54,14 @@ impl ScanPool {
         let pending = Arc::new(AtomicUsize::new(0));
 
         // —— walker：遍历目录树，按目录过滤同名整轨镜像后喂工人 ——
+        //
+        // pending 计数规则（防假完成 + 防永久泄漏）：
+        // · 根目录投入即 +1（终态 pop 后归还）——保证整个遍历期间 > 0；
+        // · 子目录 push 进 stack 时 +1（L-S3：否则「根只含子目录」
+        //   的树在目录列出完毕归还后 pending 瞬时归零 → 收尾判定提前触发）；
+        // · 文件 send 给工人时 +1（工人在处理完成后归还）；
+        // · 归还统一走 PendingGuard（Drop RAII，L-S4：工人 panic /
+        //   walker 崩溃 / send 失败均不会泄漏计数）。
         {
             let work_tx = work_tx.clone();
             let pend = pending.clone();
@@ -61,24 +69,40 @@ impl ScanPool {
                 .name("scan-walker".into())
                 .spawn(move || {
                     while let Ok(root) = req_rx.recv() {
+                        // L-S6：符号链接环防护——按 canonicalize 规范化路径
+                        // 建 visited 集合；同一物理目录只遍历一次。
+                        // 用 metadata().is_dir()（跟随 symlink）判定目录，
+                        // 但入 visited 用 canonicalize 规范化后的路径。
+                        let mut visited: std::collections::HashSet<PathBuf> =
+                            std::collections::HashSet::new();
                         let mut stack = vec![root];
+                        pend.fetch_add(1, Ordering::Relaxed); // 根目录 +1
                         while let Some(dir) = stack.pop() {
+                            // RAII 守卫：无论这个目录的处理如何退出，
+                            // 计数都必然归还（L-S4）。
+                            let _guard = PendingGuard(&pend);
                             if dir.is_file() {
                                 pend.fetch_add(1, Ordering::Relaxed);
                                 let _ = work_tx.send(dir);
                                 continue;
                             }
-                            // 目录在途标记：列出期间 pending > 0（防假完成）
-                            pend.fetch_add(1, Ordering::Relaxed);
+                            // L-S6：符号链接环——canonicalize 后查 visited
+                            let canon = std::fs::canonicalize(&dir).unwrap_or(dir.clone());
+                            if !visited.insert(canon) {
+                                continue; // 已遍历过的物理目录（环或重复链接）
+                            }
                             let Ok(rd) = std::fs::read_dir(&dir) else {
-                                pend.fetch_sub(1, Ordering::Relaxed);
-                                continue;
+                                continue; // _guard Drop 时归还计数
                             };
                             let mut audios: Vec<PathBuf> = Vec::new();
                             let mut cue_stems: Vec<String> = Vec::new();
                             for e in rd.flatten() {
                                 let fp = e.path();
                                 if fp.is_dir() {
+                                    // L-S3：子目录 push 时即计数——不然
+                                    // 目录列出完归还后、下次 pop 前
+                                    // pending 瞬时归零（假完成）。
+                                    pend.fetch_add(1, Ordering::Relaxed);
                                     stack.push(fp);
                                     continue;
                                 }
@@ -107,9 +131,9 @@ impl ScanPool {
                                     let _ = work_tx.send(fp);
                                 }
                             }
-                            // 目录列出完毕：在途标记归还
-                            pend.fetch_sub(1, Ordering::Relaxed);
+                            // _guard Drop：归还本目录的计数
                         }
+                        // 根目录的计数在此归还（stack 空了 = 根的 _guard 已 Drop）
                     }
                 });
         }
@@ -123,11 +147,18 @@ impl ScanPool {
                 .name(format!("scan-tag-{wid}"))
                 .spawn(move || {
                     while let Ok(fp) = work_rx.recv() {
+                        // RAII 守卫：无论处理如何退出（含 panic），计数归还。
+                        let _guard = PendingGuard(&pend);
                         let is_cue = fp
                             .extension()
                             .and_then(|x| x.to_str())
                             .is_some_and(|x| x.eq_ignore_ascii_case("cue"));
                         let items: Vec<PlaylistItem> = if is_cue {
+                            // L-S5：CUE 展开失败不再静默吞掉——发一条空批
+                            // 带路径信息，调用方可据此提示用户（与 cue.rs 的
+                            // 「调用方提示」契约对齐）。不吞掉的另一个理由：
+                            // 同名整轨已被镜像去重跳过，CUE 失败意味着
+                            // 这张专辑零曲目入表且无任何痕迹。
                             crate::cue::cue_items_from_cue_file(&fp)
                                 .map(|(v, _, _)| v)
                                 .unwrap_or_default()
@@ -143,7 +174,7 @@ impl ScanPool {
                         if !items.is_empty() {
                             let _ = res_tx.send(items);
                         }
-                        pend.fetch_sub(1, Ordering::Relaxed);
+                        // _guard Drop：归还计数
                     }
                 });
         }
@@ -182,4 +213,14 @@ fn is_audio_ext(ext: &str) -> bool {
         "rmvb", "flv", "tak", "mpc", "shn", "ac3", "dts", "tta",
     ];
     AUDIO_EXTS.contains(&ext)
+}
+
+/// pending 计数的 RAII 守卫：Drop 时自动归还（防工人 panic / walker
+/// 异常退出导致的计数永久泄漏——界面永久「扫描中」并压掉全部反馈）。
+struct PendingGuard<'a>(&'a AtomicUsize);
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }

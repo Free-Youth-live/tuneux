@@ -83,7 +83,7 @@ impl Playlist {
     /// 新建空播放列表（基础版默认按专辑分组）。
     pub fn new() -> Self {
         Self {
-            core: PlaylistCore::new(),
+            core: PlaylistCore::new_random(),
             selected: None,
             scroll: 0,
             view: PlaylistView::ByAlbum,

@@ -217,7 +217,7 @@ impl App {
                 self.volume_down();
                 true
             }
-            // 模式 / 面板动作（2026-10-09 扩容；与硬编码默认键同一方法，单一实现）
+            // 模式 / 面板动作
             "cycle_repeat" => {
                 self.action_cycle_repeat(config);
                 true
@@ -540,12 +540,12 @@ impl App {
                 return true;
             }
             KeyCode::Char('?') => {
-                // ? = 关于/帮助（2026-10-14 快捷键规则：F 键不作任何功能的绑定）。
+                // ? = 关于/帮助。
                 self.about_visible = !self.about_visible;
                 return true;
             }
             KeyCode::Char('i') => {
-                // 当前曲目属性弹窗：`i` 主键；Alt+Enter 为 经典播放器 肌肉记忆别名。
+                // 当前曲目属性弹窗：`i` 主键；Alt+Enter 为兼容既有使用习惯的别名。
                 // （三平台考量：Windows 旧 conhost 的 Alt+Enter 被控制台截走切全屏、
                 // macOS 终端 Option 组合受终端设置影响——普通键 i 保底恒可用。）
                 self.properties_visible = !self.properties_visible;

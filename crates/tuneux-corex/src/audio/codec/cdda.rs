@@ -49,8 +49,9 @@ pub(crate) fn is_bin_path(path: &Path) -> bool {
 }
 
 /// CD-DA 同步模式：每个扇区开头的 12 字节固定模式（00 FF×10 00）。
-/// 用于区分 2352 与 2448 形态——纯音频扇区第一个字节是 00，
-/// 而 DAO-96 镜像紧跟子通道数据。
+/// 属 Mode 1/2 数据扇区（CD-DA 纯音频扇区**不含**此模式）。
+/// 现行判据不使用此常量（改用字节多样性检测），保留作文档参照。
+#[allow(dead_code)]
 const CD_SYNC: [u8; 12] = [
     0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,
 ];
@@ -73,24 +74,39 @@ fn detect_sector_size(path: &Path) -> Option<usize> {
         (true, false) => Some(SECTOR_AUDIO),
         (false, true) => Some(SECTOR_RAW),
         (true, true) => {
-            // 两者皆整除（扇区数是 49 的倍数）：读第二扇区起始位置确认。
-            // 2352 形态第二扇区从 offset 2352 开始，应看到 CD 同步模式；
-            // 2448 形态第二扇区从 offset 2448 开始，offset 2352 处是
-            // 第一扇区的子通道数据（非同步模式）。
-            let mut buf = [0u8; CD_SYNC.len()];
+            // 两者皆整除（扇区数是 49 的倍数）。
+            //
+            // 注意：CD-DA 纯音频扇区（2352B = 98 帧 × 24B 交错 PCM）
+            // **不含同步头**——同步头（00 FF×10 00）属 Mode 1/2 数据
+            // 扇区。旧判据「读 offset 2352 看同步模式」在纯音频 2352
+            // 镜像上恒为 false → 误判 2448 → 按 2448 步进读 2352 数据
+            // = 整轨错位爆音。
+            //
+            // 替代判据（不依赖同步头）：读两种步长下第二扇区起始处
+            // 各 16 字节，检测哪个位置的数据更像子通道尾（2448 形态下
+            // offset 2352 处是第一扇区最后 96 字节子通道）。
+            // 子通道 P-W 的特征：字节值集中在 0x00/0xFF 或有重复模式，
+            // 而音频 PCM 样本的字节值分布更均匀。
+            // 简化检测：16 字节内不同字节值的个数（子通道通常 < 6 种，
+            // 音频通常 > 8 种）。
+            let mut buf_a = [0u8; 16]; // offset 2352（2352 形态的第二扇区头 / 2448 形态的子通道尾）
             let Ok(mut f) = std::fs::File::open(path) else {
                 return Some(SECTOR_AUDIO); // 保守：打不开按 2352
             };
-            let Ok(_) = f
+            let read_ok = f
                 .seek(std::io::SeekFrom::Start(SECTOR_AUDIO as u64))
-                .and_then(|_| f.read_exact(&mut buf))
-            else {
+                .and_then(|_| f.read_exact(&mut buf_a))
+                .is_ok();
+            if !read_ok {
                 return Some(SECTOR_AUDIO);
-            };
-            if buf == CD_SYNC {
-                Some(SECTOR_AUDIO)
-            } else {
+            }
+            let distinct_a: std::collections::HashSet<u8> = buf_a.iter().copied().collect();
+            // offset 2352 处子通道种类少（< 6）→ 是 2448 形态；
+            // 否则更像音频 → 2352 形态。
+            if distinct_a.len() < 6 {
                 Some(SECTOR_RAW)
+            } else {
+                Some(SECTOR_AUDIO)
             }
         }
         (false, false) => None,

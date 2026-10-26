@@ -604,11 +604,23 @@ fn decode_subframe(
                 let pred = match order {
                     0 => 0,
                     1 => out[n - 1],
-                    2 => 2 * out[n - 1] - out[n - 2],
-                    3 => 3 * out[n - 1] - 3 * out[n - 2] + out[n - 3],
-                    _ => 4 * out[n - 1] - 6 * out[n - 2] + 4 * out[n - 3] - out[n - 4],
+                    2 => {
+                        let a = out[n - 1].wrapping_mul(2);
+                        a.wrapping_sub(out[n - 2])
+                    }
+                    3 => {
+                        let a = out[n - 1].wrapping_mul(3);
+                        let b = out[n - 2].wrapping_mul(3);
+                        a.wrapping_sub(b).wrapping_add(out[n - 3])
+                    }
+                    _ => {
+                        let a = out[n - 1].wrapping_mul(4);
+                        let b = out[n - 2].wrapping_mul(6);
+                        let c = out[n - 3].wrapping_mul(4);
+                        a.wrapping_sub(b).wrapping_add(c).wrapping_sub(out[n - 4])
+                    }
                 };
-                out.push(pred + res);
+                out.push(pred.wrapping_add(res));
             }
         }
         t if t & 0x20 != 0 => {
@@ -637,14 +649,14 @@ fn decode_subframe(
                 let n = order + i;
                 let mut sum: i64 = 0;
                 for (j, &c) in coef.iter().enumerate() {
-                    sum += c * out[n - 1 - j];
+                    sum = sum.wrapping_add(c.wrapping_mul(out[n - 1 - j]));
                 }
                 let pred = if shift >= 0 {
                     sum >> shift
                 } else {
                     sum << (-shift) as u32
                 };
-                out.push(pred + res);
+                out.push(pred.wrapping_add(res));
             }
         }
         _ => return Err(DecodeError::Decode("子帧类型编码非法".into())),
@@ -655,7 +667,7 @@ fn decode_subframe(
     // 且帧 CRC 校验的是原始帧字节而非样本值——静默错音无法被现有校验发现。
     if wasted > 0 {
         for s in out.iter_mut() {
-            *s <<= wasted;
+            *s = s.wrapping_shl(wasted);
         }
     }
     Ok(())
@@ -925,7 +937,19 @@ impl DecoderBackend for FlacBackend {
                             cursor += n;
                         }
                     }
-                    Err(_) => break,
+                    Err(e) => {
+                        // 区分「帧号跳过/不需要的帧」（正常前进）与
+                        // 「真实解码错误」（流损坏）——后者上抛而非吞掉，
+                        // 否则 seek 报成功但 pending 可能为空 → 静默停播。
+                        match &e {
+                            DecodeError::Decode(msg)
+                                if msg.contains("帧序") || msg.contains("跳过") =>
+                            {
+                                // 帧号不匹配：跳到下一帧（正常 seek 行为）
+                            }
+                            _ => return Err(e),
+                        }
+                    }
                 }
             }
             return Ok(secs);

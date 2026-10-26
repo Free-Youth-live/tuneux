@@ -1,4 +1,4 @@
-//! # 统一右键菜单：五套手写弹层删并为一套（2026-10-15 右键菜单统一重写）
+//! # 统一右键菜单：五套手写弹层删并为一套
 //!
 //! - 数据模型：右键表运行时构建（[`CtxEntry`]），动作复用顶栏
 //!   [`MenuAction`] 单分发通道（无第二套执行路径）；动态态（文案/勾选/禁用/
@@ -130,7 +130,7 @@ fn header_entries(i18n: &I18n, album: &str, collapsed: bool) -> Vec<CtxEntry> {
 
 /// 浏览器行：目录 = 进入 / 加入此目录；文件 = 加入并播放 / 仅加入；
 /// 末尾统一「在文件管理器中显示」。
-/// （「属性」弹窗数据源仅播放列表行，浏览器文件行缓行——方案 §4.3 备注。）
+/// （「属性」弹窗数据源仅播放列表行，浏览器文件行缓行——按面板语义。）
 fn browser_entries(i18n: &I18n, row: usize, path: PathBuf, is_dir: bool) -> Vec<CtxEntry> {
     let mut v = Vec::new();
     if is_dir {
@@ -296,7 +296,7 @@ fn measure_entries(ctx: &egui::Context, entries: &[CtxEntry]) -> Vec2 {
                     t = format!("√ {t}");
                 }
                 if !shortcut.is_empty() {
-                    t = format!("{t}    {shortcut}");
+                    t = format!("{t}  {shortcut}");
                 }
                 let g = ctx.fonts(|f| f.layout_no_wrap(t, font.clone(), Color32::WHITE));
                 w = w.max(g.size().x + pad.x * 2.0 + 24.0);
@@ -305,7 +305,7 @@ fn measure_entries(ctx: &egui::Context, entries: &[CtxEntry]) -> Vec2 {
             CtxEntry::Sub { label, .. } => {
                 let g = ctx.fonts(|f| {
                     f.layout_no_wrap(
-                        format!("{}    ▸", truncate_label(label)),
+                        format!("{}  ▸", truncate_label(label)),
                         font.clone(),
                         Color32::WHITE,
                     )
@@ -396,7 +396,7 @@ fn item_widget(
 ) -> egui::Button<'static> {
     let text = match checked {
         Some(true) => format!("√ {}", truncate_label(label)),
-        Some(false) => format!("  {}", truncate_label(label)),
+        Some(false) => format!(" {}", truncate_label(label)),
         None => truncate_label(label),
     };
     let mut b = egui::Button::new(text);
@@ -618,8 +618,8 @@ impl MaxAppV2 {
             if st.kb_sub {
                 // 子菜单层
                 let sub_idx = st.open_sub.filter(|&p| {
-                    matches!(st.entries.get(p), Some(CtxEntry::Sub { entries, .. }) if !entries.is_empty())
-                });
+          matches!(st.entries.get(p), Some(CtxEntry::Sub { entries, .. }) if !entries.is_empty())
+        });
                 match sub_idx {
                     None => {
                         st.kb_sub = false;
@@ -860,7 +860,7 @@ mod tests {
         assert_eq!(v.iter().filter(|e| matches!(e, CtxEntry::Sep)).count(), 1);
     }
 
-    /// 组头：折叠/展开文案随状态切换（回归检查 3）。
+    /// 组头：折叠/展开文案随状态切换（回归）。
     #[test]
     fn header_entries_dynamic_label() {
         let i18n = zh();
@@ -905,7 +905,7 @@ mod tests {
         );
     }
 
-    /// dock 叶：候选 = 全集减自身减已加装（回归检查 6：模块全集不丢项）；
+    /// dock 叶：候选 = 全集减自身减已加装（回归：模块全集不得丢项）；
     /// 三个 ▸ 子菜单（水平/垂直拆分、更换）覆盖同一候选集。
     #[test]
     fn dock_leaf_candidates_complete() {
@@ -944,8 +944,8 @@ mod tests {
             for m in &cands {
                 assert!(
                     acts.iter().any(|a| matches!(a,
-                        MenuAction::DockLeafSplit(ModuleId::Browser, mm, _)
-                        | MenuAction::DockLeafReplace(ModuleId::Browser, mm) if mm == m)),
+            MenuAction::DockLeafSplit(ModuleId::Browser, mm, _)
+            | MenuAction::DockLeafReplace(ModuleId::Browser, mm) if mm == m)),
                     "候选 {m:?} 应在子菜单中"
                 );
             }

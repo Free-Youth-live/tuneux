@@ -523,7 +523,8 @@ impl WordsDecoder {
                         high = low + cm.get(2) - 1;
                         cm.dec2();
                     } else {
-                        low += (ones_count - 2) * cm.get(2);
+                        low =
+                            low.wrapping_add((ones_count.wrapping_sub(2)).wrapping_mul(cm.get(2)));
                         high = low + cm.get(2) - 1;
                         cm.inc2();
                     }
@@ -1421,9 +1422,16 @@ fn decode_stream(bytes: &[u8]) -> Result<DecodedStream, DecodeError> {
                         );
                     }
                 }
-                found.ok_or_else(|| {
+                let rate = found.ok_or_else(|| {
                     DecodeError::Decode("WavPack 非标准采样率缺 SAMPLE_RATE 子块".into())
-                })?
+                })?;
+                // 采样率合理性校验：0 或超上限会以 0 Hz 建重采样器/除零。
+                if rate == 0 || rate > 768_000 {
+                    return Err(DecodeError::Decode(format!(
+                        "WavPack 非标准采样率异常（{rate} Hz）"
+                    )));
+                }
+                rate
             } else {
                 SAMPLE_RATES[header.srate_index() as usize]
             };
@@ -1536,7 +1544,7 @@ pub(crate) fn probe_params(path: &Path) -> Option<AudioParams> {
                 break;
             }
         }
-        found?
+        found.filter(|r| *r > 0 && *r <= 768_000)?
     };
     let channels = first.channels();
     let bits = first.bytes_per_sample() * 8;
@@ -1616,6 +1624,17 @@ pub(crate) struct WavPackBackend {
 impl WavPackBackend {
     /// 打开 `.wv` 文件：整段解码，建立技术参数。
     pub(crate) fn open(path: &Path) -> Result<Self, DecodeError> {
+        // 先查文件大小再读入（预算防线须覆盖读入本身——否则超大 .wv
+        // 先按文件大小分配后才被预算拦截，分配失败即 abort 不可捕获）。
+        let file_len = path
+            .metadata()
+            .map(|m| m.len() as usize)
+            .unwrap_or(usize::MAX);
+        if file_len > DECODE_BUDGET_BYTES {
+            return Err(DecodeError::Unsupported(format!(
+                "WavPack 文件超预算（{file_len} > {DECODE_BUDGET_BYTES} 字节）"
+            )));
+        }
         let bytes = std::fs::read(path)?;
         let decoded = decode_stream(&bytes)?;
 

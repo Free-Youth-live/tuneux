@@ -36,27 +36,33 @@ impl App {
                     self.mouse_menu_bar(me.column, config);
                     return;
                 }
-                // 菜单下拉已打开：点击项执行 / 点别处关闭
-                if self.menu_active && self.menu_dropdown && me.row >= 1 {
+                // 菜单下拉已打开：命中下拉框内的项执行 / 框外只关闭不执行
+                if self.menu_active && self.menu_dropdown {
                     self.menu_dropdown = false;
                     self.menu_active = false;
                     self.menu_sub = None;
-                    // 点击下拉项：执行对应菜单动作（与 Enter 键同路径，灰显项
-                    // 在执行器内给"暂未提供"提示）；子菜单父项只展开不执行
-                    //（子项暂不支持鼠标点选，用键盘）。
-                    if let Some(menu) = crate::tui::app::menu::menus().get(self.menu_top) {
-                        let idx = (me.row - 1) as usize;
-                        if let Some(item) = menu.items.get(idx) {
-                            if item.children.is_some() {
-                                self.menu_active = true;
-                                self.menu_dropdown = true;
-                                self.menu_sub = Some(idx);
-                                self.menu_sub_item = 0;
-                            } else {
-                                self.execute_menu_action(item.action, config);
+                    // 命中判定：用渲染侧写入的下拉框实际矩形（inner 区），
+                    // 而非按行号猜测——下拉 inner.y 起始于菜单栏下第 2 行
+                    //（菜单栏 1 行 + 下拉框上边框 1 行），此前用 row-1 导致
+                    // 整体差一行：点「载入播放列表」实际执行下一项「退出」。
+                    let rect = self.menu_dropdown_rect.get();
+                    if rect.contains((me.column, me.row).into()) {
+                        let inner_y = rect.y;
+                        let idx = (me.row - inner_y) as usize;
+                        if let Some(menu) = crate::tui::app::menu::menus().get(self.menu_top) {
+                            if let Some(item) = menu.items.get(idx) {
+                                if item.children.is_some() {
+                                    self.menu_active = true;
+                                    self.menu_dropdown = true;
+                                    self.menu_sub = Some(idx);
+                                    self.menu_sub_item = 0;
+                                } else {
+                                    self.execute_menu_action(item.action, config);
+                                }
                             }
                         }
                     }
+                    // 框外点击只关闭（上面已关），不执行任何动作
                     return;
                 }
                 // 菜单已激活但点在下拉外：关闭

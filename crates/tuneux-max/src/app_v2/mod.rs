@@ -1,6 +1,6 @@
 //! # max 应用 v2：fx TUI 观感的 egui 界面
 //!
-//! 视觉基准 = tuneux-fx（既定规格冻结）：
+//! 视觉基准 = tuneux-fx（冻结规格）：
 //! - 所有面板 = 边框盒 + 标题嵌入上边框（ratatui Block 同款观感）
 //! - 全局等宽字体、直角、密排间距、选中行反色
 //! - 进度条 / 频谱 / 电平 / 三桶频段全部字符渲染（━●─ / █▓▒░ / 白帽峰值）
@@ -49,9 +49,9 @@ fn display_width(s: &str) -> usize {
         .map(|c| {
             let u = c as u32;
             if matches!(u,
-                0x1100..=0x115F | 0x2E80..=0xA4CF | 0xAC00..=0xD7A3
-                | 0xF900..=0xFAFF | 0xFE30..=0xFE4F | 0xFF00..=0xFF60
-                | 0xFFE0..=0xFFE6 | 0x20000..=0x3FFFD)
+        0x1100..=0x115F | 0x2E80..=0xA4CF | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF | 0xFE30..=0xFE4F | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6 | 0x20000..=0x3FFFD)
             {
                 2
             } else {
@@ -279,7 +279,7 @@ pub struct MaxAppV2 {
     /// 当前播放路径。
     current_path: Option<PathBuf>,
     spectrum_mode: SpectrumMode,
-    /// 峰值保持白帽（corex 算法，既定约定）。
+    /// 峰值保持白帽（corex 统一算法，跨产品同源）。
     spectrum_peaks: tuneux_corex::spectrum::SpectrumPeakHold,
     last_frame: Option<Instant>,
     frame_tick: u64,
@@ -330,6 +330,11 @@ pub struct MaxAppV2 {
     pending_open_files: bool,
     /// 拖拽中的模块（标题带 drag 开始；落到别的叶子松手 = 换位）。
     dock_drag: Option<dock::ModuleId>,
+    /// 退出请求标志：菜单/快捷键路径置位，update() 帧首消费（走 eframe
+    /// 正常关闭路径，使 on_exit 的配置与播放列表持久化必然执行）。
+    quit_requested: bool,
+    /// 上次定时保存时刻（5 秒节律，崩溃/强杀路径的兜底）。
+    last_auto_save: Option<std::time::Instant>,
     /// 待应用的叶子交换（渲染后做树手术）。
     dock_swap: Option<(dock::ModuleId, dock::ModuleId)>,
     /// 浏览器面板矩形（每帧更新；空白区右键命中判定）。
@@ -419,7 +424,7 @@ impl MaxAppV2 {
             None => return (None, None),
         };
         let mut md = self.metadata_cache.get(&it.path).cloned();
-        // 引擎回落（2026-10-15 产品实测补齐）：该行恰为正在播放曲目时，
+        // 引擎回落：该行恰为正在播放曲目时，
         // 引擎快照即此文件的实测参数——FFmpeg 长尾元数据为空兜底时
         // 属性弹窗不再全「未知」。非当前曲目不回落（快照参数不属于它）。
         let cur = self
@@ -513,7 +518,7 @@ impl MaxAppV2 {
 
         // 播放列表状态恢复（mediax PlaylistState 规范格式）：
         // 多列表取活跃列表；旧版单列表字段（items/current/shuffle）作迁移入口。
-        let mut playlist = PlaylistCore::new();
+        let mut playlist = PlaylistCore::new_random();
         let (st, state_status) = crate::config::load_state_with_status();
         // 播放状态文件损坏：状态栏 flash 提示；备份与停写锁已在加载内完成，
         // 本次会话不会覆写原文件。文案构造用 commonx 统一口径
@@ -592,6 +597,8 @@ impl MaxAppV2 {
             pending_menu: None,
             pending_open_files: false,
             dock_drag: None,
+            quit_requested: false,
+            last_auto_save: None,
             dock_swap: None,
             browser_rect: egui::Rect::NOTHING,
             playlist_rect: egui::Rect::NOTHING,
@@ -887,7 +894,7 @@ impl MaxAppV2 {
         self.ui.apply(&action);
 
         match action {
-            Quit => std::process::exit(0),
+            Quit => self.quit_requested = true,
             PlayToggle => self.toggle_play(),
             NextTrack => {
                 let outcome = self.playlist.next(self.config.repeat);
@@ -1229,7 +1236,7 @@ impl MaxAppV2 {
 
     // ==================== EQ / 压缩器面板（fx draw_equalizer/draw_compressor 对应） ====================
 
-    /// 传输工具条（classic-dark 现代模块）：传输键 + seek 滑条 + 音量滑条。
+    /// 传输工具条（经典双肤默认模块）：传输键 + seek 滑条 + 音量滑条。
     fn render_transport(&mut self, ctx: &egui::Context) {
         let pal = self.palette.clone();
         let (dur, pos, playing) = match &self.status {
@@ -1369,7 +1376,7 @@ impl MaxAppV2 {
         let duration = md.duration;
         let prev_path = self.current_path.clone();
         self.current_path = Some(path.clone());
-        // 切曲清零频谱白帽（007 跨产品约定）
+        // 切曲清零频谱白帽（跨产品统一口径）
         self.spectrum_peaks.reset();
         // 展开所在专辑（分组视图下当前曲可见）
         if let Some(a) = &album {
@@ -3255,7 +3262,7 @@ impl MaxAppV2 {
 
     /// 路径入后台扫描队列（递归 + 读标签；再大的目录也不阻塞 UI）。
     /// 在途计数统一由 walker 管理（每弹出项 +1 / 处理完 -1）——
-    /// UI 侧若再加一笔会永久泄漏 +1 = 「扫描中」卡死不灭（实测教训）。
+    /// UI 侧若再加一笔会永久泄漏 +1 = 「扫描中」卡死不灭（实测结论）。
     fn enqueue_scan(&mut self, p: PathBuf) {
         self.scan_pool.submit(p);
     }
@@ -3274,7 +3281,7 @@ impl MaxAppV2 {
     // ==================== TUI 绘制原语 ====================
 
     /// 边框盒：TUI 皮肤 = ratatui Block 风（标题嵌上边线，底色断线）；
-    /// GUI 皮肤（tui_chrome=false，classic-dark 系）= 完整边框 + 标题头部条。
+    /// GUI 皮肤（tui_chrome=false，经典系）= 完整边框 + 标题头部条。
     /// focused = 强调色边框（fx 的焦点面板高亮）。
     fn tui_box<R>(
         ui: &mut Ui,
@@ -3341,7 +3348,7 @@ impl MaxAppV2 {
         p.galley(bg_rect.left_center() + Vec2::new(3.0, 0.0), galley, pal.fg);
     }
 
-    /// GUI 标题（classic-dark 系）：透明背景——不铺任何底色补块，标题文字直接
+    /// GUI 标题（经典系）：透明背景——不铺任何底色补块，标题文字直接
     /// 置于面板底色上（边框完整走通；内容自 24px 起，不与文字重叠）。
     /// 焦点时标题提亮为 fg，否则 fg_weak。
     fn paint_gui_header(p: &egui::Painter, pal: &Palette, rect: Rect, title: &str, focused: bool) {
@@ -3375,9 +3382,9 @@ impl MaxAppV2 {
         }
     }
 
-    /// GUI 频谱（classic-dark 经典风）：实心条 + 缓落峰帽 + dB 网格线 + 频率轴，
+    /// GUI 频谱（经典风）：实心条 + 缓落峰帽 + dB 网格线 + 频率轴，
     /// 纯矩形/文本绘制，无字符网格；条色按高度走 level 三段阈值色
-    /// （classic-dark 经典绿→黄→红观感，调色板驱动；峰帽缓落由 corex
+    /// （经典绿→黄→红观感，调色板驱动；峰帽缓落由 corex
     /// SpectrumPeakHold 驱动，与字符版同一数据链）。
     fn draw_spectrum_gui(
         ui: &Ui,
@@ -3487,7 +3494,7 @@ impl MaxAppV2 {
         }
     }
 
-    /// GUI 示波器（classic-dark 风）：L/R 双波形折线 + 中线基线（纯矢量绘制）。
+    /// GUI 示波器（经典风）：L/R 双波形折线 + 中线基线（纯矢量绘制）。
     fn draw_oscilloscope_gui(
         ui: &Ui,
         pal: &Palette,
@@ -3890,7 +3897,7 @@ impl MaxAppV2 {
                             .enumerate()
                             {
                                 if !pal.tui_chrome {
-                                    // GUI 皮肤：标签 + 实心条（classic-dark 电平条风，无字符）
+                                    // GUI 皮肤：标签 + 实心条（经典电平条风，无字符）
                                     let brect = ui
                                         .allocate_exact_size(
                                             Vec2::new(ui.available_width(), LINE_H),
@@ -3973,7 +3980,7 @@ impl MaxAppV2 {
 
     /// 单声道 VU 行（fx draw_vu_row 同款）：标签青色 + 随机字符柱 + 阈值变色。
     fn vu_row(ui: &mut Ui, pal: &Palette, label: &str, level: f32, tick: u64, seed_off: u64) {
-        // GUI 皮肤：实心电平条 + 阈值变色 + 85% 警戒刻度（classic-dark peak meter 风）
+        // GUI 皮肤：实心电平条 + 阈值变色 + 85% 警戒刻度（经典峰值表风）
         if !pal.tui_chrome {
             let avail = ui.available_width();
             let rect = ui
@@ -4282,7 +4289,7 @@ impl MaxAppV2 {
                     }
                 });
             }
-            // 零匹配提示放在输入行之后（fx 同款教训：提前 return 会
+            // 零匹配提示放在输入行之后（fx 同源口径：提前 return 会
             // 把输入框顶掉，按键仍被搜索分支吞掉 = 隐形模态态）
             if entries.is_empty() {
                 ui.vertical_centered(|ui| {
@@ -4529,7 +4536,7 @@ impl MaxAppV2 {
             let title_px = title_w as f32 * cw;
             let artist_px = artist_w as f32 * cw;
 
-            // classic-dark 列头带（调色板驱动；与行同列位像素对齐）。
+            // 经典列头带（调色板驱动；与行同列位像素对齐）。
             // 横向滚动时隐藏：置顶列头无法与滚动行对齐，宁缺毋错
             let h_scroll = ((ui.available_width() - 8.0) / cw) < natural_cols as f32;
             if show_col_header && !h_scroll {
@@ -4634,7 +4641,7 @@ impl MaxAppV2 {
                                     f,
                                     fg,
                                 );
-                                // classic-dark 分组头下划线（调色板驱动）
+                                // 经典分组头下划线（调色板驱动）
                                 if show_group_rule {
                                     let y = rect.bottom() - 1.0;
                                     pt.line_segment(
@@ -4897,7 +4904,7 @@ impl MaxAppV2 {
         let pal = self.palette.clone();
         let title = self.i18n.t("panel.spectrum").into_owned();
 
-        // dt + 峰值保持（既定约定：必须用 corex SpectrumPeakHold）
+        // dt + 峰值保持（跨产品统一口径：必须用 corex SpectrumPeakHold）
         let now = Instant::now();
         let dt = self
             .last_frame
@@ -4958,7 +4965,7 @@ impl MaxAppV2 {
                 } else {
                     base_cw
                 };
-                // classic-dark 结构特征：右侧 dB 刻度列 + 底部频率轴行（调色板驱动）
+                // 经典结构特征：右侧 dB 刻度列 + 底部频率轴行（调色板驱动）
                 let axis = show_axis;
                 let db_w = if axis { 6 } else { 0 };
                 let axis_row = if axis { 1 } else { 0 };
@@ -5069,7 +5076,7 @@ impl MaxAppV2 {
                 }
                 ui.label(job);
             } else {
-                // GUI 皮肤：实心条 + 峰帽 + 网格/轴（classic-dark 经典风，无字符）
+                // GUI 皮肤：实心条 + 峰帽 + 网格/轴（经典风，无字符）
                 Self::draw_spectrum_gui(ui, &pal, content_rect, &spectrum, &peaks, show_axis);
             }
             // 右键 = 放大频谱字符（白名单交互）。直接查询指针状态而非依赖
@@ -5157,7 +5164,7 @@ impl MaxAppV2 {
                 }
                 ui.label(job);
             } else {
-                // GUI 皮肤：L/R 波形折线（classic-dark 风，无字符）
+                // GUI 皮肤：L/R 波形折线（经典风，无字符）
                 Self::draw_oscilloscope_gui(ui, &pal, &waves);
             }
         });
@@ -5346,7 +5353,7 @@ impl MaxAppV2 {
                         ui.colored_label(pal.accent, fm);
                         return;
                     }
-                    // classic-dark 技术行：codec | 码率 | 采样率 | 声道 | 位置 / 时长
+                    // 经典技术行：codec | 码率 | 采样率 | 声道 | 位置 / 时长
                     if show_tech {
                         let md = self.metadata.as_ref();
                         // 引擎实测源参数：元数据探测缺失时（FFmpeg 长尾格式）
@@ -5376,7 +5383,7 @@ impl MaxAppV2 {
                                 }
                             })
                             .unwrap_or_default();
-                        // 位深段（2026-10-15 补齐）：经典行原仅 codec|码率|
+                        // 位深段：经典行原仅 codec|码率|
                         // 采样率|声道，与现代行不一致；长尾
                         // 格式元数据缺失时回落引擎实测源位深。
                         let bits = md
@@ -5408,7 +5415,7 @@ impl MaxAppV2 {
                     }
                     // 全像素测量：图标/右段实测宽 + 进度字符实测宽 → 柱数
                     //（任何字体的宽度比都精确，不再依赖显示宽度估算）。
-                    let right = format!("{time_str}  {rep}{shuf}  {vol}% {vol_label}");
+                    let right = format!("{time_str} {rep}{shuf} {vol}% {vol_label}");
                     let f = mono(FONT);
                     let icon_px = ui.fonts(|ff| {
                         ff.layout_no_wrap(format!("{icon} "), f.clone(), Color32::WHITE)
@@ -5490,7 +5497,7 @@ impl MaxAppV2 {
                         },
                     );
                     job.append(
-                        &format!("{label}   "),
+                        &format!("{label}  "),
                         0.0,
                         TextFormat::simple(mono(FONT - 1.0), pal.fg),
                     );
@@ -5505,7 +5512,7 @@ impl MaxAppV2 {
         let pal = self.palette.clone();
 
         // —— 统一右键菜单：区域触发（空白区/状态栏；行/叶触发在各面板内），
-        //    渲染与生命周期在 context_menu 只此一份（2026-10-15 右键菜单统一重写）——
+        //  渲染与生命周期在 context_menu 只此一份——
         if ctx.input(|i| i.pointer.secondary_clicked()) {
             if let Some(hp) = ctx.input(|i| i.pointer.hover_pos()) {
                 self.trigger_zone_ctx(ctx, hp);
@@ -5557,7 +5564,7 @@ impl MaxAppV2 {
             let t_title = self.i18n.t("popup.properties").into_owned();
             let (md, path) = self.properties_data();
             let mut open_flag = self.properties_visible;
-            egui::Window::new(format!("  {}  ", t_title))
+            egui::Window::new(format!(" {} ", t_title))
                 .open(&mut open_flag)
                 .collapsible(false)
                 .resizable(false)
@@ -5629,7 +5636,7 @@ impl MaxAppV2 {
         }
 
         // —— 关于弹窗（fx draw_about 同款：字标 + 品牌 + 运行态自检 +
-        //    快捷键速查 + 第三方依赖 + 许可/离线声明）——
+        //  快捷键速查 + 第三方依赖 + 许可/离线声明）——
         if self.ui.about_visible {
             let pal = self.palette.clone();
             let (t_title, t_brand, t_tag, t_cat, t_fmt) = (
@@ -5656,7 +5663,7 @@ impl MaxAppV2 {
             // 插件自检标记：已加载 √，未加载 —（fx 同口径）
             let mark = |loaded: bool| if loaded { "√" } else { "—" };
             let selfcheck = format!(
-                "{}：{} {}  {} {}  {} {}",
+                "{}：{} {} {} {} {} {}",
                 t_cat,
                 t_eq,
                 mark(self.eq_plugin.is_some()),
@@ -5772,6 +5779,22 @@ impl eframe::App for MaxAppV2 {
                 self.ctx_menu = None;
             }
         }
+        // 退出请求 → 走 eframe 正常关闭（触发 on_exit 持久化）。
+        if self.quit_requested {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        // 定时保存（5 秒节律 + 脏标记）：崩溃/强杀路径下 on_exit 也不会跑，
+        // 与双 TUI 的定时保存口径对齐。
+        if let Some(at) = self.last_auto_save {
+            if at.elapsed() >= std::time::Duration::from_secs(5) {
+                self.last_auto_save = Some(std::time::Instant::now());
+                crate::config::save(&self.config);
+            }
+        } else {
+            self.last_auto_save = Some(std::time::Instant::now());
+        }
+
         self.status_rect = egui::Rect::NOTHING;
         // 主题 + TUI 紧凑风格（每帧下发，皮肤切换即时生效）
         theme::apply_visuals(ctx, &self.palette);
@@ -5951,7 +5974,7 @@ impl eframe::App for MaxAppV2 {
         // 面板渲染顺序 = egui 布局顺序：
         // 顶：菜单栏 → 当前曲目；底：功能键栏（最先声明=最底）→ 状态栏
         self.render_menu_bar(ctx);
-        // 传输工具条（classic-dark 默认模块；右键/菜单可加装或移除）
+        // 传输工具条（经典双肤默认模块；右键/菜单可加装或移除）
         if self.mod_on("transport") {
             self.render_transport(ctx);
         }
