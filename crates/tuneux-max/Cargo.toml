@@ -16,7 +16,7 @@
 
 [package]
 name = "tuneux-max"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 license = "MulanPSL-2.0"
 authors = ["不羁的青春（FreeYouth）"]

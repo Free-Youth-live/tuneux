@@ -106,10 +106,10 @@ mod tests {
     fn add_then_update() {
         let mut list = BookmarkList::default();
         assert!(list.add(Path::new("/a.mp3"), None, 10.0, "A"));
-        assert!(!list.add(Path::new("/a.mp3"), None, 20.0, "A二"));
+        assert!(!list.add(Path::new("/a.mp3"), None, 20.0, "A-2"));
         let b = list.get(Path::new("/a.mp3")).unwrap();
         assert_eq!(b.position_secs, 20.0);
-        assert_eq!(b.label, "A二");
+        assert_eq!(b.label, "A-2");
         assert_eq!(list.items.len(), 1);
     }
 

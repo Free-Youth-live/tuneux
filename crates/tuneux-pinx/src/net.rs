@@ -420,7 +420,7 @@ mod tests {
         );
     }
 
-    // —— 负向用例：每种绕过一个测试 ——
+    // —— URL 预检负向用例：每种绕过手法一个测试 ——
 
     #[test]
     fn rejects_userinfo_spoofing() {

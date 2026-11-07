@@ -232,7 +232,6 @@ fn medium_key(m: PlaybackMedium) -> &'static str {
     }
 }
 
-/// 频谱面板模式（v 键循环，与 fx SpectrumMode 同源；Oscilloscope/Plugin 属第二类）。
 /// 播放列表可见行（平铺 = 全 Track；专辑分组 = Header+Track 交替）。
 #[derive(Clone)]
 enum PlRow {
@@ -242,9 +241,12 @@ enum PlRow {
     Track { item: usize, seq: usize },
 }
 
+/// 频谱面板的显示模式（`v` 键循环切换；与 fx 的 SpectrumMode 同源语义）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SpectrumMode {
+    /// 不显示频谱模块。
     Hidden,
+    /// 频谱（频域柱状）。
     Full,
     /// 示波器（时域波形，fx v 循环第四态）。
     Oscilloscope,

@@ -278,7 +278,7 @@ mod tests {
         // UTF-8 BOM
         let utf8_bom = [0xEF, 0xBB, 0xBF, 0xE4, 0xBD, 0xA0, 0xE5, 0xA5, 0xBD];
         assert_eq!(decode_bytes(&utf8_bom), "你好");
-        // GBK（"你好" = C4E3BAC3）
+        // GBK（"你好" = 0xC4 0xE3 0xBA 0xC3）
         let gbk = [0xC4, 0xE3, 0xBA, 0xC3];
         assert_eq!(decode_bytes(&gbk), "你好");
     }
