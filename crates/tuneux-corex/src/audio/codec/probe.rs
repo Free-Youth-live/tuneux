@@ -12,9 +12,11 @@ use std::path::Path;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::{MetadataOptions, MetadataRevision, StandardTag, StandardVisualKey};
+use symphonia::core::meta::{
+    MetadataOptions, MetadataRevision, StandardTag, StandardVisualKey, Visual,
+};
 
-use super::decoder::{codec_name_or_ext, AudioParams};
+use super::decoder::{bits_per_sample_with_alac, codec_name_resolved, AudioParams};
 
 /// 探测得到的原始标签（供媒体层组装 `TrackMetadata`，不泄露 symphonia 类型）。
 #[derive(Debug, Default, Clone)]
@@ -82,8 +84,8 @@ pub fn probe_metadata(path: &Path) -> Option<(AudioParams, ProbeTags)> {
     let params = AudioParams::new(
         audio_params.sample_rate,
         audio_params.channels.as_ref().map(|c| c.count() as u16),
-        audio_params.bits_per_sample,
-        codec_name_or_ext(&audio_params.codec.to_string(), path),
+        bits_per_sample_with_alac(audio_params),
+        codec_name_resolved(audio_params.codec, path),
         track_id,
         duration_secs,
     );
@@ -93,24 +95,39 @@ pub fn probe_metadata(path: &Path) -> Option<(AudioParams, ProbeTags)> {
     let mut tags = ProbeTags::default();
     if let Some(rev) = metadata.current() {
         fill_tags(&mut tags, rev);
-        // 封面：symphonia 把 FLAC PICTURE / MP3 APIC 都归一为 Visual。
-        // 按用途优先取 FrontCover（标准封面），退而 BackCover，
-        // 再退到任意非空 visual——避免 FileIcon / Logo 之类的小图先被误取。
-        tags.cover = rev
-            .media
-            .visuals
-            .iter()
-            .find(|v| !v.data.is_empty() && matches!(v.usage, Some(StandardVisualKey::FrontCover)))
-            .or_else(|| {
-                rev.media.visuals.iter().find(|v| {
-                    !v.data.is_empty() && matches!(v.usage, Some(StandardVisualKey::BackCover))
-                })
-            })
-            .or_else(|| rev.media.visuals.iter().find(|v| !v.data.is_empty()))
-            .and_then(|v| v.media_type.clone().map(|m| (v.data.to_vec(), m)));
+        tags.cover = select_cover(&rev.media.visuals);
     }
 
     Some((params, tags))
+}
+
+/// 封面三级回退（FrontCover → BackCover → 任意）：每一级都要求 visual
+/// 既有非空 data 又有 media_type——缺 MIME 的候选不再拦住整条回退链
+/// （旧缺陷：先选出 visual 再取 media_type，Front 有数据无 MIME 时整链
+/// 得 None，带 MIME 的 Back 不被尝试）。
+fn select_cover(visuals: &[Visual]) -> Option<(Vec<u8>, String)> {
+    let usable = |v: &Visual| {
+        if v.data.is_empty() {
+            return None;
+        }
+        v.media_type.as_ref().map(|m| (v.data.to_vec(), m.clone()))
+    };
+    visuals
+        .iter()
+        .find(|v| matches!(v.usage, Some(StandardVisualKey::FrontCover)))
+        .and_then(usable)
+        .or_else(|| {
+            visuals
+                .iter()
+                .find(|v| matches!(v.usage, Some(StandardVisualKey::BackCover)))
+                .and_then(usable)
+        })
+        .or_else(|| {
+            visuals
+                .iter()
+                .find(|v| !v.data.is_empty() && v.media_type.is_some())
+                .and_then(usable)
+        })
 }
 
 /// 从 symphonia 的 `MetadataRevision` 填充标签字段。
@@ -150,5 +167,78 @@ fn fill_tags(tags: &mut ProbeTags, rev: &MetadataRevision) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! 封面三级回退选择的单元测试（直接构造 symphonia Visual，
+    //! 不依赖真实媒体文件）。
+    use super::*;
+
+    /// 构造一个测试用 Visual。
+    fn visual(data: &[u8], media_type: Option<&str>, usage: Option<StandardVisualKey>) -> Visual {
+        Visual {
+            media_type: media_type.map(str::to_string),
+            dimensions: None,
+            color_mode: None,
+            usage,
+            tags: Vec::new(),
+            data: data.into(),
+        }
+    }
+
+    /// 主缺陷回归：FrontCover 有数据但缺 MIME，BackCover 有数据带 MIME——
+    /// 旧实现先选 visual 再取 media_type，整链得 None；修复后回退选中
+    /// BackCover。
+    #[test]
+    fn cover_fallback_skips_front_without_mime() {
+        let visuals = vec![
+            visual(&[1, 2, 3], None, Some(StandardVisualKey::FrontCover)),
+            visual(
+                &[4, 5, 6],
+                Some("image/jpeg"),
+                Some(StandardVisualKey::BackCover),
+            ),
+        ];
+        let cover = select_cover(&visuals).expect("应回退选中 BackCover");
+        assert_eq!(cover.0, vec![4, 5, 6]);
+        assert_eq!(cover.1, "image/jpeg");
+    }
+
+    /// Front 有数据带 MIME：优先 Front，不回退。
+    #[test]
+    fn cover_prefers_front_with_mime() {
+        let visuals = vec![
+            visual(&[1], Some("image/png"), Some(StandardVisualKey::FrontCover)),
+            visual(&[2], Some("image/jpeg"), Some(StandardVisualKey::BackCover)),
+        ];
+        let cover = select_cover(&visuals).expect("应选中 FrontCover");
+        assert_eq!(cover.0, vec![1]);
+        assert_eq!(cover.1, "image/png");
+    }
+
+    /// Front 缺 MIME、Back 空数据带 MIME、第三个无用途但有数据带 MIME：
+    /// 回退链逐级下探，最终落到任意级。
+    #[test]
+    fn cover_fallback_reaches_any_tier() {
+        let visuals = vec![
+            visual(&[1], None, Some(StandardVisualKey::FrontCover)),
+            visual(&[], Some("image/jpeg"), Some(StandardVisualKey::BackCover)),
+            visual(&[9], Some("image/png"), None),
+        ];
+        let cover = select_cover(&visuals).expect("应落到任意级");
+        assert_eq!(cover.0, vec![9]);
+        assert_eq!(cover.1, "image/png");
+    }
+
+    /// 全部候选都缺 MIME：None。
+    #[test]
+    fn cover_none_when_all_missing_mime() {
+        let visuals = vec![
+            visual(&[1], None, Some(StandardVisualKey::FrontCover)),
+            visual(&[2], None, None),
+        ];
+        assert!(select_cover(&visuals).is_none());
     }
 }

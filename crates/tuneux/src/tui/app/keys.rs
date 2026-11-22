@@ -15,8 +15,9 @@ use super::App;
 ///
 /// 规则：
 /// - `Char(' ')` → `"space"`；
-/// - 字母键：无修饰符原样（`'n'`→`"n"`）；带 SHIFT 时转小写并加 `"shift+"`
-///   前缀（终端常把 Shift+n 上报为 `Char('N') + SHIFT`，统一成 `"shift+n"`）；
+/// - 字母键：恒转小写（无修饰时终端上报恒为小写，大写只可能来自
+///   SHIFT 或 CapsLock——SHIFT 计入下方 `"shift+"` 前缀，CapsLock 则归一
+///   掉，保证配置 `"n"` 在两种键盘状态下都命中）；带 SHIFT 时加 `"shift+"` 前缀；
 /// - 符号键（`+`、`-`、`=`、`/` 等）：忽略 SHIFT——打出符号本身常需按住
 ///   Shift，若计入前缀会导致 `"+"` 永远匹配不上，故按符号本身输出；
 /// - 具名键映射为小写单词（`Up`→`"up"`、`Tab`→`"tab"` 等）；
@@ -27,8 +28,9 @@ fn key_to_desc(key: &KeyEvent) -> Option<String> {
     let base = match key.code {
         KeyCode::Char(' ') => "space".to_string(),
         KeyCode::Char(c) => {
-            // 字母 + SHIFT：统一小写，交给下方 shift+ 前缀（屏蔽终端大小写差异）
-            if key.modifiers.contains(KeyModifiers::SHIFT) && c.is_ascii_alphabetic() {
+            // 字母恒转小写：无修饰大写只来自 CapsLock，归一后配置 "n" 恒命中；
+            // SHIFT 在下方单独计 shift+ 前缀（屏蔽终端大小写差异）。
+            if c.is_ascii_alphabetic() {
                 c.to_ascii_lowercase().to_string()
             } else {
                 c.to_string()
@@ -148,6 +150,21 @@ impl App {
         config.spectrum_mode = self.spectrum_mode;
     }
 
+    pub(crate) fn action_cycle_theme(&mut self, config: &mut Config) {
+        // t：循环切换内置主题（终端原生→磷光绿→经典→深蓝→藏青→黑白→灰白→暗彩）。
+        // 即时生效（set_theme 写当前 UI 线程调色板，下一帧即新色）并写回 config.theme
+        // （退出随配置持久化），无需手改 toml / 重启。
+        let next = crate::tui::palette::next_theme_id(&config.theme);
+        config.theme = next.to_string();
+        crate::tui::palette::set_theme(next);
+        let msg = format!(
+            "{}: {}",
+            self.i18n.t("msg.theme"),
+            self.i18n.t(&format!("theme.{next}"))
+        );
+        self.flash_message(&msg);
+    }
+
     pub(crate) fn action_toggle_browser(&mut self, config: &mut Config) {
         // b：Hidden ↔ Browser（互斥：开浏览器会关掉封面）
         if self.left_panel == LeftPanel::Browser {
@@ -234,6 +251,10 @@ impl App {
                 self.action_cycle_visual(config);
                 true
             }
+            "cycle_theme" => {
+                self.action_cycle_theme(config);
+                true
+            }
             "toggle_group_view" => {
                 self.action_toggle_group_view(config);
                 true
@@ -258,6 +279,11 @@ impl App {
     /// 封面浏览模式按键：Up/Down/j/k 移动、Enter 播放、PageUp/PageDown 翻页；
     /// 其余键（含 c 切换、n/p 切曲、Left/Right seek、l 歌词）返回 false 走全局，避免冲突。
     fn handle_cover_browser_key(&mut self, key: KeyEvent, config: &mut Config) -> bool {
+        // 封面浏览无搜索：/ 在封面浏览态吃掉不响应（否则落入播放列表搜索，
+        // 搜索框作用于封面面板之外的列表，界面指向混乱）。
+        if key.code == KeyCode::Char('/') {
+            return true;
+        }
         let albums = self.cover_browser_albums();
         let count = albums.len();
         if count == 0 {
@@ -278,7 +304,7 @@ impl App {
                     let path = path.clone();
                     if let Some(idx) = self.playlist.items().iter().position(|it| it.path == path) {
                         self.playlist.jump_to(idx);
-                        self.play_and_update_current(idx, config);
+                        self.play_and_update_current(idx, config, true);
                     }
                 }
             }
@@ -377,7 +403,7 @@ impl App {
                                 if self.filter_playlist().contains(&sel) {
                                     // 手动点选播放：压入 history。
                                     self.playlist.jump_to(sel);
-                                    self.play_and_update_current(sel, config);
+                                    self.play_and_update_current(sel, config, true);
                                 }
                             }
                         }
@@ -471,13 +497,19 @@ impl App {
             }
             KeyCode::Right => {
                 if let Some(engine) = &self.engine {
-                    let dur = engine.duration();
-                    let new_pos = if dur > 0.0 {
-                        (engine.position() + 5.0).min(dur)
+                    let target = engine.position() + 5.0;
+                    let new_pos = if self.current_item_is_cue() {
+                        // CUE 的进度是整文件绝对秒数，不能用分轨时长钳制它。
+                        self.clamp_cue_seek(target)
                     } else {
-                        engine.position() + 5.0
+                        let dur = engine.duration();
+                        if dur > 0.0 {
+                            target.min(dur)
+                        } else {
+                            target
+                        }
                     };
-                    engine.send(audio::AudioCmd::Seek(self.clamp_cue_seek(new_pos)));
+                    engine.send(audio::AudioCmd::Seek(new_pos));
                 }
                 return true;
             }
@@ -490,7 +522,10 @@ impl App {
                 self.volume_down();
                 return true;
             }
-            KeyCode::Char('a') => {
+            // a 键作用于浏览器当前条目：仅左侧面板为 Browser（浏览器可见）
+            // 时响应——隐藏/封面态按 a 会把不可见面板的选中条目加入列表
+            //（与 Tab 的「浏览器仅在可见时可聚焦」不变式同口径）。
+            KeyCode::Char('a') if self.left_panel == LeftPanel::Browser => {
                 self.add_current_browser_to_playlist(config);
                 return true;
             }
@@ -508,6 +543,10 @@ impl App {
             }
             KeyCode::Char('m') => {
                 self.action_cycle_medium(config);
+                return true;
+            }
+            KeyCode::Char('t') => {
+                self.action_cycle_theme(config);
                 return true;
             }
             KeyCode::Char('x') => {
@@ -605,7 +644,7 @@ impl App {
                         Some(playlist::Selection::Track(i)) => {
                             // 手动点选播放：压入 history。
                             self.playlist.jump_to(i);
-                            self.play_and_update_current(i, config);
+                            self.play_and_update_current(i, config, true);
                         }
                         Some(playlist::Selection::Album(a)) => {
                             self.playlist.toggle_album(&a);
@@ -613,7 +652,7 @@ impl App {
                         None => {
                             if !self.playlist.is_empty() {
                                 self.playlist.jump_to(0);
-                                self.play_and_update_current(0, config);
+                                self.play_and_update_current(0, config, true);
                             }
                         }
                     }

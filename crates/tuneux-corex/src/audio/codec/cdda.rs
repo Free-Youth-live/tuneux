@@ -56,6 +56,56 @@ const CD_SYNC: [u8; 12] = [
     0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,
 ];
 
+/// 字节窗口内不同字节值的个数（子通道典型 <6，音频通常 ≥6）。
+fn distinct_count(buf: &[u8]) -> usize {
+    let mut seen = [false; 256];
+    let mut n = 0usize;
+    for &b in buf {
+        if !seen[b as usize] {
+            seen[b as usize] = true;
+            n += 1;
+        }
+    }
+    n
+}
+
+/// 校验 16+ 字节子通道窗口的 Q 通道 CRC-16（IEC 60908）：
+/// 窗口按「P 12 字节 + Q 12 字节」布局，Q 前 10 字节为数据、
+/// 后 2 字节为大端 CRC。子通道全零时 CRC 亦为 0，天然通过。
+fn subchannel_q_crc_ok(buf: &[u8]) -> bool {
+    if buf.len() < 24 {
+        return false;
+    }
+    let mut crc: u16 = 0;
+    for &b in &buf[12..22] {
+        crc ^= u16::from(b) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
+        }
+    }
+    u16::from_be_bytes([buf[22], buf[23]]) == crc
+}
+
+/// 读取子通道候选窗口（24 字节）与音频参照窗口（16 字节）；
+/// 任一读取失败返回 None（调用方按无证据处理）。
+fn read_probe_windows(
+    f: &mut std::fs::File,
+    sub_off: u64,
+    aud_off: u64,
+) -> Option<([u8; 24], [u8; 16])> {
+    let mut sub = [0u8; 24];
+    let mut aud = [0u8; 16];
+    f.seek(SeekFrom::Start(sub_off)).ok()?;
+    f.read_exact(&mut sub).ok()?;
+    f.seek(SeekFrom::Start(aud_off)).ok()?;
+    f.read_exact(&mut aud).ok()?;
+    Some((sub, aud))
+}
+
 /// 探测扇区尺寸：文件大小整除判定 + 首扇区同步模式二次确认。
 ///
 /// 单纯用整除有互素陷阱：2448/2352 = 51/49 互素，扇区数为 49 的倍数时
@@ -82,28 +132,47 @@ fn detect_sector_size(path: &Path) -> Option<usize> {
             // 镜像上恒为 false → 误判 2448 → 按 2448 步进读 2352 数据
             // = 整轨错位爆音。
             //
-            // 替代判据（不依赖同步头）：读两种步长下第二扇区起始处
-            // 各 16 字节，检测哪个位置的数据更像子通道尾（2448 形态下
-            // offset 2352 处是第一扇区最后 96 字节子通道）。
-            // 子通道 P-W 的特征：字节值集中在 0x00/0xFF 或有重复模式，
-            // 而音频 PCM 样本的字节值分布更均匀。
-            // 简化检测：16 字节内不同字节值的个数（子通道通常 < 6 种，
-            // 音频通常 > 8 种）。
-            let mut buf_a = [0u8; 16]; // offset 2352（2352 形态的第二扇区头 / 2448 形态的子通道尾）
+            // 单点「offset 2352 处 16 字节 distinct<6」启发式有两个
+            // 误判方向：数字静音段（16 字节全零 distinct=1）被误判
+            // 2448；高多样性子通道（Q 数据含 BCD 时间与 CRC，distinct
+            // 可达 ≥6）被误判 2352。改为「多扇区一致性投票 + Q 子码
+            // CRC 复查」：
+            // - 子通道候选位（2448 形态第 n 扇区子通道尾 = 2352+n×2448，
+            //   2352 形态下同为音频）与音频参照位（(n+1)×2448，两种
+            //   形态下都是音频）成对采样 4 组。候选位呈子通道特征
+            //   （distinct<6）且参照位有音频多样性（distinct≥6）才算
+            //   2448 证据；静音处两者同为全零 → 不算证据，多数扇区仍
+            //   投 2352。候选位呈音频特征（distinct≥6）算 2352 证据。
+            // - Q 子码 CRC-16（IEC 60908，Q 数据 10 字节 + 大端 CRC
+            //   2 字节）多块合法是 2448 的强证据：音频字节恰好通过
+            //   CRC 的概率 2^-16/块，两块以上同过概率可忽略；全零子
+            //   通道的 CRC 亦为 0 天然通过，但要求音频参照位确有内容
+            //   （distinct≥2），排除静音镜像全零窗口的伪通过。
+            const SAMPLE_BLOCKS: usize = 4;
             let Ok(mut f) = std::fs::File::open(path) else {
                 return Some(SECTOR_AUDIO); // 保守：打不开按 2352
             };
-            let read_ok = f
-                .seek(std::io::SeekFrom::Start(SECTOR_AUDIO as u64))
-                .and_then(|_| f.read_exact(&mut buf_a))
-                .is_ok();
-            if !read_ok {
-                return Some(SECTOR_AUDIO);
+            let mut crc_ok_blocks = 0usize;
+            let mut votes_raw = 0usize;
+            let mut votes_audio = 0usize;
+            for n in 0..SAMPLE_BLOCKS {
+                let sub_off = SECTOR_AUDIO as u64 + n as u64 * SECTOR_RAW as u64;
+                let aud_off = (n + 1) as u64 * SECTOR_RAW as u64;
+                let Some((sub, aud)) = read_probe_windows(&mut f, sub_off, aud_off) else {
+                    continue; // 读不到即无证据，跳过该组
+                };
+                let sub_distinct = distinct_count(&sub);
+                let aud_distinct = distinct_count(&aud);
+                if aud_distinct >= 2 && subchannel_q_crc_ok(&sub) {
+                    crc_ok_blocks += 1;
+                }
+                if sub_distinct < 6 && aud_distinct >= 6 {
+                    votes_raw += 1;
+                } else if sub_distinct >= 6 {
+                    votes_audio += 1;
+                }
             }
-            let distinct_a: std::collections::HashSet<u8> = buf_a.iter().copied().collect();
-            // offset 2352 处子通道种类少（< 6）→ 是 2448 形态；
-            // 否则更像音频 → 2352 形态。
-            if distinct_a.len() < 6 {
+            if crc_ok_blocks >= 2 || votes_raw > votes_audio {
                 Some(SECTOR_RAW)
             } else {
                 Some(SECTOR_AUDIO)
@@ -288,7 +357,9 @@ impl<R: Read + Seek + Send> DecoderBackend for CddaBackend<R> {
         self.cursor = sector * SAMPLES_PER_SECTOR as u64;
         self.reader
             .seek(SeekFrom::Start(sector * self.sector_step))?;
-        Ok(secs)
+        // 返回实际落点（钳制后的扇区对应秒数）：越界 seek 不得把进度设到
+        // 超出时长的请求值（引擎以返回值为准 reset_position）。
+        Ok(sector as f64 / 75.0)
     }
 }
 
@@ -488,6 +559,128 @@ mod tests {
             Err(DecodeError::Unsupported(_))
         ));
         assert_eq!(probe_sample_rate(&path), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ----------------------------------------------------------------
+    // 二义扇区尺寸（2352/2448 双整除）探测
+    // ----------------------------------------------------------------
+
+    /// 生成字节多样性高的已知 PCM（伪随机：任意 16 字节窗口 distinct ≥ 6，
+    /// 供二义探测测试的音频参照位使用）：扇区 s 帧 f 的样本值 =
+    /// (s*7919 + f*1049) & 0x7FFF（i16，两声道同值）。
+    fn gen_pcm_varied(sectors: usize) -> Vec<u8> {
+        let mut data = Vec::with_capacity(sectors * SECTOR_AUDIO);
+        for s in 0..sectors {
+            for f in 0..SAMPLES_PER_SECTOR {
+                let v = ((s * 7919 + f * 1049) & 0x7FFF) as i16;
+                data.extend_from_slice(&v.to_le_bytes());
+                data.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        data
+    }
+
+    /// 构造 96 字节「高多样性」子通道块：P 12 字节 00/FF 交替 +
+    /// Q 数据 [41 05 01 12 34 56 00 00 00 00] + 大端 CRC-16 0x8B42 +
+    /// 余量补零。窗口前 16 字节 distinct = 6，单点启发式会误判 2352。
+    fn q_subchannel() -> [u8; SUBCHANNEL_SIZE] {
+        let mut sub = [0u8; SUBCHANNEL_SIZE];
+        for (i, b) in sub[..12].iter_mut().enumerate() {
+            *b = if i % 2 == 0 { 0x00 } else { 0xFF };
+        }
+        sub[12..22].copy_from_slice(&[0x41, 0x05, 0x01, 0x12, 0x34, 0x56, 0x00, 0x00, 0x00, 0x00]);
+        sub[22] = 0x8B;
+        sub[23] = 0x42;
+        sub
+    }
+
+    /// 二义尺寸（51×2352 = 49×2448）+ 第二扇区数字静音：单点 distinct
+    /// 启发式把 16 字节全零窗口误判 2448 → 每扇区 96 字节真实音频当
+    /// 子通道跳过、整轨错位爆音；修复后多扇区投票判 2352，与 2352
+    /// 参考解码位级一致。
+    #[test]
+    fn ambiguous_size_silent_second_sector_votes_2352() {
+        let mut pcm = gen_pcm_varied(51);
+        pcm[SECTOR_AUDIO..2 * SECTOR_AUDIO].fill(0); // 第二扇区数字静音
+        let path = write_temp(&pcm, "bin");
+        let mut b = CddaBackend::open(&path).expect("应能打开");
+        assert_eq!(
+            b.sector_step, SECTOR_AUDIO as u64,
+            "静音第二扇区不应误判 2448"
+        );
+        let got = decode_all(&mut b);
+        let want = decode_all(
+            &mut CddaBackend::from_reader(std::io::Cursor::new(pcm.clone()), SECTOR_AUDIO, 51)
+                .expect("参照应能构造"),
+        );
+        assert_eq!(got.len(), want.len(), "样本总数应与 2352 口径一致");
+        for (i, (x, y)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "第 {i} 个样本不一致（误判 2448 错位）"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 二义尺寸 + 高多样性子通道（Q 数据含 BCD 时间与 CRC，窗口
+    /// distinct ≥ 6）：单点 distinct 启发式误判 2352 → 96 字节子通道
+    /// 当音频输出爆音；修复后 Q 子码 CRC 多块复查判 2448，解码结果
+    /// 与 2352 参考位级一致（20261114 的 2448 多块整扇区重写不回退）。
+    #[test]
+    fn ambiguous_size_q_subchannel_crc_votes_2448() {
+        let pcm = gen_pcm_varied(49);
+        let mut raw = Vec::with_capacity(49 * SECTOR_RAW);
+        for s in 0..49 {
+            raw.extend_from_slice(&pcm[s * SECTOR_AUDIO..(s + 1) * SECTOR_AUDIO]);
+            raw.extend_from_slice(&q_subchannel());
+        }
+        let path = write_temp(&raw, "bin");
+        let mut b = CddaBackend::open(&path).expect("应能打开");
+        assert_eq!(
+            b.sector_step, SECTOR_RAW as u64,
+            "高多样性子通道不应误判 2352"
+        );
+        let got = decode_all(&mut b);
+        let want = decode_all(
+            &mut CddaBackend::from_reader(std::io::Cursor::new(pcm.clone()), SECTOR_AUDIO, 49)
+                .expect("参照应能构造"),
+        );
+        assert_eq!(got.len(), want.len(), "样本总数应与 2352 参考一致");
+        for (i, (x, y)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "第 {i} 个样本不一致（子通道未剥离）"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 二义尺寸 + 全零子通道（正常音频）：CRC（全零块天然合法）与
+    /// 多扇区投票双路径都应判 2448——2448 双路径既有回归的补充覆盖。
+    #[test]
+    fn ambiguous_size_zero_subchannel_votes_2448() {
+        let pcm = gen_pcm_varied(49);
+        let mut raw = Vec::with_capacity(49 * SECTOR_RAW);
+        for s in 0..49 {
+            raw.extend_from_slice(&pcm[s * SECTOR_AUDIO..(s + 1) * SECTOR_AUDIO]);
+            raw.extend_from_slice(&[0u8; SUBCHANNEL_SIZE]);
+        }
+        let path = write_temp(&raw, "bin");
+        let mut b = CddaBackend::open(&path).expect("应能打开");
+        assert_eq!(b.sector_step, SECTOR_RAW as u64, "全零子通道应判 2448");
+        let got = decode_all(&mut b);
+        let want = decode_all(
+            &mut CddaBackend::from_reader(std::io::Cursor::new(pcm.clone()), SECTOR_AUDIO, 49)
+                .expect("参照应能构造"),
+        );
+        assert_eq!(got.len(), want.len(), "样本总数应与 2352 参考一致");
+        for (i, (x, y)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "第 {i} 个样本不一致");
+        }
         let _ = std::fs::remove_file(&path);
     }
 }

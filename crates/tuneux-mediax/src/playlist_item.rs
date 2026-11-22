@@ -81,6 +81,15 @@ pub fn clamp_seek_to_cue(pos: f64, cue: Option<&CueRef>) -> f64 {
     }
 }
 
+/// 把整文件的绝对进度换算为 CUE 分轨内进度，供歌词和波形使用。
+/// 普通曲目原样返回；CUE 起点之前按 0 处理。
+pub fn cue_relative_position(position: f64, cue: Option<&CueRef>) -> f64 {
+    match cue {
+        Some(cue) => (position - cue.start_ms as f64 / 1000.0).max(0.0),
+        None => position,
+    }
+}
+
 // =============================================================================
 // 单元测试
 // =============================================================================
@@ -163,5 +172,13 @@ track_number = 1
         };
         assert_eq!(clamp_seek_to_cue(99.0, Some(&last)), 99.0);
         assert_eq!(clamp_seek_to_cue(0.0, Some(&last)), 10.0);
+    }
+
+    #[test]
+    fn cue_relative_position_subtracts_track_start() {
+        let cue = sample_item().cue.unwrap();
+        assert_eq!(cue_relative_position(15.0, Some(&cue)), 5.0);
+        assert_eq!(cue_relative_position(2.0, Some(&cue)), 0.0);
+        assert_eq!(cue_relative_position(15.0, None), 15.0);
     }
 }

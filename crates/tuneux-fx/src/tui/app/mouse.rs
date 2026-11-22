@@ -38,17 +38,44 @@ impl App {
                 }
                 // 菜单下拉已打开：命中下拉框内的项执行 / 框外只关闭不执行
                 if self.menu_active && self.menu_dropdown {
+                    let sub_open = self.menu_sub;
+                    // 先关（框外点击只关闭不执行），再按命中矩形解析。
                     self.menu_dropdown = false;
                     self.menu_active = false;
                     self.menu_sub = None;
-                    // 命中判定：用渲染侧写入的下拉框实际矩形（inner 区），
-                    // 而非按行号猜测——下拉 inner.y 起始于菜单栏下第 2 行
-                    //（菜单栏 1 行 + 下拉框上边框 1 行），此前用 row-1 导致
-                    // 整体差一行：点「载入播放列表」实际执行下一项「退出」。
+                    let pos = Position::new(me.column, me.row);
+                    // 子菜单命中：按子菜单矩形 + children 下标解析（渲染与点击
+                    // 同源矩形——此前子菜单渲染后覆盖 menu_dropdown_rect，
+                    // 点击仍按顶级菜单索引解析：点的是子菜单项、执行的是错误的
+                    // 顶级动作，点主下拉其余项只关不执行）。子菜单后画覆盖在
+                    // 主下拉之上（窄终端允许重叠），命中优先级同绘制序。
+                    if let Some(sub_idx) = sub_open {
+                        let sub_rect = self.menu_sub_rect.get();
+                        if sub_rect.contains(pos) {
+                            let idx = (me.row - sub_rect.y) as usize;
+                            if let Some(menu) = crate::tui::app::menu::menus().get(self.menu_top) {
+                                if let Some(children) = menu
+                                    .items
+                                    .get(sub_idx)
+                                    .and_then(|it| it.children.as_deref())
+                                {
+                                    // 子菜单最多一层，子项为叶项：直接执行。
+                                    if let Some(item) = children.get(idx) {
+                                        self.execute_menu_action(item.action, config);
+                                    }
+                                }
+                            }
+                            return;
+                        }
+                    }
+                    // 主下拉命中：按主下拉矩形解析顶级项。
+                    // 用渲染侧写入的下拉框实际矩形（inner 区），而非按行号
+                    // 猜测——下拉 inner.y 起始于菜单栏下第 2 行（菜单栏 1 行 +
+                    // 下拉框上边框 1 行），此前用 row-1 导致整体差一行：
+                    // 点「载入播放列表」实际执行下一项「退出」。
                     let rect = self.menu_dropdown_rect.get();
-                    if rect.contains((me.column, me.row).into()) {
-                        let inner_y = rect.y;
-                        let idx = (me.row - inner_y) as usize;
+                    if rect.contains(pos) {
+                        let idx = (me.row - rect.y) as usize;
                         if let Some(menu) = crate::tui::app::menu::menus().get(self.menu_top) {
                             if let Some(item) = menu.items.get(idx) {
                                 if item.children.is_some() {
@@ -155,7 +182,10 @@ impl App {
                 }
             }
         } else if prect.contains(pos) {
-            let rows = self.playlist.visible_rows(config.playlist_view);
+            // 行集与渲染同源：搜索态渲染的是过滤后
+            // 平铺行，此前点击仍按未过滤的 visible_rows 解析，点第 N 行
+            // 执行的是未过滤列表的第 N 行。
+            let rows = self.playlist_rows();
             let Some(ri) = row_index(prect, self.playlist.scroll(), y) else {
                 return;
             };
@@ -164,7 +194,7 @@ impl App {
                     let item = *item_index;
                     self.playlist.set_selected(item);
                     if dbl {
-                        self.play_and_update_current(item, config);
+                        self.play_manually_and_update_current(item, config);
                     }
                 }
                 Some(PlaylistRow::AlbumHeader { album, .. }) => {
@@ -180,6 +210,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{LyricsMode, SpectrumMode};
+    use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
 
     #[test]
     fn row_index_maps_scroll_and_offset() {
@@ -189,5 +221,72 @@ mod tests {
         assert_eq!(row_index(rect, 7, 10), Some(7));
         // 矩形上沿之上：无映射
         assert_eq!(row_index(rect, 3, 9), None);
+    }
+
+    /// 打开「视图 › 频谱」子菜单并渲染一帧：命中矩形由渲染层写入，
+    /// 点击坐标据此计算（渲染与点击同源）。
+    fn open_view_spectrum_menu(app: &mut App) {
+        app.menu_active = true;
+        app.menu_dropdown = true;
+        app.menu_top = 4; // 视图
+        app.menu_item = 1;
+        app.menu_sub = Some(1); // 「频谱」子菜单父项
+        app.menu_sub_item = 0;
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("建终端");
+        terminal
+            .draw(|f| {
+                crate::tui::render::draw(f, app, &Config::default(), &[], std::time::Duration::ZERO)
+            })
+            .expect("绘制");
+    }
+
+    /// 子菜单展开时点子菜单项必须执行子项动作（此处「内置频谱」），
+    /// 而不是按顶级菜单下标误执行顶级动作。
+    #[test]
+    fn submenu_click_executes_child_action_not_top_level() {
+        let config = Config::default();
+        let mut app = App::new(&config);
+        app.spectrum_mode = SpectrumMode::Hidden;
+        open_view_spectrum_menu(&mut app);
+        let sub = app.menu_sub_rect.get();
+        assert_ne!(sub, ratatui::layout::Rect::default(), "子菜单矩形应已写入");
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: sub.x + 1,
+            row: sub.y, // 子菜单第 1 项（内置频谱）
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut cfg = config;
+        app.handle_mouse(ev, &mut cfg);
+        assert_eq!(
+            app.spectrum_mode,
+            SpectrumMode::Half,
+            "应执行子项「内置频谱」而非顶级第 1 项「浏览器」"
+        );
+        assert!(!app.menu_active, "执行后菜单应关闭");
+    }
+
+    /// 子菜单展开时点主下拉其余项必须执行该顶级项（此前主矩形
+    /// 被子菜单矩形覆盖，这类点击只关菜单不执行）。
+    #[test]
+    fn main_dropdown_click_while_submenu_open_executes_top_item() {
+        let config = Config::default();
+        let mut app = App::new(&config);
+        app.lyrics_mode = LyricsMode::Hidden;
+        open_view_spectrum_menu(&mut app);
+        let main = app.menu_dropdown_rect.get();
+        assert_ne!(main, ratatui::layout::Rect::default(), "主下拉矩形应已写入");
+        // 视图菜单主下拉第 3 项（下标 2）＝歌词开关。
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: main.x + 1,
+            row: main.y + 2,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut cfg = config;
+        app.handle_mouse(ev, &mut cfg);
+        assert_eq!(app.lyrics_mode, LyricsMode::Visible, "应执行顶级项「歌词」");
+        assert!(!app.menu_active, "执行后菜单应关闭");
     }
 }

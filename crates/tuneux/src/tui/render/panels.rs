@@ -21,6 +21,7 @@ use ratatui::{
 
 use crate::fs_browser;
 use crate::playlist;
+use crate::tui::palette;
 use tuneux_corex as audio;
 use tuneux_mediax::lyrics;
 use tuneux_mediax::metadata;
@@ -37,6 +38,45 @@ use tuneux_mediax::metadata;
 /// 1 个字符（上半 = 前景色，下半 = 背景色）。
 ///
 /// 无图（None）或解码失败：居中显示"（无封面）"，提示按 c 隐藏。
+/// 封面像素取样（含主题处理）：暗屏主题（dim_screen）先做十字邻域轻模糊
+/// 模拟反射式 TFT 的柔边，再经 cover_pixel 抬高黑位、降低对比和饱和度；其余主题直接取色。
+/// 越界 / 透明像素按 cover_pixel 的透明口径处理。
+fn cover_px(rgba: &image::RgbaImage, px: u32, py: u32, w: u32, h: u32) -> Color {
+    if py >= h || px >= w {
+        return palette::cover_pixel(0, 0, 0, 0);
+    }
+    let [cr, cg, cb, ca] = rgba.get_pixel(px, py).0;
+    if ca <= 128 {
+        return palette::cover_pixel(0, 0, 0, 0);
+    }
+    if palette::pal().dim_screen {
+        let (mut sr, mut sg, mut sb, mut n) = (0u32, 0u32, 0u32, 0u32);
+        for (dx, dy) in [(0i32, 0i32), (1, 0), (-1, 0), (0, 1), (0, -1)] {
+            let x = px as i32 + dx;
+            let y = py as i32 + dy;
+            if x >= 0 && x < w as i32 && y >= 0 && y < h as i32 {
+                let [r, g, b, a] = rgba.get_pixel(x as u32, y as u32).0;
+                if a > 128 {
+                    sr += r as u32;
+                    sg += g as u32;
+                    sb += b as u32;
+                    n += 1;
+                }
+            }
+        }
+        if n > 0 {
+            return palette::cover_pixel(
+                sr.checked_div(n).unwrap_or_default() as u8,
+                sg.checked_div(n).unwrap_or_default() as u8,
+                sb.checked_div(n).unwrap_or_default() as u8,
+                255,
+            );
+        }
+        return palette::cover_pixel(0, 0, 0, 0);
+    }
+    palette::cover_pixel(cr, cg, cb, ca)
+}
+
 pub(super) fn draw_cover_panel(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -46,7 +86,7 @@ pub(super) fn draw_cover_panel(
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         format!(" {} · c ", i18n.t("panel.cover")),
         Style::default()
-            .fg(Color::Cyan)
+            .fg(palette::pal().chrome)
             .add_modifier(Modifier::BOLD),
     ));
     let inner = block.inner(area);
@@ -62,7 +102,7 @@ pub(super) fn draw_cover_panel(
     let Some((dst_w, dst_h, rgba)) = thumb else {
         // 无封面：居中显示灰色提示
         let msg = Paragraph::new(i18n.t("empty.cover").into_owned())
-            .style(Style::default().fg(Color::DarkGray))
+            .style(Style::default().fg(palette::pal().dim))
             .alignment(Alignment::Center);
         frame.render_widget(msg, inner);
         return;
@@ -89,26 +129,12 @@ pub(super) fn draw_cover_panel(
             let py_bot = py_top + 1;
             if py_top < dst_h {
                 for px in 0..dst_w {
-                    let [r1, g1, b1, a1] = rgba.get_pixel(px, py_top).0;
-                    let top_color = if a1 > 128 {
-                        Color::Rgb(r1, g1, b1)
-                    } else {
-                        // 透明像素：用背景色（黑色）
-                        Color::Black
-                    };
+                    // 经 cover_px：单色映射 / 暗屏压暗 + 轻模糊，透明落底色。
+                    let top_color = cover_px(rgba, px, py_top, dst_w, dst_h);
                     // 恒用 ▀（上半块）：图像奇数高时末行下半越界，仍画 ▀、
-                    // 下半 bot_color 取背景色（黑），不丢最后一像素行。
+                    // 下半取背景色，不丢最后一像素行。
                     let ch = "▀";
-                    let bot_color = if py_bot < dst_h {
-                        let [r2, g2, b2, a2] = rgba.get_pixel(px, py_bot).0;
-                        if a2 > 128 {
-                            Color::Rgb(r2, g2, b2)
-                        } else {
-                            Color::Black
-                        }
-                    } else {
-                        Color::Black
-                    };
+                    let bot_color = cover_px(rgba, px, py_bot, dst_w, dst_h);
                     spans.push(Span::styled(
                         ch.to_string(),
                         Style::default().fg(top_color).bg(bot_color),
@@ -149,7 +175,11 @@ pub(super) fn draw_browser(
     focused: bool,
     i18n: &tuneux_commonx::I18n,
 ) {
-    let title_color = if focused { Color::Yellow } else { Color::Cyan };
+    let title_color = if focused {
+        palette::pal().title_focus
+    } else {
+        palette::pal().chrome
+    };
     let title = format!(
         " {} · {} ",
         i18n.t("panel.browser"),
@@ -168,7 +198,7 @@ pub(super) fn draw_browser(
     // 三种特殊状态优先处理：错误 / 空目录 / 正常列表
     if let Some(err) = browser.last_error() {
         let msg = Paragraph::new(format!("{}: {err}", i18n.t("msg.error")))
-            .style(Style::default().fg(Color::Red));
+            .style(Style::default().fg(palette::error_fg()));
         frame.render_widget(msg, inner);
         return;
     }
@@ -195,7 +225,7 @@ pub(super) fn draw_browser(
             Paragraph::new(Span::styled(
                 prompt,
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(palette::pal().title_fg.unwrap_or(Color::Yellow))
                     .add_modifier(Modifier::BOLD),
             )),
             chunks[0],
@@ -214,7 +244,7 @@ pub(super) fn draw_browser(
             i18n.t("empty.dir").into_owned()
         };
         let msg = Paragraph::new(msg)
-            .style(Style::default().fg(Color::DarkGray))
+            .style(Style::default().fg(palette::pal().dim))
             .alignment(Alignment::Center);
         frame.render_widget(msg, list_area);
         return;
@@ -239,13 +269,13 @@ pub(super) fn draw_browser(
                 Line::from(Span::styled(
                     text,
                     Style::default()
-                        .bg(Color::LightCyan)
-                        .fg(Color::Black)
+                        .bg(palette::pal().sel_bg)
+                        .fg(palette::pal().sel_fg.unwrap_or(Color::Black))
                         .add_modifier(Modifier::BOLD),
                 ))
             } else if entry.is_dir() {
                 // 目录：蓝色，与前缀 ▸ 一起标识可进入
-                Line::from(Span::styled(text, Style::default().fg(Color::Blue)))
+                Line::from(Span::styled(text, Style::default().fg(palette::pal().info)))
             } else {
                 Line::from(Span::raw(text))
             }
@@ -324,7 +354,11 @@ pub(super) fn draw_playlist(
     i18n: &tuneux_commonx::I18n,
 ) {
     let focused = focus == playlist::Panel::Playlist;
-    let title_color = if focused { Color::Yellow } else { Color::Cyan };
+    let title_color = if focused {
+        palette::pal().title_focus
+    } else {
+        palette::pal().chrome
+    };
     // 标题：搜索时显示 "匹配 N/M" 让用户知道过滤效果
     let title = if search_mode && !search_query.is_empty() {
         format!(
@@ -358,7 +392,7 @@ pub(super) fn draw_playlist(
             Paragraph::new(Span::styled(
                 prompt,
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(palette::pal().title_fg.unwrap_or(Color::Yellow))
                     .add_modifier(Modifier::BOLD),
             )),
             chunks[0],
@@ -377,11 +411,29 @@ pub(super) fn draw_playlist(
             i18n.t("empty.playlist").into_owned()
         };
         let msg = Paragraph::new(msg)
-            .style(Style::default().fg(Color::DarkGray))
+            .style(Style::default().fg(palette::pal().dim))
             .alignment(Alignment::Center);
         frame.render_widget(msg, list_area);
         return;
     }
+
+    // 分组视图（rows 含组头）时曲目缩进（列宽计算要用，先判定）
+    let grouped = rows
+        .iter()
+        .any(|r| matches!(r, playlist::PlaylistRow::AlbumHeader { .. }));
+
+    // 列布局宽度（仿 fx 同款口径）：▶(1)+空格 + 序号(右对齐+.) + 空格 + 歌名 + 空格
+    // + 表演者 + 空格 + 时长(右对齐 8 列)。窄面板时表演者列先收缩。
+    let w = list_area.width as usize;
+    let dur_w = 8usize;
+    let icon_w = 2usize;
+    let digits = rows.len().to_string().len().max(1);
+    let num_w = digits + 1;
+    let indent_w = if grouped { 4 } else { 0 };
+    let gaps = 4usize;
+    let flexible = w.saturating_sub(icon_w + num_w + gaps + dur_w + indent_w);
+    let artist_w = flexible * 30 / 100;
+    let title_w = flexible.saturating_sub(artist_w);
 
     let current = playlist.current_index();
     let selected = playlist.selected();
@@ -390,10 +442,6 @@ pub(super) fn draw_playlist(
     // scroll 由事件循环的 ensure_visible 维护，保证选中项在可视区内。
     let scroll = playlist.scroll();
     let visible_rows = list_area.height as usize;
-    // 分组视图（rows 含组头）时曲目缩进
-    let grouped = rows
-        .iter()
-        .any(|r| matches!(r, playlist::PlaylistRow::AlbumHeader { .. }));
 
     let lines: Vec<Line> = rows
         .iter()
@@ -440,13 +488,16 @@ pub(super) fn draw_playlist(
                     Line::from(Span::styled(
                         text,
                         Style::default()
-                            .bg(Color::LightCyan)
-                            .fg(Color::Black)
+                            .bg(palette::pal().sel_bg)
+                            .fg(palette::pal().sel_fg.unwrap_or(Color::Black))
                             .add_modifier(Modifier::BOLD),
                     ))
                 } else {
                     // 组头：青色
-                    Line::from(Span::styled(text, Style::default().fg(Color::Cyan)))
+                    Line::from(Span::styled(
+                        text,
+                        Style::default().fg(palette::pal().chrome),
+                    ))
                 }
             }
             playlist::PlaylistRow::Track { item_index } => {
@@ -458,7 +509,7 @@ pub(super) fn draw_playlist(
                         .performer
                         .clone()
                         .or_else(|| cache.get(&item.path).and_then(|md| md.artist.clone()))
-                        .unwrap_or_else(|| i18n.t("group.unknown_artist").to_string());
+                        .unwrap_or_default();
                     (cue.title.clone(), artist)
                 } else {
                     // 普通曲目：取标题/艺术家，优先元数据缓存，降级文件名
@@ -471,9 +522,7 @@ pub(super) fn draw_playlist(
                                     .map(|s| s.to_string())
                                     .unwrap_or_default()
                             }),
-                            md.artist
-                                .clone()
-                                .unwrap_or_else(|| i18n.t("group.unknown_artist").to_string()),
+                            md.artist.clone().unwrap_or_default(),
                         ),
                         None => (
                             // 缓存未命中：标题降级文件名，艺术家留空
@@ -486,32 +535,56 @@ pub(super) fn draw_playlist(
                         ),
                     }
                 };
-                // "歌名 - 歌手"；歌手为空时只显示歌名（避免尾随 " - "）
-                let label = if artist.is_empty() {
-                    title
+                // "歌名 | 艺术家 | 时长" 多列布局（仿 fx 同款列宽与截断口径）
+                let dur = if let Some(cue) = &item.cue {
+                    match cue.end_ms {
+                        Some(end) => {
+                            super::fmt_time((end.saturating_sub(cue.start_ms)) as f64 / 1000.0)
+                        }
+                        None => cache
+                            .get(&item.path)
+                            .and_then(|md| md.duration)
+                            .map(|d| super::fmt_time((d - cue.start_ms as f64 / 1000.0).max(0.0)))
+                            .unwrap_or_default(),
+                    }
                 } else {
-                    format!("{title} - {artist}")
+                    cache
+                        .get(&item.path)
+                        .and_then(|md| md.duration)
+                        .map(super::fmt_time)
+                        .unwrap_or_default()
                 };
-                // 当前播放项加前缀：播放中 ▶，暂停 ‖
+
+                // 序号：平铺 = 大排行，分组 = track_number（专辑内序号）。
                 let is_current = Some(*item_index) == current;
                 let prefix = if is_current {
                     if engine.as_ref().is_some_and(|e| e.is_playing()) {
-                        "▶ "
+                        "▶"
                     } else {
-                        "‖ "
+                        "‖"
                     }
                 } else {
-                    "  "
+                    " "
                 };
-                let text = if grouped {
-                    // 分组视图：缩进 4 格 + 组内曲序（track_number）
+                let seq_str = if grouped {
                     match item.track_number {
-                        Some(n) => format!("    {prefix}{n}. {label}"),
-                        None => format!("    {prefix}{label}"),
+                        Some(n) => format!("{n}."),
+                        None => String::new(),
                     }
                 } else {
-                    format!("{prefix}{}. {}", row_idx + 1, label)
+                    format!("{}.", row_idx + 1)
                 };
+
+                let indent = if grouped { "    " } else { "" };
+                let title_tr = tuneux_displayx::truncate_to_width(&title, title_w);
+                let artist_tr = tuneux_displayx::truncate_to_width(&artist, artist_w);
+                let text = format!(
+                    "{indent}{prefix} {} {} {} {}",
+                    tuneux_displayx::pad_left_to_width(&seq_str, num_w),
+                    tuneux_displayx::pad_to_width(&title_tr, title_w),
+                    tuneux_displayx::pad_to_width(&artist_tr, artist_w),
+                    tuneux_displayx::pad_left_to_width(&dur, dur_w),
+                );
 
                 let is_selected =
                     matches!(selected, Some(playlist::Selection::Track(i)) if *i == *item_index);
@@ -520,8 +593,8 @@ pub(super) fn draw_playlist(
                     Line::from(Span::styled(
                         text,
                         Style::default()
-                            .bg(Color::LightCyan)
-                            .fg(Color::Black)
+                            .bg(palette::pal().sel_bg)
+                            .fg(palette::pal().sel_fg.unwrap_or(Color::Black))
                             .add_modifier(Modifier::BOLD),
                     ))
                 } else if is_current {
@@ -529,7 +602,7 @@ pub(super) fn draw_playlist(
                     Line::from(Span::styled(
                         text,
                         Style::default()
-                            .fg(Color::Green)
+                            .fg(palette::pal().ok)
                             .add_modifier(Modifier::BOLD),
                     ))
                 } else {
@@ -551,12 +624,13 @@ pub(super) fn draw_lyrics_panel(
     area: Rect,
     engine: &Option<audio::Engine>,
     lyrics_opt: Option<&lyrics::Lyrics>,
+    cue: Option<&tuneux_mediax::CueRef>,
     i18n: &tuneux_commonx::I18n,
 ) {
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         format!(" {} ", i18n.t("panel.lyrics")),
         Style::default()
-            .fg(Color::Cyan)
+            .fg(palette::pal().chrome)
             .add_modifier(Modifier::BOLD),
     ));
     let inner = block.inner(area);
@@ -564,15 +638,15 @@ pub(super) fn draw_lyrics_panel(
 
     let Some(lyrics) = lyrics_opt.filter(|l| !l.is_empty()) else {
         let msg = Paragraph::new(i18n.t("empty.lyrics").into_owned())
-            .style(Style::default().fg(Color::DarkGray))
+            .style(Style::default().fg(palette::pal().dim))
             .alignment(Alignment::Center);
         frame.render_widget(msg, inner);
         return;
     };
 
-    // 当前行：按播放位置二分定位
+    // CUE 分轨的歌词时间以分轨起点为零点。
     let pos = engine.as_ref().map(|e| e.position()).unwrap_or(0.0);
-    let current = lyrics.current_line(pos);
+    let current = lyrics.current_line(tuneux_mediax::cue_relative_position(pos, cue));
     let visible = inner.height as usize;
 
     // 当前行居中：起始行 = current - 可视行数/2
@@ -588,13 +662,13 @@ pub(super) fn draw_lyrics_panel(
                 Line::from(Span::styled(
                     line.text.clone(),
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(palette::pal().title_fg.unwrap_or(Color::Yellow))
                         .add_modifier(Modifier::BOLD),
                 ))
             } else {
                 Line::from(Span::styled(
                     line.text.clone(),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(palette::pal().dim),
                 ))
             }
         })
@@ -629,7 +703,7 @@ pub(super) fn draw_cover_browser(
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         format!(" {} ", i18n.t("panel.cover_browser")),
         Style::default()
-            .fg(Color::Cyan)
+            .fg(palette::pal().chrome)
             .add_modifier(Modifier::BOLD),
     ));
     let inner = block.inner(area);
@@ -698,39 +772,11 @@ pub(super) fn draw_cover_browser(
                     let py_top = rel * 2;
                     let py_bot = py_top + 1;
                     for px in 0..dw {
-                        let top = if py_top < dh {
-                            let [r, g, b, a] = rgba.get_pixel(px, py_top).0;
-                            if a > 128 {
-                                Some(Color::Rgb(r, g, b))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-                        let bot = if py_bot < dh {
-                            let [r, g, b, a] = rgba.get_pixel(px, py_bot).0;
-                            if a > 128 {
-                                Some(Color::Rgb(r, g, b))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-                        // 恒用 ▀（上半=顶像素，下半=底像素或背景）；奇数高封面末行
-                        // 底像素缺失时下半画背景色，不再丢失顶像素。
-                        let mut st = Style::default();
-                        if let Some(c) = top {
-                            st = st.fg(c);
-                        } else {
-                            st = st.fg(Color::Black);
-                        }
-                        if let Some(c) = bot {
-                            st = st.bg(c);
-                        } else {
-                            st = st.bg(Color::Black);
-                        }
+                        // 经 cover_px：单色映射 / 暗屏压暗 + 轻模糊，透明落底色。
+                        let top = cover_px(rgba, px, py_top, dw, dh);
+                        let bot = cover_px(rgba, px, py_bot, dw, dh);
+                        // 恒用 ▀（上半=顶像素，下半=底像素或背景）。
+                        let st = Style::default().fg(top).bg(bot);
                         spans.push(Span::styled("▀".to_string(), st));
                     }
                 }

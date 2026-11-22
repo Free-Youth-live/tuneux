@@ -74,6 +74,8 @@ if [ -d "$REPO_ROOT/plugins" ]; then
   echo "  插件已拷入 $(ls "$APP/Contents/MacOS/plugins/" | wc -l | tr -d ' ') 份"
 fi
 cp "$REPO_ROOT/THIRD-PARTY-LICENSES.txt" "$APP/Contents/Resources/"
+# 木兰宽松许可证（第2版）随 bundle
+cp "$REPO_ROOT/LICENSE" "$APP/Contents/Resources/"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -87,7 +89,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleIconFile</key>
   <string>AppIcon</string>
   <key>CFBundleIdentifier</key>
-  <string>tech.jishu.tuneux-max</string>
+  <string>studio.tuneux.max</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
@@ -134,8 +136,11 @@ if [ -d "$FFMPEG_DIR" ] && [ -f "$FFMPEG_DIR/bin/ffmpeg" ]; then
   [ "$GET_F" = "$WANT_F" ] || { echo "❌ ffmpeg 哈希与 VERSIONS.txt 不一致"; exit 1; }
   [ "$GET_P" = "$WANT_P" ] || { echo "❌ ffprobe 哈希与 VERSIONS.txt 不一致"; exit 1; }
   VOUT="$("$FFV" -version 2>&1)"
-  echo "$VOUT" | head -1 | grep -q "ffmpeg version 9\." \
-    || { echo "❌ ffmpeg 版本行异常"; exit 1; }
+  # 期望主版本从 ffmpeg-pin.toml 提取（与构建输入同源；硬编码主版本
+  # 会在 pin 升版后让四步校验误拒、阻塞发布链）
+  PIN_MAJOR="$(sed -n 's/^version = "\([0-9]*\)\..*/\1/p' "$REPO_ROOT/tools/ffmpeg-pin.toml" | head -1)"
+  echo "$VOUT" | head -1 | grep -q "ffmpeg version ${PIN_MAJOR}\." \
+    || { echo "❌ ffmpeg 版本行异常（期望主版本 ${PIN_MAJOR}）"; exit 1; }
   echo "$VOUT" | grep -qE -- "--enable-(gpl|nonfree)" \
     && { echo "❌ ffmpeg 配置串含禁项（gpl/nonfree），中止打包"; exit 1; } || true
   [ -s "$APP/Contents/Resources/ffmpeg/licenses/COPYING.LGPLv2.1" ] \

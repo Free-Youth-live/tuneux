@@ -120,7 +120,11 @@ impl Lyrics {
 fn parse_offset(line: &str) -> Option<f64> {
     let trimmed = line.trim();
     let inner = trimmed.strip_prefix("[offset:")?.strip_suffix(']')?;
-    inner.trim().parse::<f64>().ok()
+    let offset: f64 = inner.trim().parse().ok()?;
+    // 拒绝 NaN/±inf：非有限值会平移污染全表时间戳，破坏后续按时间戳
+    // sort_by / binary_search_by 依赖的「有限且有序」前提，高亮定位随之
+    // 不可预测（外部 .lrc 可投喂，必须在此拦截）。
+    offset.is_finite().then_some(offset)
 }
 
 /// 解析一行 LRC，返回该行的所有 (时间戳, 文本) 对。
@@ -151,17 +155,24 @@ fn parse_timestamp(s: &str) -> Option<f64> {
     let mut parts = s.split(':');
     let minutes: f64 = parts.next()?.trim().parse().ok()?;
     let seconds_part = parts.next()?;
+    // 段数必须恰为 2；多余段（如 1:02:03:04）非法。
+    if parts.next().is_some() {
+        return None;
+    }
     let mut sec_parts = seconds_part.split('.');
     let seconds: f64 = sec_parts.next()?.parse().ok()?;
-    // 小数部分：按位数换算（2 位 = 厘秒，3 位 = 毫秒）
-    let fraction = sec_parts
-        .next()
-        .map(|f| {
-            let digits: f64 = f.parse().unwrap_or(0.0);
+    // 小数部分：按位数换算（2 位 = 厘秒，3 位 = 毫秒）；非法字符按非法处理，
+    // 与函数其余部分「非法返回 None」口径一致，不静默按 .00 处理。
+    let fraction = match sec_parts.next() {
+        None => 0.0,
+        Some(f) => {
+            let digits: f64 = f.parse().ok()?;
             digits / 10f64.powi(f.len() as i32)
-        })
-        .unwrap_or(0.0);
-    Some(minutes * 60.0 + seconds + fraction)
+        }
+    };
+    // 拒绝 NaN/Inf/溢出等非有限值：歌词表依赖「有限且有序」前提。
+    let total = minutes * 60.0 + seconds + fraction;
+    total.is_finite().then_some(total)
 }
 
 /// 解码歌词文件字节为 UTF-8 字符串（BOM → UTF-8 严格 → GB18030）。
@@ -236,6 +247,23 @@ mod tests {
         // 负 offset：时间戳整体提前
         let l2 = Lyrics::parse("[offset:-300]\n[00:02.00]X\n");
         assert_eq!(l2.lines[0].timestamp, 1.7);
+    }
+
+    /// 非有限 offset（NaN/±inf）必须拒绝：否则全表时间戳被污染为 NaN，
+    /// 破坏排序与二分查找前提。
+    #[test]
+    fn offset_rejects_non_finite_values() {
+        for bad in [
+            "[offset:NaN]",
+            "[offset:+inf]",
+            "[offset:-inf]",
+            "[offset:infinity]",
+        ] {
+            let text = format!("{bad}\n[00:02.00]某句\n");
+            let lyrics = Lyrics::parse(&text);
+            assert_eq!(lyrics.lines.len(), 1, "{bad} 应被拒绝");
+            assert_eq!(lyrics.lines[0].timestamp, 2.0, "{bad} 应被拒绝");
+        }
     }
 
     #[test]

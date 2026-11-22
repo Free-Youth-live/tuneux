@@ -61,12 +61,18 @@ impl FilterParams {
     }
 
     /// 设置截止频率（Hz，自动钳制到有效范围）。
+    ///
+    /// 返回「已接受（true）/ 被拒绝（false）」，与压缩器/均衡器 setter
+    /// 同口径；返回值不再表示「值是否变化」。
+    /// 非有限值拒绝且保持原值（既有口径）。
     pub fn set_cutoff_hz(&self, hz: f32) -> bool {
+        if !hz.is_finite() {
+            return false;
+        }
         let clamped = hz.clamp(FILTER_CUTOFF_MIN_HZ, FILTER_CUTOFF_MAX_HZ);
-        let changed = clamped != self.cutoff_hz();
         self.cutoff_bits
             .store(f32_to_bits(clamped), Ordering::Relaxed);
-        changed
+        true
     }
 
     /// 谐振 Q 值。
@@ -75,11 +81,17 @@ impl FilterParams {
     }
 
     /// 设置谐振 Q（自动钳制）。
+    ///
+    /// 返回「已接受（true）/ 被拒绝（false）」，与压缩器/均衡器 setter
+    /// 同口径；返回值不再表示「值是否变化」。
+    /// 非有限值拒绝且保持原值（既有口径）。
     pub fn set_resonance_q(&self, q: f32) -> bool {
+        if !q.is_finite() {
+            return false;
+        }
         let clamped = q.clamp(FILTER_Q_MIN, FILTER_Q_MAX);
-        let changed = clamped != self.resonance_q();
         self.q_bits.store(f32_to_bits(clamped), Ordering::Relaxed);
-        changed
+        true
     }
 
     /// 使能。
@@ -224,6 +236,10 @@ pub struct FilterEffect {
 
 impl FilterEffect {
     /// 处理一批交错样本（与 EqEffect::process 同签名）。
+    ///
+    /// 与 EQ/压缩器统一口径：通道数非 1/2 时**整体直通**。
+    /// 旧实现只滤每帧前 2 声道、其余声道直通，与其余两个 DSP
+    /// 的「非 1/2 声道整体直通」口径分裂，且文档未声明。
     pub fn process(
         &mut self,
         data: &mut [f32],
@@ -234,18 +250,23 @@ impl FilterEffect {
         if !params.enabled() {
             return;
         }
-        for frame in data.chunks_mut(channels.max(1)) {
-            if frame.len() >= 2 {
+        if channels != 1 && channels != 2 {
+            return;
+        }
+        if channels == 2 {
+            for frame in data.as_chunks_mut::<2>().0 {
                 let (l, r) =
                     self.stereo
                         .process_frame(params, sample_rate as f32, frame[0], frame[1]);
                 frame[0] = l;
                 frame[1] = r;
-            } else if frame.len() == 1 {
-                let (l, _) =
-                    self.stereo
-                        .process_frame(params, sample_rate as f32, frame[0], frame[0]);
-                frame[0] = l;
+            }
+        } else {
+            for x in data.iter_mut() {
+                let (l, _) = self
+                    .stereo
+                    .process_frame(params, sample_rate as f32, *x, *x);
+                *x = l;
             }
         }
     }
@@ -253,5 +274,87 @@ impl FilterEffect {
     /// 重置内部状态（换曲 / seek 时清残留）。
     pub fn reset(&mut self) {
         self.stereo = BiquadStereo::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// setter 返回「已接受/被拒绝」而非「值是否变化」：
+    /// 写入同值也必须返回 true（与压缩器/均衡器 setter 同口径）。
+    #[test]
+    fn setters_return_acceptance_not_change_detection() {
+        let p = FilterParams::default();
+        // 同值写入：旧「值是否变化」语义返回 false，新「已接受」语义返回 true。
+        assert!(p.set_cutoff_hz(p.cutoff_hz()), "同值写入应为已接受");
+        assert!(p.set_resonance_q(p.resonance_q()), "同值写入应为已接受");
+        // 越界值钳制后仍为「已接受」。
+        assert!(p.set_cutoff_hz(1_000_000.0));
+        assert_eq!(p.cutoff_hz(), FILTER_CUTOFF_MAX_HZ);
+        // 非有限值仍拒绝（既有口径保持）。
+        assert!(!p.set_cutoff_hz(f32::NAN));
+        assert!(!p.set_resonance_q(f32::INFINITY));
+    }
+
+    /// 非 1/2 声道整体直通：旧实现只滤每帧前 2 声道、
+    /// 其余声道直通，与 EQ/压缩器「非 1/2 声道整体直通」口径分裂。
+    #[test]
+    fn multi_channel_beyond_stereo_passes_through_whole_buffer() {
+        let mut fx = FilterEffect::default();
+        let p = FilterParams::default();
+        p.set_enabled(true);
+        p.set_cutoff_hz(500.0);
+        p.set_resonance_q(5.0);
+        for channels in [0, 3, 4, 6] {
+            let mut data = vec![0.5f32; channels * 3];
+            let orig = data.clone();
+            fx.process(&mut data, channels, 48_000, &p);
+            assert_eq!(data, orig, "{channels} 声道应整体直通");
+        }
+    }
+
+    /// 单声道/立体声仍正常滤波：启用 + 低截止时高频交替信号被改变且输出有限。
+    #[test]
+    fn mono_and_stereo_processed_when_enabled() {
+        let mut fx = FilterEffect::default();
+        let p = FilterParams::default();
+        p.set_enabled(true);
+        p.set_cutoff_hz(500.0);
+        p.set_resonance_q(1.0);
+        // 交替样本（高频成分）：500Hz LPF 必须改变它。
+        let mut data: Vec<f32> = (0..32)
+            .map(|i| if i % 2 == 0 { 0.5 } else { -0.5 })
+            .collect();
+        fx.process(&mut data, 1, 48_000, &p);
+        assert!(data.iter().all(|v| v.is_finite()), "单声道输出必须有限");
+        assert!(
+            data.iter()
+                .any(|&v| (v - 0.5).abs() > 1e-3 || (v + 0.5).abs() > 1e-3),
+            "单声道低通滤波应改变高频交替信号"
+        );
+        let mut data: Vec<f32> = (0..32)
+            .map(|i| if i % 2 == 0 { 0.5 } else { -0.5 })
+            .collect();
+        fx.process(&mut data, 2, 48_000, &p);
+        assert!(data.iter().all(|v| v.is_finite()), "立体声输出必须有限");
+        assert!(
+            data.iter()
+                .any(|&v| (v - 0.5).abs() > 1e-3 || (v + 0.5).abs() > 1e-3),
+            "立体声低通滤波应改变高频交替信号"
+        );
+    }
+
+    #[test]
+    fn non_finite_params_are_rejected_without_overwrite() {
+        let p = FilterParams::default();
+        p.set_cutoff_hz(1_000.0);
+        p.set_resonance_q(1.2);
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(!p.set_cutoff_hz(bad));
+            assert!(!p.set_resonance_q(bad));
+            assert_eq!(p.cutoff_hz(), 1_000.0);
+            assert_eq!(p.resonance_q(), 1.2);
+        }
     }
 }

@@ -47,11 +47,11 @@ use self::menu::{menus, MenuAction};
 
 /// 应用运行时状态。
 pub struct App {
-    /// 当前生效的调色板（来自皮肤清单选中项；None = 内置默认 DOS 风配色）。
+    /// 当前生效的调色板（来自皮肤清单选中项；None = 内置藏青配色）。
     pub skin: Option<Palette>,
     /// 已加载的第一方皮肤清单（验签 Trusted；名称 + 调色板）。
     pub skins: Vec<LoadedSkin>,
-    /// 当前皮肤序号：0 = 终端原生，1..=skins.len() = 清单内皮肤。
+    /// 当前皮肤在共享顺序中的序号；第 4 项为内置藏青，其余为插件皮肤。
     pub skin_sel: usize,
     /// 皮肤选择器弹窗开关。
     pub skin_picker: bool,
@@ -61,7 +61,7 @@ pub struct App {
     pub lang_picker_sel: usize,
     /// 可用语言列表（启动时扫描 locales/ + 内置 zh，形如 [("zh","中文"),("en","English")]）。
     pub lang_list: Vec<(String, String)>,
-    /// 选择器内高亮序号（0 = 终端原生）。
+    /// 选择器内高亮序号，与 `skin_sel` 共用共享顺序。
     pub skin_picker_sel: usize,
     /// 打开选择器前的生效皮肤（Esc 取消时恢复）。
     skin_prev: Option<Palette>,
@@ -93,7 +93,7 @@ pub struct App {
     /// i18n 查询器：请求语言表（`locales/<lang>.txt`）+ zh 内置兜底。
     pub i18n: tuneux_commonx::I18n,
     /// ReplayGain 增益缓存：path → 整曲增益（dB）。首次播放无缓存（增益 1.0），
-    /// 播放中引擎测量完成后缓存，下次播放该曲生效。随 playlist.toml 落盘。
+    /// 播放中引擎测量完成后缓存，下次播放该曲生效。随 tuneux-fx-playlist.toml 落盘。
     pub replay_gain_cache: std::collections::BTreeMap<PathBuf, f64>,
     /// 焦点面板：浏览器 ↔ 播放列表（Tab 切换）。
     pub focus: playlist::Panel,
@@ -129,6 +129,9 @@ pub struct App {
     pub browser_list_rect: std::cell::Cell<ratatui::layout::Rect>,
     /// 主菜单下拉的命中矩形（渲染侧每帧写入，鼠标侧判定用；与浏览器/列表面板同款）。
     pub menu_dropdown_rect: std::cell::Cell<ratatui::layout::Rect>,
+    /// 子菜单下拉的命中矩形：与主下拉分记，后画的子菜单不再覆盖主矩形，
+    /// 点击解析与渲染同源。
+    pub menu_sub_rect: std::cell::Cell<ratatui::layout::Rect>,
     pub playlist_list_rect: std::cell::Cell<ratatui::layout::Rect>,
     /// 上次左键点击（时刻 + 坐标）——双击判定。
     last_click: Option<(std::time::Instant, u16, u16)>,
@@ -206,6 +209,11 @@ pub struct App {
     pub filter_visible: bool,
     /// 滤波器参数选中索引（0=截止，1=谐振）。
     pub filter_sel: usize,
+    /// 滤波器面板记账的引擎槽位：未记账才 alloc，此后调节/渲染
+    /// 恒用同一槽位——每键/每帧重查 alloc 会让调节漂移到下一个空闲槽；
+    /// None = 尚未记账或引擎缺失/槽位占满。面板开合不释放槽位，
+    /// 设置与启用态跨开关保留（与均衡器同口径）。
+    pub filter_slot: Option<u32>,
     /// 均衡器当前选中的段（0-9，↑/↓ 调增益、←/→ 切段）。
     pub eq_band_sel: usize,
     /// 已加载的第一方均衡器插件（持有其 WASM 实例与槽位共享）。
@@ -232,8 +240,9 @@ pub struct App {
 
 /// 官方（第一方）插件签名公钥（Ed25519，32 字节）：宿主内置的信任根。
 ///
-/// 随二进制分发、运行时不可替换；用它验证随包分发的 equalizer.sig /
-/// compressor.sig——验签命中 → Trusted，无 .sig / 验签失败 → Unsigned（降级）。
+/// 随二进制分发、运行时不可替换；用它验证随包分发的全部 11 份 .sig
+///（均衡器 / 压缩器 / 皮肤 7 / 可视化 2）——验签命中 → Trusted，无 .sig /
+/// 验签失败 → Unsigned（降级）。
 /// 对应私钥只存仓库外本地文件，绝不入库、绝不写进二进制。
 const OFFICIAL_PUBKEY: [u8; 32] = [
     0x9a, 0xc3, 0x5b, 0x76, 0xa9, 0xaf, 0xbe, 0x5f, 0xfc, 0xab, 0x74, 0x35, 0xeb, 0xaf, 0xb2, 0x83,
@@ -250,8 +259,9 @@ fn key_to_desc(key: &KeyEvent) -> Option<String> {
     let base = match key.code {
         KeyCode::Char(' ') => "space".to_string(),
         KeyCode::Char(c) => {
-            // 字母 + SHIFT：统一小写，交给下方 shift+ 前缀（屏蔽终端大小写差异）
-            if key.modifiers.contains(KeyModifiers::SHIFT) && c.is_ascii_alphabetic() {
+            // 字母恒转小写：无修饰大写只来自 CapsLock，归一后配置 "n" 恒命中；
+            // SHIFT 在下方单独计 shift+ 前缀（屏蔽终端大小写差异）。
+            if c.is_ascii_alphabetic() {
                 c.to_ascii_lowercase().to_string()
             } else {
                 c.to_string()
@@ -346,6 +356,12 @@ fn load_first_party_core(
     let dir = config::plugins_dir();
     let wasm = std::fs::read(dir.join(format!("{name}.wasm"))).ok()?;
     let manifest = std::fs::read_to_string(dir.join(format!("{name}.manifest"))).ok()?;
+    if tuneux_pinx::manifest_plugin_id(&manifest)
+        .ok()?
+        .is_some_and(|manifest_id| manifest_id != id)
+    {
+        return None;
+    }
     // 官方签名 .sig（64 字节，随包分发）：验签证明「第一方 + 未被篡改」。
     let sig: [u8; 64] = std::fs::read(dir.join(format!("{name}.sig")))
         .ok()?
@@ -395,7 +411,14 @@ fn load_first_party_plugin(
     let (mut plugin, granted) = load_first_party_core(engine, name, id, None)?;
     // 分配槽位（v2 动态多槽位）；插件 init 携带 slot id 写参数。
     let slot = alloc(engine)?;
-    plugin.call_init(slot).ok()?;
+    if plugin.call_init(slot).is_err() {
+        if id == tuneux_pinx::EQ_ID {
+            engine.free_eq_slot(slot);
+        } else if id == tuneux_pinx::COMP_ID {
+            engine.free_compressor_slot(slot);
+        }
+        return None;
+    }
     Some((slot, plugin, granted))
 }
 
@@ -468,14 +491,14 @@ fn load_visual_plugins(engine: &audio::Engine) -> Vec<LoadedVisual> {
     let mut out = Vec::new();
     for file_stem in names {
         let Some((mut plugin, granted)) =
-            load_first_party_core(engine, &file_stem, "tuneux-vis", Some(&allowed))
+            load_first_party_core(engine, &file_stem, tuneux_pinx::VIS_ID, Some(&allowed))
         else {
             continue;
         };
         if plugin.call_init(0).is_err() {
             continue;
         }
-        // 日志键带文件名（签名 id 仍是 "tuneux-vis"，见 record_plugin_load 说明）。
+        // 日志键带文件名（签名 id 仍是 tuneux_pinx::VIS_ID，见 record_plugin_load 说明）。
         record_plugin_load(&format!("tuneux-vis:{file_stem}"), plugin.tristate, granted);
         out.push(LoadedVisual {
             name: file_stem,
@@ -492,7 +515,7 @@ fn load_visual_plugins(engine: &audio::Engine) -> Vec<LoadedVisual> {
 /// 能力面固定收紧为 `[theme]`——manifest 多声明的能力一律不授予（纵深
 /// 防御，与效果器插件的「清单声明即授予」口径不同）。任一文件缺失 /
 /// 验签非 Trusted / 解析失败 → 跳过该份（记核查日志），不阻断启动。
-/// 清单按皮肤名排序；无皮肤文件时返回空清单（终端原生配色）。
+/// 清单按双端共享主题顺序排序；无皮肤文件时选择器只剩内置藏青。
 fn load_skin_palettes(engine: &audio::Engine) -> Vec<LoadedSkin> {
     let allowed = [tuneux_pinx::Capability::Theme];
     let dir = config::plugins_dir();
@@ -513,20 +536,16 @@ fn load_skin_palettes(engine: &audio::Engine) -> Vec<LoadedSkin> {
 
     let mut out: Vec<LoadedSkin> = Vec::new();
     for file_stem in names {
+        let id = tuneux_pinx::ids::skin_id_for_stem(&file_stem);
         let Some((mut plugin, granted)) =
-            load_first_party_core(engine, &file_stem, tuneux_pinx::SKIN_ID, Some(&allowed))
+            load_first_party_core(engine, &file_stem, &id, Some(&allowed))
         else {
             continue;
         };
         if plugin.call_init(0).is_err() {
             continue;
         }
-        // 同可视化插件：日志键带文件名，签名 id 保持 tuneux_pinx::SKIN_ID。
-        record_plugin_load(
-            &format!("{}:{file_stem}", tuneux_pinx::SKIN_ID),
-            plugin.tristate,
-            granted,
-        );
+        record_plugin_load(&id, plugin.tristate, granted);
         let Some(text) = plugin.theme().and_then(|b| std::str::from_utf8(b).ok()) else {
             continue;
         };
@@ -542,8 +561,65 @@ fn load_skin_palettes(engine: &audio::Engine) -> Vec<LoadedSkin> {
             palette,
         });
     }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
+    sort_skins(&mut out);
     out
+}
+
+fn sort_skins(skins: &mut [LoadedSkin]) {
+    let rank = |name: &str| {
+        tuneux_displayx::THEME_ORDER
+            .iter()
+            .position(|theme| theme.name == name)
+            .unwrap_or(usize::MAX)
+    };
+    skins.sort_by(|a, b| {
+        rank(&a.name)
+            .cmp(&rank(&b.name))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+}
+
+pub(crate) const BUILTIN_SKIN_INDEX: usize = 4;
+const DEFAULT_SKIN_NAME: &str = "终端原生";
+
+pub(crate) fn skin_by_index(skins: &[LoadedSkin], index: usize) -> Option<&LoadedSkin> {
+    if index == BUILTIN_SKIN_INDEX {
+        return None;
+    }
+    let skin_index = if index < BUILTIN_SKIN_INDEX {
+        index
+    } else {
+        index.checked_sub(1)?
+    };
+    skins.get(skin_index)
+}
+
+fn skin_index_by_name(skins: &[LoadedSkin], name: &str) -> usize {
+    let wanted = if name.is_empty() {
+        DEFAULT_SKIN_NAME
+    } else {
+        name
+    };
+    skins
+        .iter()
+        .position(|skin| skin.name == wanted)
+        .map(|index| {
+            if index < BUILTIN_SKIN_INDEX {
+                index
+            } else {
+                index + 1
+            }
+        })
+        .unwrap_or(BUILTIN_SKIN_INDEX)
+}
+
+fn skin_name_by_index(skins: &[LoadedSkin], index: usize) -> String {
+    if index == BUILTIN_SKIN_INDEX {
+        return "藏青".to_string();
+    }
+    skin_by_index(skins, index)
+        .map(|skin| skin.name.clone())
+        .unwrap_or_default()
 }
 
 impl App {
@@ -594,21 +670,10 @@ impl App {
         // 加载全部第一方可视化面板插件（能力 meter_read）：「可视化-*」前缀扫描。
         let visual_plugins = engine.as_ref().map(load_visual_plugins).unwrap_or_default();
         let skins = engine.as_ref().map(load_skin_palettes).unwrap_or_default();
-        // 皮肤选择：0 = 内置默认（DOS 风），1 = 终端原生，2.. = 皮肤清单。
-        let skin_sel = match config.skin.as_str() {
-            "" => 0,
-            "终端原生" => 1,
-            name => skins
-                .iter()
-                .position(|s| s.name == name)
-                .map(|i| i + 2)
-                .unwrap_or(0),
-        };
-        let skin = match skin_sel {
-            0 => None,
-            1 => Some(Palette::terminal()),
-            i => skins.get(i - 2).map(|s| s.palette),
-        };
+        // 内置藏青位于共享顺序第 5 项，其余皮肤按同一顺序排列。
+        // 旧配置里的 Norton 蓝 / 午夜蓝 已在 config 加载时迁移为「深蓝」。
+        let skin_sel = skin_index_by_name(&skins, &config.skin);
+        let skin = skin_by_index(&skins, skin_sel).map(|skin| skin.palette);
         // 恢复播放列表持久化状态（独立文件）。
         let (playlist_state, playlist_status) = config::load_playlist_state_with_status();
         // 文件损坏：走 UI 通道提示（此处已在 raw 模式，eprintln 会弄脏备用屏）；
@@ -621,7 +686,11 @@ impl App {
         );
 
         let mut playlist = Playlist::new();
-        playlist.set_shuffle(config.shuffle);
+        let shuffle_mode = match config.shuffle_mode.as_str() {
+            "off" if config.shuffle => tuneux_mediax::ShuffleMode::Tracks,
+            name => tuneux_mediax::ShuffleMode::parse(name),
+        };
+        playlist.set_shuffle_mode(shuffle_mode);
         playlist.set_view(config.playlist_view);
 
         // 恢复上次播放列表并预提取元数据（多列展示立即正确）。
@@ -720,6 +789,7 @@ impl App {
             cover_browser_scroll: 0,
             browser_list_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             menu_dropdown_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            menu_sub_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             playlist_list_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             last_click: None,
             cover_browser_visible: 0,
@@ -761,6 +831,7 @@ impl App {
             eq_visible: false,
             filter_visible: false,
             filter_sel: 0,
+            filter_slot: None,
             eq_band_sel: 0,
             eq_plugin,
             eq_slot: eq_slot.unwrap_or(0),
@@ -1026,7 +1097,7 @@ impl App {
 
         // —— 皮肤选择器（↑/↓ 即时预览、Enter 确认并持久化、Esc 取消恢复）——
         if self.skin_picker {
-            let count = self.skins.len() + 2; // +2 = 内置默认 / 终端原生
+            let count = self.skins.len() + 1; // +1 = 内置藏青
             match key.code {
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.skin_picker_sel = self.skin_picker_sel.saturating_sub(1);
@@ -1038,11 +1109,7 @@ impl App {
                 }
                 KeyCode::Enter => {
                     self.skin_sel = self.skin_picker_sel;
-                    config.skin = match self.skin_sel {
-                        0 => String::new(),
-                        1 => "终端原生".to_string(),
-                        i => self.skins[i - 2].name.clone(),
-                    };
+                    config.skin = skin_name_by_index(&self.skins, self.skin_sel);
                     config::save(config);
                     self.skin_prev = None;
                     self.skin_picker = false;
@@ -1055,11 +1122,8 @@ impl App {
             }
             // 即时预览：弹窗仍开时，高亮项即为生效调色板。
             if self.skin_picker {
-                self.skin = match self.skin_picker_sel {
-                    0 => None,
-                    1 => Some(Palette::terminal()),
-                    i => self.skins.get(i - 2).map(|s| s.palette),
-                };
+                self.skin =
+                    skin_by_index(&self.skins, self.skin_picker_sel).map(|skin| skin.palette);
             }
             return true;
         }
@@ -1308,7 +1372,9 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => self.browser.move_down(),
                 KeyCode::Home => self.browser.move_to_top(),
                 KeyCode::End => self.browser.move_to_bottom(),
-                KeyCode::Char('/') => {
+                // 浏览器不可见时（封面浏览态）`/` 不响应——搜索框画在
+                // 浏览器面板内，进去只会是看不见的搜索。
+                KeyCode::Char('/') if self.left_panel == LeftPanel::Browser => {
                     self.search_mode = true;
                     self.search_target = SearchTarget::Browser;
                     self.search_query.clear();
@@ -1332,7 +1398,8 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => self.playlist.move_selection_down(),
                 KeyCode::Home => self.playlist.move_selection_to_top(),
                 KeyCode::End => self.playlist.move_selection_to_bottom(),
-                KeyCode::Char('/') => {
+                // 封面浏览态工作区无播放列表，`/` 不响应（同浏览器臂守卫）。
+                KeyCode::Char('/') if self.left_panel != LeftPanel::CoverBrowser => {
                     self.search_mode = true;
                     self.search_target = SearchTarget::Playlist;
                     self.search_query.clear();
@@ -1350,14 +1417,14 @@ impl App {
                     }
                     Some(playlist::Selection::Track(sel)) => {
                         self.playlist.jump_to(sel);
-                        self.play_and_update_current(sel, config);
+                        self.play_manually_and_update_current(sel, config);
                     }
                     None => {
                         // 无选中但列表非空：播第一首（与基础版同口径——
                         // 无选中按 Enter 的用户意图就是开始播，不留死键）。
                         if !self.playlist.is_empty() {
                             self.playlist.jump_to(0);
-                            self.play_and_update_current(0, config);
+                            self.play_manually_and_update_current(0, config);
                         }
                     }
                 },
@@ -1395,7 +1462,7 @@ impl App {
                     if let Some(sel) = self.playlist.selected_track() {
                         if self.filter_playlist().contains(&sel) {
                             self.playlist.jump_to(sel);
-                            self.play_and_update_current(sel, config);
+                            self.play_manually_and_update_current(sel, config);
                         }
                     }
                 }
@@ -1464,7 +1531,7 @@ impl App {
                     let path = path.clone();
                     if let Some(idx) = self.playlist.items().iter().position(|it| it.path == path) {
                         self.playlist.jump_to(idx);
-                        self.play_and_update_current(idx, config);
+                        self.play_manually_and_update_current(idx, config);
                     }
                 }
             }
@@ -2039,7 +2106,11 @@ impl App {
 
     /// 「编辑 › 搜索」：按当前焦点打开搜索（浏览器可见且聚焦时搜浏览器，
     /// 否则搜播放列表——与 / 键在两个焦点面板上的行为一致）。
+    /// 封面浏览态工作区无浏览器也无播放列表：不进入不可见搜索。
     fn open_search_for_focus(&mut self) {
+        if self.left_panel == LeftPanel::CoverBrowser {
+            return;
+        }
         self.search_mode = true;
         self.search_query.clear();
         if self.focus == playlist::Panel::Browser && self.left_panel == LeftPanel::Browser {
@@ -2145,17 +2216,35 @@ impl App {
         true
     }
 
+    /// 已记账的滤波器槽位参数：未记账先 alloc 记账，此后恒用
+    /// 同一槽位；引擎缺失或槽位全占用返回 None（调用方不得据此吞键——
+    /// Esc 必须仍能关面板）。渲染层（render.rs）同用此入口。
+    pub(crate) fn filter_params(&mut self) -> Option<std::sync::Arc<audio::FilterParams>> {
+        let engine = self.engine.as_ref()?;
+        let slot = match self.filter_slot {
+            Some(s) => s,
+            None => {
+                let (s, _) = engine.alloc_filter_slot()?;
+                self.filter_slot = Some(s);
+                s
+            }
+        };
+        Some(engine.filter_slots()[slot as usize].clone())
+    }
+
     /// 滤波器面板按键：↑/↓ 调值，←/→ 切参数，e 旁路，r 重置，Esc 关闭。
     fn handle_filter_key(&mut self, key: KeyEvent) -> bool {
-        let Some(engine) = &self.engine else {
+        // Esc 先于槽位/引擎判定：面板必须能关（alloc 失败曾把
+        // 含 Esc 在内的全部按键提前吞掉，面板关不掉）。
+        if key.code == KeyCode::Esc {
+            self.filter_visible = false;
+            return true;
+        }
+        let Some(params) = self.filter_params() else {
+            // 引擎缺失或槽位全占用：调节无效但不吞键（Esc 已处理）。
             return true;
         };
-        let Some((slot, _)) = engine.alloc_filter_slot() else {
-            return true;
-        };
-        let params = &engine.filter_slots()[slot as usize];
         match key.code {
-            KeyCode::Esc => self.filter_visible = false,
             KeyCode::Up => {
                 if self.filter_sel == 0 {
                     let step = params.cutoff_hz() * 0.05;
@@ -2345,6 +2434,11 @@ impl App {
                             return;
                         }
                     }
+                    if was_empty && !self.playlist.is_empty() {
+                        let first = self.playlist.display_order().first().copied().unwrap_or(0);
+                        self.playlist.set_selected(first);
+                        self.play_manually_and_update_current(first, config);
+                    }
                     return;
                 }
                 // 整轨 + 同名 .cue → 展开为多首 CUE 曲目；否则按普通文件加入。
@@ -2381,7 +2475,7 @@ impl App {
                     // 加入前列表为空：播放/选中"专辑-曲序"排序后的第一首。
                     let first = self.playlist.display_order().first().copied().unwrap_or(0);
                     self.playlist.set_selected(first);
-                    self.play_and_update_current(first, config);
+                    self.play_manually_and_update_current(first, config);
                 }
             }
             fs_browser::Entry::Dir { path, .. } => {
@@ -2632,7 +2726,7 @@ impl App {
         if b.cue_start_ms.is_some() {
             self.pending_cue_offset = Some(b.position_secs);
         }
-        self.play_and_update_current(idx, config);
+        self.play_manually_and_update_current(idx, config);
         let m = self.i18n.t("msg.bm_jump").replace("{}", &b.label);
         self.flash_message(&m);
     }
@@ -2699,34 +2793,33 @@ impl App {
                                 .replace("{}", &skipped.to_string());
                             self.flash_message(&msg);
                         }
-                        // 记下第一轨起点：去重全命中时据此定位「第一曲」
-                        //（CUE 同 path，不能只按 path 定位，否则命中任意分轨）。
+                        // 记下第一轨起点：据此定位「第一曲」（CUE 同 path，
+                        // 不能只按 path 定位，否则命中任意分轨）。
                         let first_start_ms = items
                             .first()
                             .and_then(|it| it.cue.as_ref().map(|c| c.start_ms));
-                        let start_idx = self.playlist.items().len();
                         if config.dedup_on_add {
                             self.playlist.add_many_dedup(items);
                         } else {
                             self.playlist.add_many(items);
                         }
-                        // 播放首个加入的分轨；全部去重命中时按「path + 第一轨起点」定位。
-                        let play_idx = if start_idx < self.playlist.items().len() {
-                            start_idx
-                        } else {
-                            self.playlist
-                                .items()
-                                .iter()
-                                .position(|it| {
-                                    it.path == audio_path
-                                        && first_start_ms.is_some_and(|ms| {
-                                            it.cue.as_ref().map(|c| c.start_ms) == Some(ms)
-                                        })
-                                })
-                                .unwrap_or(0)
-                        };
-                        self.playlist.jump_to(play_idx);
-                        self.play_and_update_current(play_idx, config);
+                        // 播放第一分轨：直接按「path + 第一轨起点」定位——部分
+                        // 去重命中时新分轨追加在已有分轨之后，「首个新加入分轨」
+                        // 不是第一轨。定位失败提示，不回退第 0 首。
+                        match cue::cue_first_track_index(
+                            self.playlist.items(),
+                            first_start_ms,
+                            &audio_path,
+                        ) {
+                            Some(play_idx) => {
+                                self.playlist.jump_to(play_idx);
+                                self.play_manually_and_update_current(play_idx, config);
+                            }
+                            None => {
+                                let m = self.i18n.t("msg.cue_fail").into_owned();
+                                self.flash_message(&m);
+                            }
+                        }
                     }
                     None => {
                         let m = self.i18n.t("msg.cue_fail").into_owned();
@@ -2748,33 +2841,28 @@ impl App {
                 self.flash_message(&msg);
             }
             if !expanded.is_empty() {
-                // 记下第一轨起点：去重全命中时据此定位「第一曲」（同 path 多分轨）。
+                // 记下第一轨起点：据此定位「第一曲」（同 path 多分轨）。
                 let first_start_ms = expanded
                     .first()
                     .and_then(|it| it.cue.as_ref().map(|c| c.start_ms));
-                let start_idx = self.playlist.items().len();
                 if config.dedup_on_add {
                     self.playlist.add_many_dedup(expanded);
                 } else {
                     self.playlist.add_many(expanded);
                 }
-                // 播放首个加入的分轨；若全部去重命中，则按「path + 第一轨起点」定位。
-                let play_idx = if start_idx < self.playlist.items().len() {
-                    start_idx
-                } else {
-                    self.playlist
-                        .items()
-                        .iter()
-                        .position(|it| {
-                            it.path == path
-                                && first_start_ms.is_some_and(|ms| {
-                                    it.cue.as_ref().map(|c| c.start_ms) == Some(ms)
-                                })
-                        })
-                        .unwrap_or(0)
-                };
-                self.playlist.jump_to(play_idx);
-                self.play_and_update_current(play_idx, config);
+                // 播放第一分轨：按「path + 第一轨起点」定位——部分去重命中时
+                // 新分轨追加在已有分轨之后，「首个新加入分轨」不是第一轨
+                // 定位失败提示，不回退第 0 首。
+                match cue::cue_first_track_index(self.playlist.items(), first_start_ms, &path) {
+                    Some(play_idx) => {
+                        self.playlist.jump_to(play_idx);
+                        self.play_manually_and_update_current(play_idx, config);
+                    }
+                    None => {
+                        let m = self.i18n.t("msg.cue_fail").into_owned();
+                        self.flash_message(&m);
+                    }
+                }
                 if was_searching {
                     self.exit_browser_search();
                 }
@@ -2798,7 +2886,7 @@ impl App {
                 // 去重命中：文件已在列表，定位并立即播放（而非静默无反应）。
                 if let Some(idx) = self.playlist.items().iter().position(|it| it.path == path) {
                     self.playlist.jump_to(idx);
-                    self.play_and_update_current(idx, config);
+                    self.play_manually_and_update_current(idx, config);
                 }
                 if was_searching {
                     self.exit_browser_search();
@@ -2808,7 +2896,7 @@ impl App {
             let new_idx = self.playlist.items().len() - 1;
             // 手动点选播放：压入 history，使 p 键能回到点选前的曲目。
             self.playlist.jump_to(new_idx);
-            self.play_and_update_current(new_idx, config);
+            self.play_manually_and_update_current(new_idx, config);
             if was_searching {
                 self.exit_browser_search();
             }
@@ -2866,7 +2954,12 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{keycode_to_action, OFFICIAL_PUBKEY};
+    use super::{
+        keycode_to_action, skin_index_by_name, skin_name_by_index, App, LeftPanel, LoadedSkin,
+        OFFICIAL_PUBKEY,
+    };
+    use crate::playlist;
+    use crate::tui::theme::Palette;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     /// 自定义键映射：命中返回动作名、未命中 None、不可自定义键 None
@@ -2904,7 +2997,65 @@ mod tests {
         assert_eq!(jump_secs, 75.0, "往返必须落回整轨 75s（双重计入会得 135s）");
     }
 
-    /// 校验某个第一方插件：官方公钥验签 committed 的 .sig 必须匹配 committed 的 .wasm。
+    #[test]
+    fn skin_selector_index_and_saved_name_roundtrip() {
+        let mut skins = tuneux_displayx::THEME_ORDER
+            .iter()
+            .filter(|theme| theme.id != "navy")
+            .rev()
+            .map(|theme| LoadedSkin {
+                name: theme.name.to_string(),
+                stem: format!("皮肤-{}", theme.name),
+                palette: Palette::default(),
+            })
+            .collect::<Vec<_>>();
+        super::sort_skins(&mut skins);
+        let names = skins
+            .iter()
+            .map(|skin| skin.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "终端原生",
+                "磷光绿",
+                "经典青",
+                "深蓝",
+                "黑白",
+                "灰白",
+                "暗彩"
+            ]
+        );
+        for (index, theme) in tuneux_displayx::THEME_ORDER.iter().enumerate() {
+            assert_eq!(skin_index_by_name(&skins, theme.name), index);
+            assert_eq!(skin_name_by_index(&skins, index), theme.name);
+            let loaded = super::skin_by_index(&skins, index);
+            assert_eq!(loaded.is_some(), theme.id != "navy");
+        }
+        assert_eq!(skin_index_by_name(&skins, ""), 0, "空配置默认终端原生");
+        assert_eq!(skin_index_by_name(&skins, "不存在"), 4);
+        assert_eq!(
+            skin_name_by_index(&skins, tuneux_displayx::THEME_ORDER.len()),
+            ""
+        );
+        let without_terminal = skins
+            .iter()
+            .filter(|skin| skin.name != "终端原生")
+            .map(|skin| LoadedSkin {
+                name: skin.name.clone(),
+                stem: skin.stem.clone(),
+                palette: skin.palette,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            skin_index_by_name(&without_terminal, ""),
+            4,
+            "缺终端原生皮肤时回退内置藏青"
+        );
+    }
+
+    /// 校验某个第一方插件：官方公钥验签 committed 的 .sig 必须匹配
+    /// committed 的 manifest 原文与 .wasm（v2 签名口径 id‖manifest‖wasm）。
     /// 防止「wasm 改动后忘记重新签名」导致插件在用户处被静默降级/加载失败。
     fn assert_officially_signed(name: &str, id: &str) {
         let base = format!("{}/../../plugins/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -2928,42 +3079,197 @@ mod tests {
     fn first_party_plugins_are_officially_signed() {
         assert_officially_signed("equalizer", "tuneux-eq");
         assert_officially_signed("compressor", "tuneux-comp");
-        assert_officially_signed("皮肤-Norton蓝", "tuneux-skin");
-        assert_officially_signed("皮肤-午夜蓝", "tuneux-skin");
+        for name in [
+            "磷光绿",
+            "经典青",
+            "深蓝",
+            "终端原生",
+            "黑白",
+            "灰白",
+            "暗彩",
+        ] {
+            assert_officially_signed(
+                &format!("皮肤-{name}"),
+                &tuneux_pinx::ids::skin_id_for_stem(&format!("皮肤-{name}")),
+            );
+        }
+        for name in ["能量条", "频谱瀑布"] {
+            assert_officially_signed(&format!("可视化-{name}"), tuneux_pinx::VIS_ID);
+        }
     }
 
     #[test]
-    fn skin_plugin_registers_parseable_theme() {
-        // 用随包的「皮肤-Norton蓝.wasm」验证：init 经 theme_register 注册的皮肤
-        // 文本可解析为调色板（无签名仅影响三态、不影响主题捕获，故不依赖官方私钥）。
-        let base = format!("{}/../../plugins/皮肤-Norton蓝", env!("CARGO_MANIFEST_DIR"));
-        let wasm = std::fs::read(format!("{base}.wasm")).expect("读取皮肤 wasm 失败");
+    fn skin_signature_is_bound_to_manifest_and_filename() {
+        let base = format!("{}/../../plugins/皮肤-磷光绿", env!("CARGO_MANIFEST_DIR"));
+        let wasm = std::fs::read(format!("{base}.wasm")).expect("读取 wasm");
+        let manifest = std::fs::read(format!("{base}.manifest")).expect("读取 manifest");
+        let sig_bytes = std::fs::read(format!("{base}.sig")).expect("读取签名");
+        let sig: [u8; 64] = sig_bytes.try_into().expect("签名长度");
+        let id = tuneux_pinx::ids::skin_id_for_stem("皮肤-磷光绿");
+        assert_eq!(
+            tuneux_pinx::manifest_plugin_id(std::str::from_utf8(&manifest).expect("UTF-8")),
+            Ok(Some(id.as_str()))
+        );
+        let wrong_id = tuneux_pinx::ids::skin_id_for_stem("皮肤-深蓝");
+        let mut message = Vec::new();
+        message.extend_from_slice(wrong_id.as_bytes());
+        message.extend_from_slice(&manifest);
+        message.extend_from_slice(&wasm);
+        assert!(
+            !tuneux_pinx::verify_signature(&OFFICIAL_PUBKEY, &message, &sig),
+            "改名复用其它皮肤 id 必须验签失败"
+        );
+    }
+
+    fn wat_theme_text(name: &str) -> String {
+        let path = format!("{}/assets/皮肤-{name}.wat", env!("CARGO_MANIFEST_DIR"));
+        let wat = std::fs::read_to_string(path).expect("读取皮肤 WAT 失败");
+        let encoded = wat
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("(data (i32.const 0) \"")
+                    .and_then(|text| text.strip_suffix("\")"))
+            })
+            .expect("WAT 应含主题数据段");
+        encoded.replace("\\n", "\n")
+    }
+
+    #[test]
+    fn skin_plugins_register_parseable_themes() {
+        // 逐份验证随包皮肤：init 经 theme_register 注册的皮肤文本可解析为调色板，
+        // 且与 WAT 数据段逐字节一致（无签名仅影响三态，不影响主题捕获）。
         let eq_slots: [std::sync::Arc<tuneux_corex::EqParams>; tuneux_corex::EQ_SLOTS] =
             std::array::from_fn(|_| std::sync::Arc::new(tuneux_corex::EqParams::new()));
         let comp_slots: [std::sync::Arc<tuneux_corex::CompressorParams>; tuneux_corex::COMP_SLOTS] =
             std::array::from_fn(|_| std::sync::Arc::new(tuneux_corex::CompressorParams::new()));
         let host = tuneux_pinx::WasmHost::new(100_000, 4, eq_slots, comp_slots);
-        let mut plugin = host
-            .load(
-                &wasm,
-                "tuneux-skin",
-                b"",
-                None,
-                &tuneux_pinx::TrustList::default(),
-                &[tuneux_pinx::Capability::Theme],
-                &[tuneux_pinx::Capability::Theme],
-            )
-            .expect("皮肤插件应加载成功");
-        plugin.call_init(0).expect("init 应执行成功");
-        let text =
-            std::str::from_utf8(plugin.theme().expect("应注册皮肤")).expect("皮肤文本应为 UTF-8");
-        let pal = crate::tui::theme::Palette::from_skin(text).expect("皮肤应可解析");
-        // 断言值跟随当前随包皮肤（Norton 蓝）：换皮肤时同步改这里。
-        assert_eq!(pal.bg, Some(ratatui::style::Color::Rgb(0x00, 0x00, 0xaa)));
+        for name in [
+            "磷光绿",
+            "经典青",
+            "深蓝",
+            "终端原生",
+            "黑白",
+            "灰白",
+            "暗彩",
+        ] {
+            let base = format!("{}/../../plugins/皮肤-{name}", env!("CARGO_MANIFEST_DIR"));
+            let wasm = std::fs::read(format!("{base}.wasm")).expect("读取皮肤 wasm 失败");
+            let mut plugin = host
+                .load(
+                    &wasm,
+                    &tuneux_pinx::ids::skin_id_for_stem(&format!("皮肤-{name}")),
+                    b"",
+                    None,
+                    &tuneux_pinx::TrustList::default(),
+                    &[tuneux_pinx::Capability::Theme],
+                    &[tuneux_pinx::Capability::Theme],
+                )
+                .expect("皮肤插件应加载成功");
+            plugin.call_init(0).expect("init 应执行成功");
+            let text = std::str::from_utf8(plugin.theme().expect("应注册皮肤"))
+                .expect("皮肤文本应为 UTF-8");
+            assert_eq!(text, wat_theme_text(name), "{name} 的 WAT/WASM 不一致");
+            let pal = crate::tui::theme::Palette::from_skin(text).expect("皮肤应可解析");
+            if name == "暗彩" {
+                assert_eq!(pal.bg, Some(ratatui::style::Color::Rgb(0x9c, 0xa4, 0x94)));
+                assert_eq!(
+                    pal.border,
+                    Some(ratatui::style::Color::Rgb(0x4d, 0x57, 0x4e))
+                );
+                assert_eq!(pal.border_type, ratatui::widgets::BorderType::Plain);
+                assert!(pal.dim_screen);
+            }
+        }
+    }
+
+    /// 槽位全占满（alloc 必失败）时 Esc 仍必须能关面板——
+    /// 修复前 alloc None 提前吞掉含 Esc 在内的全部按键，面板关不掉。
+    #[test]
+    fn filter_panel_esc_closes_even_without_free_slot() {
+        let config = crate::config::Config::default();
+        let mut app = App::new(&config);
+        app.filter_visible = true;
+        if let Some(e) = &app.engine {
+            for p in e.filter_slots() {
+                p.set_enabled(true); // 占满 4 槽：alloc 必失败
+            }
+        }
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.handle_filter_key(esc));
+        assert!(!app.filter_visible, "无空闲槽时 Esc 也必须能关面板");
+    }
+
+    /// 滤波槽位只记账一次——连续按键写同一槽位（步进累积生效），
+    /// 其他槽位保持默认（修复前每键重查 alloc，调节漂移到下一个空闲槽）。
+    #[test]
+    fn filter_panel_books_single_slot_and_writes_consistently() {
+        let config = crate::config::Config::default();
+        let mut app = App::new(&config);
+        // 先取出槽位参数快照（独立所有权），避免与下方 app 可变借用冲突。
+        let Some(slots) = app.engine.as_ref().map(|e| e.filter_slots()) else {
+            return; // 无音频设备环境跳过（Esc 分支由上一测试覆盖）
+        };
+        app.filter_visible = true;
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        assert!(app.handle_filter_key(down));
+        let booked = app.filter_slot.expect("首个调节键应记账槽位");
+        let first = slots[booked as usize].cutoff_hz();
+        assert!(first < 20_000.0, "Down 应从默认 20kHz 下调");
+        assert!(app.handle_filter_key(down));
+        assert_eq!(app.filter_slot, Some(booked), "第二次按键不得重新分配槽位");
+        let second = slots[booked as usize].cutoff_hz();
+        assert!(second < first, "同一槽位连续步进应累积生效");
+        for (i, p) in slots.iter().enumerate() {
+            if i != booked as usize {
+                assert!(
+                    (p.cutoff_hz() - 20_000.0).abs() < 1e-3,
+                    "其他槽位不得被漂移写入"
+                );
+            }
+        }
+    }
+
+    /// 封面浏览态工作区没有浏览器/播放列表，`/` 与
+    /// 「编辑 › 搜索」都不得进入看不见的搜索态。
+    #[test]
+    fn slash_does_not_open_search_in_cover_browser() {
+        let config = crate::config::Config::default();
+        let mut app = App::new(&config);
+        app.left_panel = LeftPanel::CoverBrowser;
+        let slash = KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE);
+        app.focus = playlist::Panel::Playlist;
+        assert!(app.handle_key(slash, &mut crate::config::Config::default()));
+        assert!(!app.search_mode, "播放列表焦点按 / 不应进入搜索");
+        app.focus = playlist::Panel::Browser;
+        assert!(app.handle_key(slash, &mut crate::config::Config::default()));
+        assert!(!app.search_mode, "浏览器焦点按 / 不应进入搜索");
+        app.open_search_for_focus();
+        assert!(!app.search_mode, "菜单搜索入口同样不应进入搜索");
+    }
+
+    /// 手动点播恢复失败计数；自动跳曲不得借播放流程清零计数。
+    #[test]
+    fn manual_playback_restores_failure_count() {
+        let config = crate::config::Config::default();
+        let mut app = App::new(&config);
+        app.playlist.add(playlist::PlaylistItem {
+            path: std::path::PathBuf::from("/music/manual-recovery.flac"),
+            album: None,
+            track_number: None,
+            cue: None,
+        });
+        app.consecutive_failures = tuneux_mediax::CONSECUTIVE_FAILURE_LIMIT;
+
+        app.play_manually_and_update_current(0, &config);
+        assert_eq!(app.consecutive_failures, 0, "手动点播应恢复自动跳曲能力");
+
+        app.consecutive_failures = tuneux_mediax::CONSECUTIVE_FAILURE_LIMIT;
+        app.handle_nav_outcome(playlist::NavOutcome::Switch(0), &config);
         assert_eq!(
-            pal.border,
-            Some(ratatui::style::Color::Rgb(0x55, 0xff, 0xff))
+            app.consecutive_failures,
+            tuneux_mediax::CONSECUTIVE_FAILURE_LIMIT,
+            "自动跳曲不得清零失败计数"
         );
-        assert_eq!(pal.border_type, ratatui::widgets::BorderType::Double);
     }
 }

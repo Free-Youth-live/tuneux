@@ -65,15 +65,23 @@ fn install_panic_hook() {
 /// 初始化终端：raw 模式 + 备用屏幕，返回绑定 crossterm 后端的 Terminal。
 fn init_terminal() -> AppResult<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(io::stdout());
-    Ok(Terminal::new(backend)?)
+    let terminal = (|| {
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        let backend = CrosstermBackend::new(io::stdout());
+        Ok(Terminal::new(backend)?)
+    })();
+    if terminal.is_err() {
+        let _ = restore_terminal();
+    }
+    terminal
 }
 
 /// 恢复终端到正常状态（退出前必须调用）。
 fn restore_terminal() -> AppResult<()> {
-    disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
+    let raw_result = disable_raw_mode();
+    let screen_result = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+    raw_result?;
+    screen_result?;
     Ok(())
 }
 
@@ -91,6 +99,7 @@ fn run(
     let mut last_save = std::time::Instant::now();
     // 上一帧时刻：用于计算帧间隔，驱动频谱峰值按秒衰减（帧率无关）。
     let mut last_frame = std::time::Instant::now();
+    let mut scan_added = 0usize;
     // 系统媒体键：默认开启，可由配置的 `media_keys_enabled = false` 关闭。
     // 平台不支持（macOS）或 D-Bus 不可用（headless）时返回 None，静默缺失。
     let media_key_handle = if config.media_keys_enabled {
@@ -241,13 +250,13 @@ fn run(
             }
         }
         if got_failed {
-            app.consecutive_failures += 1;
-            if app.consecutive_failures >= 10 {
-                // 连续失败达到上限：停止自动跳曲，避免列表全损坏时无限循环刷屏。
-                let m = app.i18n.t("msg.consecutive_fail").into_owned();
-                app.flash_message(&m);
-                app.consecutive_failures = 0;
-            } else {
+            // 三端共用同一份失败决议（mediax）：未达上限继续跳；达到上限
+            // 计数饱和、停止自动跳曲，只有用户手动发起点播才清零——不再出现
+            // 「提示后清零、再失败 10 次又循环」的假熔断。
+            let (count, keep_skipping) =
+                tuneux_mediax::advance_failure_count(app.consecutive_failures);
+            app.consecutive_failures = count;
+            if keep_skipping {
                 // 播放失败：强制跳下一首（单曲循环按"顺序"语义，不重复失败曲）。
                 // 错误提示已由 refresh_last_error 显示（"打开失败/解码错误"）。
                 let skip_repeat = if config.repeat == RepeatMode::Single {
@@ -259,6 +268,10 @@ fn run(
                 if let NavOutcome::Switch(_) = outcome {
                     app.handle_nav_outcome(outcome, config);
                 }
+            } else {
+                // 达到上限：停止自动跳曲（计数保持在上限，不在此清零）。
+                let m = app.i18n.t("msg.consecutive_fail").into_owned();
+                app.flash_message(&m);
             }
         }
 
@@ -273,6 +286,7 @@ fn run(
                     .map(|v| v.abs())
                     .fold(0.0f32, f32::max);
                 if peak > 0.001 {
+                    let pos = tuneux_mediax::cue_relative_position(pos, app.current_cue().as_ref());
                     let bucket = ((pos / dur) * 256.0) as usize;
                     if bucket < app.track_envelope.len() {
                         app.track_envelope[bucket] = app.track_envelope[bucket].max(peak);
@@ -281,21 +295,42 @@ fn run(
             }
         }
 
-        // 共享扫描池结果排空（每帧至多 64 条，与 max 同款）
+        // 显示排序由 display_order 负责；保持插入序以稳定播放索引。
         {
             let mut drained = 0;
             while drained < 64 {
                 match app.scan_pool.try_recv() {
-                    Some(batch) => {
+                    Some(tuneux_mediax::scan_pool::ScanEvent::Items(batch)) => {
+                        let was_idle = app.current_path.is_none();
+                        // 回填元数据缓存：标题/歌手搜索对刚加入的未播曲目可命中。
+                        app.fill_scan_metadata_cache(&batch);
                         drained += batch.len();
-                        app.playlist.add_many(batch);
+                        scan_added += if config.dedup_on_add {
+                            app.playlist.add_many_dedup(batch)
+                        } else {
+                            let count = batch.len();
+                            app.playlist.add_many(batch);
+                            count
+                        };
+                        if was_idle && app.playlist.current_index().is_none() {
+                            app.playlist.jump_to(0);
+                            app.handle_nav_outcome(playlist::NavOutcome::Switch(0), config);
+                        }
+                    }
+                    Some(tuneux_mediax::scan_pool::ScanEvent::CueError { path, message }) => {
+                        drained += 1;
+                        app.flash_message(&format!("{}：{message}", path.display()));
                     }
                     None => break,
                 }
             }
-            if app.scan_pool.pending() == 0 && drained > 0 {
-                let items = app.playlist.items_mut();
-                playlist::Playlist::sort_items(items);
+            if app.scan_pool.is_idle() && scan_added > 0 {
+                app.flash_message(
+                    &app.i18n
+                        .t("msg.added")
+                        .replace("{}", &scan_added.to_string()),
+                );
+                scan_added = 0;
             }
         }
 
@@ -331,7 +366,11 @@ fn run(
                 // 锁中毒安全：即便锁被某线程 panic 污染，也取出守卫正常写入。
                 *title.lock().unwrap_or_else(|e| e.into_inner()) = title_str;
             }
-            while let Ok(ev) = handle.rx.try_recv() {
+            // 单轮读取有界并合并同类事件，超额部分留到下一轮。
+            for ev in tuneux_commonx::media_key::drain_media_key_events(
+                &handle.rx,
+                tuneux_commonx::media_key::MEDIA_KEY_DRAIN_LIMIT,
+            ) {
                 match ev {
                     media_key::MediaKeyEvent::PlayPause => app.toggle_play(),
                     media_key::MediaKeyEvent::Next => app.advance_to_next_track(config),

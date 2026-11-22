@@ -9,6 +9,25 @@ use tuneux_mediax::metadata;
 use super::App;
 
 impl App {
+    /// 扫描池结果合入播放列表时回填元数据缓存。
+    ///
+    /// 扫描工人只把专辑/曲序留进条目，标题/歌手被丢弃——这里对缓存
+    /// 缺失的非 CUE 条目补一次提取，使「按曲名/歌手搜索」对刚加入的
+    /// 未播曲目也能命中。提取在 UI 线程做，但每个条目只发生一次，且
+    /// 受主循环排空上限（每帧 64 条）自然分批；封面字节照热路径口径剥离。
+    pub(crate) fn fill_scan_metadata_cache(&mut self, items: &[tuneux_mediax::PlaylistItem]) {
+        for item in items {
+            // CUE 分轨的标题/表演者存在 cue 引用里，搜索已直接匹配；
+            // 同路径多分轨共用整轨元数据，不必逐轨重复提取。
+            if item.cue.is_some() || self.metadata_cache.contains_key(&item.path) {
+                continue;
+            }
+            let mut md = metadata::TrackMetadata::from_file(&item.path);
+            md.cover = None;
+            self.metadata_cache.insert(item.path.clone(), md);
+        }
+    }
+
     /// 取元数据：优先从缓存读，miss 时调 from_file 并写入缓存。
     ///
     /// 容量上限：元数据缓存无限增长会持续积累内存。
@@ -181,5 +200,102 @@ impl App {
         }
         // 解码失败由调用方记负缓存并经 UI 提示，不在此打日志（避免每帧刷屏）。
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 写一个最小可探测的 16 位单声道 WAV（44 字节头 + 4 个采样），
+    /// 供元数据提取测试用（无标签，title 走 file_stem 兜底）。
+    /// 放进独立子目录：文件夹封面回退只扫同目录，避免命中系统临时区噪声。
+    fn write_minimal_wav(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).expect("建测试目录");
+        let path = dir.join(name);
+        let data_len: u32 = 8;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36u32 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // 单声道
+        bytes.extend_from_slice(&44100u32.to_le_bytes());
+        bytes.extend_from_slice(&88200u32.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 8]);
+        std::fs::write(&path, bytes).expect("写测试 wav");
+        path
+    }
+
+    /// 扫描合入回填——缓存缺失的普通条目入库后可被标题搜索命中；
+    /// CUE 分轨跳过（标题在 cue 引用里）、封面字节剥离。
+    #[test]
+    fn fill_scan_metadata_cache_populates_missing_entries() {
+        let dir = std::env::temp_dir().join("tuneux_fx_scan_fill");
+        let wav = write_minimal_wav(&dir, "tuneux_fx_scan_fill.wav");
+        let cue_path = std::path::PathBuf::from("/nonexistent/cue.flac");
+        let config = crate::config::Config::default();
+        let mut app = App::new(&config);
+        let batch = [
+            tuneux_mediax::PlaylistItem {
+                path: wav.clone(),
+                album: None,
+                track_number: None,
+                cue: None,
+            },
+            tuneux_mediax::PlaylistItem {
+                path: cue_path.clone(),
+                album: None,
+                track_number: None,
+                cue: Some(tuneux_mediax::CueRef {
+                    index: 1,
+                    title: "第一轨".into(),
+                    performer: None,
+                    start_ms: 0,
+                    end_ms: None,
+                }),
+            },
+        ];
+        app.fill_scan_metadata_cache(&batch);
+        let md = app.metadata_cache.get(&wav).expect("普通条目应回填缓存");
+        assert_eq!(
+            md.title.as_deref(),
+            Some("tuneux_fx_scan_fill"),
+            "无标签 wav 的标题走文件名兜底"
+        );
+        assert!(md.cover.is_none(), "缓存条目必须剥离封面字节");
+        assert!(
+            !app.metadata_cache.contains_key(&cue_path),
+            "CUE 分轨不逐轨回填整轨元数据"
+        );
+        let _ = std::fs::remove_file(&wav);
+    }
+
+    /// 已缓存条目不被扫描回填覆盖（保留热路径/启动预填的条目）。
+    #[test]
+    fn fill_scan_metadata_cache_keeps_existing_entries() {
+        let dir = std::env::temp_dir().join("tuneux_fx_scan_fill_keep");
+        let wav = write_minimal_wav(&dir, "tuneux_fx_scan_fill_keep.wav");
+        let config = crate::config::Config::default();
+        let mut app = App::new(&config);
+        let existing = metadata::TrackMetadata {
+            title: Some("已有标题".into()),
+            ..Default::default()
+        };
+        app.metadata_cache.insert(wav.clone(), existing);
+        app.fill_scan_metadata_cache(&[tuneux_mediax::PlaylistItem {
+            path: wav.clone(),
+            album: None,
+            track_number: None,
+            cue: None,
+        }]);
+        let md = app.metadata_cache.get(&wav).expect("缓存条目仍在");
+        assert_eq!(md.title.as_deref(), Some("已有标题"), "已缓存条目不被覆盖");
+        let _ = std::fs::remove_file(&wav);
     }
 }

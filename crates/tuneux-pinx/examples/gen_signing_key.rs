@@ -12,7 +12,7 @@
 //! 产物三处：
 //! - 私钥种子（32 字节）写入 seed_path() 指向的仓库外文件（绝不提交进仓库）；
 //! - 官方公钥（32 字节）打印到 stdout，人工内嵌进二进制信任根；
-//! - equalizer.sig / compressor.sig / skin.sig（各 64 字节）写入 plugins/，随包分发。
+//! - 各第一方插件的 .sig（64 字节）写入 plugins/，随包分发；皮肤逐份使用独立 ID。
 //!
 //! 种子路径解析（不在代码里写死任何本机绝对路径）：
 //! 1. 环境变量 TUNEUX_OFFICIAL_SIGNING_SEED 优先；
@@ -84,14 +84,20 @@ fn main() {
         .unwrap_or_default();
     skin_names.sort();
     for name in skin_names {
-        // 插件 id 按前缀分工：皮肤 tuneux-skin、可视化 tuneux-vis（v2
-        // 签名消息 = id ‖ manifest ‖ wasm，两侧必须一致，否则验签不匹配）。
+        // 可视化沿用族 id；皮肤使用 manifest 中的逐皮肤 id，并要求它与文件名一致。
         let id = if name.starts_with("可视化-") {
-            "tuneux-vis"
+            tuneux_pinx::ids::VIS_ID.to_string()
         } else {
-            "tuneux-skin"
+            let id = tuneux_pinx::ids::skin_id_for_stem(&name);
+            let manifest_path = format!("{plugins_dir}/{name}.manifest");
+            let manifest = std::fs::read_to_string(manifest_path).expect("读取皮肤 manifest 失败");
+            let manifest_id = tuneux_pinx::manifest_plugin_id(&manifest)
+                .expect("皮肤 manifest id 非法")
+                .expect("皮肤 manifest 必须声明逐皮肤 id");
+            assert_eq!(manifest_id, id, "皮肤 manifest id 与文件名不一致");
+            id
         };
-        sign_plugin(&signing, &name, id);
+        sign_plugin(&signing, &name, &id);
     }
 }
 

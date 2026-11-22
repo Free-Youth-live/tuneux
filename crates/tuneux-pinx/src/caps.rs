@@ -68,6 +68,7 @@ impl Capability {
 }
 
 /// 解析 MV3 式能力清单（manifest 文本）：每行一个能力短名，`#` 注释与空行忽略。
+/// `id = ...` 元数据由 [`manifest_plugin_id`] 单独读取，不属于能力声明。
 ///
 /// 未知短名报错（显式失败，不静默跳过——插件清单写错应被发现，而不是悄悄
 /// 少授能力）。返回去重后的能力列表（保持声明顺序）。
@@ -76,6 +77,12 @@ pub fn parse_manifest(text: &str) -> Result<Vec<Capability>, String> {
     for (idx, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line
+            .split_once('=')
+            .is_some_and(|(key, _)| key.trim() == "id")
+        {
             continue;
         }
         match Capability::from_name(line) {
@@ -88,6 +95,36 @@ pub fn parse_manifest(text: &str) -> Result<Vec<Capability>, String> {
         }
     }
     Ok(out)
+}
+
+/// 读取 manifest 的可选插件 ID；ID 不得包含空白或控制字符，且最多声明一次。
+pub fn manifest_plugin_id(text: &str) -> Result<Option<&str>, String> {
+    let mut found = None;
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "id" {
+            continue;
+        }
+        if found.is_some() {
+            return Err(format!("重复插件 id（第 {} 行）", index + 1));
+        }
+        let value = value.trim();
+        if value.is_empty()
+            || value
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
+        {
+            return Err(format!("非法插件 id（第 {} 行）", index + 1));
+        }
+        found = Some(value);
+    }
+    Ok(found)
 }
 
 /// 能力授予失败的原因。
@@ -241,6 +278,17 @@ mod tests {
             parse_manifest(text),
             Ok(vec![Capability::AudioDsp, Capability::AudioPlay])
         );
+    }
+
+    #[test]
+    fn manifest_id_is_optional_unique_and_validated() {
+        let text = "id = tuneux-skin:深蓝\ntheme\n";
+        assert_eq!(manifest_plugin_id(text), Ok(Some("tuneux-skin:深蓝")));
+        assert_eq!(parse_manifest(text), Ok(vec![Capability::Theme]));
+        assert_eq!(manifest_plugin_id("theme\n"), Ok(None));
+        assert!(manifest_plugin_id("id=one\nid=two\n").is_err());
+        assert!(manifest_plugin_id("id=two words\n").is_err());
+        assert!(manifest_plugin_id("id=\n").is_err());
     }
 
     #[test]

@@ -195,21 +195,27 @@ impl BitReader {
     }
 
     /// 读 n 位（0 ≤ n ≤ 64），64 位返回（总样本数 / seek 点用）。
+    ///
+    /// n > 32 时拆成「高 n−32 位 + 低 32 位」两段递归读取：位缓冲是
+    /// 64 位窗口，`fill_byte` 的 `buf << 8` 在残留位数 > 56 时会把最早
+    /// 的位移出丢失——单次填装最多支撑「≤32 位请求 + 8 位余量」。
+    /// 拆段后每段 ≤ 32 位，任意 n（含 64）都安全；MSB 优先的流序语义不变。
     fn read_bits64(&mut self, n: u32) -> Result<u64, DecodeError> {
         debug_assert!(n <= 64);
         if n == 0 {
             return Ok(0);
+        }
+        if n > 32 {
+            let hi = self.read_bits64(n - 32)?;
+            let lo = self.read_bits64(32)?;
+            return Ok((hi << 32) | lo);
         }
         while self.bits < n {
             if !self.fill_byte()? {
                 return Err(DecodeError::Decode("帧中途到达文件尾（截断）".into()));
             }
         }
-        let v = if n == 64 {
-            self.buf
-        } else {
-            (self.buf >> (self.bits - n)) & ((1u64 << n) - 1)
-        };
+        let v = (self.buf >> (self.bits - n)) & ((1u64 << n) - 1);
         self.consume(n);
         Ok(v)
     }
@@ -257,6 +263,8 @@ struct StreamInfo {
     channels: u8,
     bits_per_sample: u8,
     total_samples: u64,
+    /// 最大块尺寸（固定块流的「帧号 → 首样本」换算用：sample = 帧号 × 最大块）。
+    max_blocksize: u32,
 }
 
 /// SEEKTABLE 的一个 seek 点（样本序号 → 首帧起的相对字节偏移）。
@@ -305,6 +313,7 @@ fn parse_metadata(file: &mut File) -> Result<FlacMeta, DecodeError> {
                 }
                 let mut b = [0u8; 34];
                 file.read_exact(&mut b)?;
+                let max_blocksize = (u32::from(b[2]) << 8) | u32::from(b[3]);
                 let sample_rate =
                     (u32::from(b[10]) << 12) | (u32::from(b[11]) << 4) | (u32::from(b[12]) >> 4);
                 let channels = ((b[12] >> 1) & 0x07) + 1;
@@ -322,6 +331,7 @@ fn parse_metadata(file: &mut File) -> Result<FlacMeta, DecodeError> {
                     channels,
                     bits_per_sample,
                     total_samples,
+                    max_blocksize,
                 });
             }
             3 => {
@@ -385,6 +395,99 @@ struct FrameHeader {
     block_size: u32,
     assignment: ChannelAssignment,
     bits_per_sample: u8,
+    /// 帧首样本序号（变长块策略 = 头内样本号；固定块策略 = 帧号 × 最大块）。
+    /// 快速 seek 的帧定位依据（估位后扫描帧头即得，无需解码整帧）。
+    first_sample: u64,
+}
+
+/// UTF-8 变长整数首字节的载荷位数（不含续字节）。
+fn utf8_lead_value(first: u8, extra: u32) -> u64 {
+    match extra {
+        0 => u64::from(first & 0x7F),
+        1 => u64::from(first & 0x1F),
+        2 => u64::from(first & 0x0F),
+        3 => u64::from(first & 0x07),
+        4 => u64::from(first & 0x03),
+        5 => u64::from(first & 0x01),
+        _ => 0,
+    }
+}
+
+/// 估位：按平均码率把目标样本映射为帧区字节偏移（CBR 近似；夹在
+/// [first_frame, data_end) 内）。总量未知或帧区为空时返回 None。
+fn estimate_byte_offset(
+    first_frame: u64,
+    data_end: u64,
+    total_samples: u64,
+    target: u64,
+) -> Option<u64> {
+    if total_samples == 0 || data_end <= first_frame {
+        return None;
+    }
+    let frac = (target as f64 / total_samples as f64).clamp(0.0, 1.0);
+    let off = first_frame + (frac * (data_end - first_frame) as f64) as u64;
+    Some(off.clamp(first_frame, data_end.saturating_sub(1)))
+}
+
+/// 快速 seek 的最大回扫窗口：估位误差超过此值即放弃快速路径，
+/// 回退线性解码（正确性兜底）。96kHz/24bit 下 16 MiB ≈ 2–4 分钟
+/// 音频的帧数据，覆盖远超常规 VBR 起伏。
+const FAST_SEEK_SCAN_WINDOW: u64 = 16 * 1024 * 1024;
+
+/// 在 [floor, from) 内从后向前找帧头（同步码 + 帧头 CRC-8 双重校验），
+/// 返回「首样本 ≤ target 的最近一帧」的 (绝对偏移, 首样本)。
+///
+/// 用独立文件句柄探测，不扰动主解码游标；候选点经 parse_frame_header
+/// 完整解析（含 CRC-8），假同步（帧数据里撞上 0xFFF8）几乎不可能通过。
+fn scan_frame_start(
+    file: &std::fs::File,
+    info: &StreamInfo,
+    from: u64,
+    floor: u64,
+    target: u64,
+) -> Option<(u64, u64)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let floor = floor.max(1);
+    const CHUNK: u64 = 64 * 1024;
+    let mut hi = from; // 窗口上界（不含）
+    while hi > floor {
+        let lo = hi.saturating_sub(CHUNK).max(floor);
+        let mut probe = file.try_clone().ok()?;
+        // 从 lo-1 读到 hi（含两端）：块内候选 [lo, hi)，左邻 1 字节
+        // 供块底同步对配对；块顶字节的对在更高一块里已被覆盖。
+        let want = (hi - lo + 1) as usize;
+        probe.seek(SeekFrom::Start(lo - 1)).ok()?;
+        let mut chunk = vec![0u8; want];
+        let n = probe.read(&mut chunk).ok()?;
+        chunk.truncate(n);
+        // chunk[i] 对应文件偏移 lo-1+i；候选 i ∈ [1, hi-lo]，即 [lo, hi)。
+        let top = (hi - lo) as usize;
+        for i in (1..=top).rev() {
+            if chunk[i] != 0xFF || chunk.get(i + 1).is_none_or(|&b| b & 0xFE != 0xF8) {
+                continue;
+            }
+            let abs = lo - 1 + i as u64;
+            // 逐候选解析帧头（独立句柄；CRC-8 校验同步真实性）。
+            let mut pf = match file.try_clone() {
+                Ok(f) => f,
+                Err(_) => return None,
+            };
+            pf.seek(SeekFrom::Start(abs)).ok()?;
+            let mut br = BitReader::new(pf, abs);
+            if let Ok(hdr) = parse_frame_header(&mut br, info) {
+                if hdr.first_sample <= target {
+                    return Some((abs, hdr.first_sample));
+                }
+                // 首样本越过目标（估位偏晚）：继续向前找更早的帧。
+            }
+            // 解析失败 = 假同步或流损坏：继续扫。
+        }
+        hi = lo;
+        if from - hi > FAST_SEEK_SCAN_WINDOW {
+            return None;
+        }
+    }
+    None
 }
 
 /// 采样率编码表（帧头 4 位；0 = 用 STREAMINFO）。
@@ -396,15 +499,15 @@ fn parse_frame_header(r: &mut BitReader, info: &StreamInfo) -> Result<FrameHeade
         ));
     }
     let _reserved = r.read_bits(1)?;
-    let _blocking_strategy = r.read_bits(1)?;
+    let blocking_strategy = r.read_bits(1)?;
     let bs_code = r.read_bits(4)?;
     let sr_code = r.read_bits(4)?;
     let ch_code = r.read_bits(4)?;
     let bps_code = r.read_bits(3)?;
     let _reserved2 = r.read_bits(1)?;
 
-    // 帧号 / 样本号（UTF-8 风格变长，最多 7 字节）：本实现不消费其值，
-    // 但必须正确跳过对应字节数。
+    // 帧号 / 样本号（UTF-8 风格变长，最多 7 字节）：值为快速 seek 的帧
+    // 定位依据（blocking=1 时是首样本序号，否则是帧号）。
     let first = r.read_bits(8)? as u8;
     let extra = if first & 0x80 == 0 {
         0
@@ -423,8 +526,13 @@ fn parse_frame_header(r: &mut BitReader, info: &StreamInfo) -> Result<FrameHeade
     } else {
         return Err(DecodeError::Decode("帧号编码非法".into()));
     };
+    let mut number = utf8_lead_value(first, extra);
     for _ in 0..extra {
-        r.read_bits(8)?;
+        let b = r.read_bits(8)? as u8;
+        if b & 0xC0 != 0x80 {
+            return Err(DecodeError::Decode("帧号续字节非法".into()));
+        }
+        number = (number << 6) | u64::from(b & 0x3F);
     }
 
     // 块尺寸。
@@ -480,10 +588,16 @@ fn parse_frame_header(r: &mut BitReader, info: &StreamInfo) -> Result<FrameHeade
             "帧头 CRC-8 校验失败（算得 {computed8:#04x}，流记 {expected8:#04x}）"
         )));
     }
+    let first_sample = if blocking_strategy == 1 {
+        number
+    } else {
+        number.saturating_mul(u64::from(info.max_blocksize))
+    };
     Ok(FrameHeader {
         block_size,
         assignment,
         bits_per_sample,
+        first_sample,
     })
 }
 
@@ -816,6 +930,7 @@ impl FlacBackend {
                 channels: meta.info.channels,
                 bits_per_sample: meta.info.bits_per_sample,
                 total_samples: meta.info.total_samples,
+                max_blocksize: meta.info.max_blocksize,
             },
             first_frame_offset: meta.first_frame_offset,
             seek_table: meta.seek_table,
@@ -824,6 +939,29 @@ impl FlacBackend {
             scale,
             stream_done: false,
         })
+    }
+
+    /// 快速扫描定位（无 SEEKTABLE 流）：按平均码率估位，再在回扫窗口内
+    /// 找「首样本 ≤ target」的帧头。找到的偏移经帧头 CRC-8 校验；失败
+    /// 返回 None（调用方回退从头线性解码，行为与旧口径一致）。
+    fn fast_scan_point(&self, target: u64) -> Option<(u64, u64)> {
+        // 畸形 STREAMINFO（max_blocksize = 0）：固定块流的「帧号 × 最大块」
+        // 换算会全为 0，扫描可能错位到错误帧——禁用快速路径，保线性正确性。
+        if self.info.max_blocksize == 0 {
+            return None;
+        }
+        // 目标太近不值得扫描：两帧以内线性丢弃更快，也省一次句柄克隆。
+        let near = u64::from(self.info.max_blocksize) * 2;
+        if target < near {
+            return None;
+        }
+        let first = self.first_frame_offset;
+        let est =
+            estimate_byte_offset(first, self.data_end_offset, self.info.total_samples, target)?;
+        // 估位偏晚一点更常见（标签区不计入平均码率），先右探半帧再回扫。
+        let from = (est + 64 * 1024).min(self.data_end_offset.saturating_sub(1));
+        let floor = first.max(from.saturating_sub(FAST_SEEK_SCAN_WINDOW));
+        scan_frame_start(&self.reader.file, &self.info, from, floor, target)
     }
 
     /// 解码一帧并入行缓冲；返回本帧样本数（0 = 流尾）。
@@ -884,7 +1022,12 @@ impl DecoderBackend for FlacBackend {
         Ok(Some(out))
     }
 
-    /// SEEKTABLE 定位 + 解码丢弃至精确帧；无表则从头解码丢弃（v1 口径）。
+    /// 定位：SEEKTABLE 点 → 快速扫描（估位 + 帧头回扫，无表流的快速路径）
+    /// → 从头线性解码（正确性兜底），三档起点统一走「解码丢弃至精确帧」。
+    ///
+    /// 快速路径动机：无 SEEKTABLE 的流（外部工具剥离、写入标签后未重建）
+    /// 原口径从头线性解码——96kHz/24bit 下定位 90 秒需解码数千万样本，
+    /// 实测十余秒才出声（界面已显示 [播] 但无声、时间不走）。
     fn seek(&mut self, secs: f64) -> Result<f64, DecodeError> {
         if !secs.is_finite() || secs < 0.0 {
             return Err(DecodeError::Seek(format!("非法 seek 秒数：{secs}")));
@@ -894,71 +1037,38 @@ impl DecoderBackend for FlacBackend {
             return Err(DecodeError::Seek("采样率未知，无法按秒定位".into()));
         }
         let target = (secs * f64::from(sr)) as u64;
-        // 选 seek 起点：SEEKTABLE 中不大于 target 的最后一点；
-        // 无表或无匹配点 → 从头（偏移 = 首帧、样本 = 0）。
-        let (start_sample, start_offset) = self
-            .seek_table
-            .as_ref()
-            .and_then(|t| {
-                t.iter()
-                    .filter(|p| p.sample <= target)
-                    .max_by_key(|p| p.sample)
-                    .map(|p| (p.sample, p.offset))
-            })
-            .unwrap_or((0, 0));
-        // 偏移范围校验：SEEKTABLE 声明的偏移 + 首帧基址不得越过数据末尾。
-        // 越界意味着表与音频段不匹配（写入标签后偏移未更新等）——按保守
-        // 口径回退到从头线性解码（旧缺陷：越界 seek 静默跳到文件末尾并
-        // 返回 Ok，用户以为 seek 成功但实际跳到结尾停止播放）。
-        let absolute_offset = self.first_frame_offset + start_offset;
-        if start_offset > 0 && self.data_end_offset > 0 && absolute_offset >= self.data_end_offset {
-            // 表不可信：退回从头线性解码（保守口径）。
-            self.reader.reset_to(self.first_frame_offset)?;
-            self.pending.clear();
-            self.stream_done = false;
-            let mut cursor = 0u64;
-            while cursor < target {
-                let mut ch: Vec<Vec<i64>> = Vec::new();
-                match decode_frame(&mut self.reader, &self.info, &mut ch) {
-                    Ok(n) => {
-                        let n = n as u64;
-                        if cursor + n > target {
-                            let skip = (target - cursor) as usize;
-                            let c_count = self.info.channels as usize;
-                            for i in skip..n as usize {
-                                for c in 0..c_count {
-                                    let v =
-                                        ch.get(c).and_then(|col| col.get(i)).copied().unwrap_or(0);
-                                    self.pending.push_back(v as f32 / self.scale);
-                                }
-                            }
-                            cursor = target;
-                        } else {
-                            cursor += n;
-                        }
-                    }
-                    Err(e) => {
-                        // 区分「帧号跳过/不需要的帧」（正常前进）与
-                        // 「真实解码错误」（流损坏）——后者上抛而非吞掉，
-                        // 否则 seek 报成功但 pending 可能为空 → 静默停播。
-                        match &e {
-                            DecodeError::Decode(msg)
-                                if msg.contains("帧序") || msg.contains("跳过") =>
-                            {
-                                // 帧号不匹配：跳到下一帧（正常 seek 行为）
-                            }
-                            _ => return Err(e),
-                        }
-                    }
+
+        // —— 起点三档：SEEKTABLE → 快速扫描 → 从头 ——
+        let mut start_sample = 0u64;
+        let mut start_offset = 0u64; // 相对首帧
+        if let Some(t) = self.seek_table.as_ref() {
+            if let Some(p) = t
+                .iter()
+                .filter(|p| p.sample <= target)
+                .max_by_key(|p| p.sample)
+            {
+                let absolute = self.first_frame_offset.saturating_add(p.offset);
+                let trusted = p.offset == 0
+                    || (absolute != u64::MAX
+                        && (self.data_end_offset == 0 || absolute < self.data_end_offset));
+                if trusted {
+                    start_sample = p.sample;
+                    start_offset = p.offset;
                 }
             }
-            return Ok(secs);
         }
-        self.reader.reset_to(absolute_offset)?;
+        if start_sample == 0 && start_offset == 0 && target > 0 {
+            if let Some((abs, sample)) = self.fast_scan_point(target) {
+                start_sample = sample;
+                start_offset = abs - self.first_frame_offset;
+            }
+        }
+
+        // —— 解码丢弃：从起点帧推进到目标（帧内目标只丢前段，余下入缓冲）——
+        self.reader
+            .reset_to(self.first_frame_offset + start_offset)?;
         self.pending.clear();
         self.stream_done = false;
-
-        // 解码丢弃：从 start_sample 起逐帧推进到 target。
         let mut cursor = start_sample;
         while cursor < target {
             let mut channels: Vec<Vec<i64>> = Vec::new();
@@ -966,7 +1076,6 @@ impl DecoderBackend for FlacBackend {
                 Ok(n) => {
                     let n = n as u64;
                     if cursor + n > target {
-                        // 目标落在本帧内：只丢弃前段，余下入行缓冲。
                         let skip = (target - cursor) as usize;
                         let ch = self.info.channels as usize;
                         for i in skip..n as usize {
@@ -984,17 +1093,16 @@ impl DecoderBackend for FlacBackend {
                         cursor += n;
                     }
                 }
+                // 截断容忍（与正常解码路径同口径：按已到达处理，标记流尾）；
+                // 其余解码错误上抛——否则 seek 假成功但 pending 空 → 静默停播。
                 Err(DecodeError::Decode(msg)) if msg.contains("截断") => {
                     self.stream_done = true;
                     break;
                 }
                 Err(e) => return Err(e),
             }
-            if self.stream_done {
-                break;
-            }
         }
-        Ok(secs)
+        Ok(cursor as f64 / f64::from(sr))
     }
 }
 
@@ -1252,6 +1360,19 @@ mod tests {
         out
     }
 
+    /// 只解前 n 个交错样本（对拍取窗口用：不必解码整文件）。
+    fn decode_n(b: &mut FlacBackend, n: usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            match b.decode_next() {
+                Ok(Some(chunk)) => out.extend_from_slice(&chunk),
+                _ => break,
+            }
+        }
+        out.truncate(n);
+        out
+    }
+
     /// wasted bits（dropped bits）必须左移还原。
     ///
     /// FLAC 规定：子帧头置 wasted 标志时，样本最低 k 位在编码时被截掉，
@@ -1402,6 +1523,311 @@ mod tests {
         let out = decode_all(&mut b);
         expect_samples(&out, &s, 24);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ----------------- 快速 seek（无 SEEKTABLE 流） -----------------
+
+    /// UTF-8 变长编码（测试编码器用）：值 → 帧头「帧号/样本号」域字节。
+    fn write_utf8_number(w: &mut BitWriter, v: u64) {
+        if v < 0x80 {
+            w.write_bits(v, 8);
+        } else if v < 0x800 {
+            w.write_bits(0xC0 | (v >> 6), 8);
+            w.write_bits(0x80 | (v & 0x3F), 8);
+        } else if v < 0x1_0000 {
+            w.write_bits(0xE0 | (v >> 12), 8);
+            w.write_bits(0x80 | ((v >> 6) & 0x3F), 8);
+            w.write_bits(0x80 | (v & 0x3F), 8);
+        } else {
+            panic!("测试未覆盖 ≥0x10000 的编号");
+        }
+    }
+
+    /// 变长块帧（blocking=1，头内写「首样本序号」）。
+    fn encode_frame_sample_number(
+        first_sample: u64,
+        block_size: u32,
+        bps: u8,
+        sub: Sub,
+    ) -> Vec<u8> {
+        let mut w = BitWriter::default();
+        w.write_bits(0x3FFE, 14);
+        w.write_bits(0, 1);
+        w.write_bits(1, 1); // blocking strategy：样本号
+        w.write_bits(0b0110, 4);
+        w.write_bits(0, 4); // 采样率：STREAMINFO
+        w.write_bits(0, 4); // 单声道
+        let bps_code = match bps {
+            16 => 0b100,
+            24 => 0b110,
+            other => panic!("测试未覆盖位深 {other}"),
+        };
+        w.write_bits(bps_code, 3);
+        w.write_bits(0, 1);
+        write_utf8_number(&mut w, first_sample);
+        w.write_bits(u64::from(block_size - 1), 8);
+        w.align();
+        let c8 = crc8_of(&w.out);
+        w.write_bits(u64::from(c8), 8);
+        encode_subframe(&mut w, &sub, bps);
+        w.align();
+        let c16 = crc16_of(&w.out);
+        w.write_bits(u64::from(c16), 16);
+        w.out
+    }
+
+    /// 估位：总量未知 → None；目标越界 → 夹到帧区；中段 → 线性插值。
+    #[test]
+    fn estimate_byte_offset_clamps() {
+        assert!(estimate_byte_offset(100, 200, 0, 50).is_none());
+        assert!(estimate_byte_offset(100, 100, 1000, 500).is_none());
+        let e = estimate_byte_offset(100, 200, 1000, 500).unwrap();
+        assert_eq!(e, 150, "中段应线性插值");
+        let e = estimate_byte_offset(100, 200, 1000, 5000).unwrap();
+        assert_eq!(e, 199, "越界目标夹到 data_end-1");
+        let e = estimate_byte_offset(100, 200, 1000, 0).unwrap();
+        assert_eq!(e, 100, "目标 0 → 首帧");
+    }
+
+    /// 无 SEEKTABLE 多帧流：seek 应精确落在目标帧（验证快速扫描 +
+    /// 解码丢弃的落点正确，而非只回填了位置元数据——每帧常量 = 帧号，
+    /// 解出的首个样本即暴露真实落帧）。
+    #[test]
+    fn fast_seek_without_seektable_lands_exact_frame() {
+        let sr = 16000u32;
+        let block = 256u32;
+        let frames_n = 64usize;
+        let frames: Vec<Vec<u8>> = (0..frames_n)
+            .map(|k| {
+                encode_frame(
+                    k as u32,
+                    block,
+                    0,
+                    16,
+                    vec![Sub::Constant((k * 1000) as i64)],
+                )
+            })
+            .collect();
+        let total = (frames_n as u64) * u64::from(block);
+        let bytes = make_flac(sr, 1, 16, total, block as u16, &frames, None);
+        let path = write_temp(&bytes);
+        let mut b = FlacBackend::open(&path).expect("应能打开");
+        assert!(b.seek_table.is_none(), "夹具应无 SEEKTABLE");
+
+        // 目标 = 第 30 帧正中（样本 7808）。
+        let want_sample = 30 * u64::from(block) + 128;
+        let got = b
+            .seek(want_sample as f64 / f64::from(sr))
+            .expect("seek 应成功");
+        assert_eq!(got, want_sample as f64 / f64::from(sr), "返回位置应精确");
+        let out = decode_all(&mut b);
+        assert!(!out.is_empty(), "seek 后应有数据");
+        let first = (out[0] * 32768.0).round() as i64;
+        assert_eq!(first, 30 * 1000, "应落在第 30 帧（常量=帧号×1000）");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 变长块流（头内样本号）：快速路径同样精确（first_sample 取头内值）。
+    #[test]
+    fn fast_seek_variable_block_sample_number() {
+        let sr = 16000u32;
+        // 帧 0：192 样本；帧 1..：256 样本，头内样本号多字节形态。
+        let f0 = encode_frame_sample_number(0, 192, 16, Sub::Constant(111));
+        let f1 = encode_frame_sample_number(192, 256, 16, Sub::Constant(2222));
+        let f2 = encode_frame_sample_number(448, 256, 16, Sub::Constant(3333));
+        let frames = vec![f0, f1, f2];
+        let total = 192 + 256 * 2;
+        let bytes = make_flac(sr, 1, 16, total, 256, &frames, None);
+        let path = write_temp(&bytes);
+        let mut b = FlacBackend::open(&path).expect("应能打开");
+        // 目标 300 落在帧 1（[192, 448)）。
+        let got = b.seek(300.0 / f64::from(sr)).expect("seek 应成功");
+        assert_eq!(got, 300.0 / f64::from(sr));
+        let out = decode_all(&mut b);
+        let first = (out[0] * 32768.0).round() as i64;
+        assert_eq!(first, 2222, "应落在帧 1");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 直接验证快速扫描路径本身（而非经 seek 的端到端结果——小夹具上
+    /// 线性兜底与快速路径产物相同，端到端断言抓不住扫描器失效）。
+    #[test]
+    fn fast_scan_point_returns_frame_on_tableless_stream() {
+        let sr = 16000u32;
+        let block = 256u32;
+        let frames: Vec<Vec<u8>> = (0..64usize)
+            .map(|k| {
+                encode_frame(
+                    k as u32,
+                    block,
+                    0,
+                    16,
+                    vec![Sub::Constant((k * 1000) as i64)],
+                )
+            })
+            .collect();
+        let total = 64 * u64::from(block);
+        let bytes = make_flac(sr, 1, 16, total, block as u16, &frames, None);
+        let path = write_temp(&bytes);
+        let b = FlacBackend::open(&path).expect("应能打开");
+        let target = 30 * u64::from(block) + 128;
+        match b.fast_scan_point(target) {
+            Some((abs, sample)) => {
+                assert!(abs >= b.first_frame_offset, "扫描点须在帧区内");
+                assert_eq!(sample, 30 * u64::from(block), "应定位到第 30 帧首样本");
+            }
+            None => panic!("无表流应能扫到帧起点（快速路径失效会退化为线性解码）"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 有 SEEKTABLE 的流行为不变：定位点精确。
+    #[test]
+    fn seektable_seek_still_exact() {
+        let sr = 16000u32;
+        let block = 256u32;
+        let frames: Vec<Vec<u8>> = (0..8usize)
+            .map(|k| encode_frame(k as u32, block, 0, 16, vec![Sub::Constant((k * 10) as i64)]))
+            .collect();
+        let total = 8 * u64::from(block);
+        // 单点：第 4 帧起点（偏移 = 前 4 帧累计字节数，相对首帧）。
+        let off4: u64 = frames.iter().take(4).map(|f| f.len() as u64).sum();
+        let pts = vec![(4 * u64::from(block), off4)];
+        let bytes = make_flac(sr, 1, 16, total, block as u16, &frames, Some(pts));
+        let path = write_temp(&bytes);
+        let mut b = FlacBackend::open(&path).expect("应能打开");
+        assert!(b.seek_table.is_some());
+        let want = 5 * u64::from(block) + 31;
+        let got = b.seek(want as f64 / f64::from(sr)).expect("seek 应成功");
+        assert_eq!(got, want as f64 / f64::from(sr));
+        let out = decode_all(&mut b);
+        let first = (out[0] * 32768.0).round() as i64;
+        assert_eq!(first, 50, "应落在第 5 帧");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 畸形 STREAMINFO（max_blocksize = 0）：固定块流的「帧号 × 最大块」换算
+    /// 会全为 0，快速路径必须直接返回 None（回退线性解码），不得给出错位锚点；
+    /// 回退路径落点仍须正确（每帧常量 = 帧号×1000）。
+    #[test]
+    fn fast_scan_disabled_when_max_blocksize_zero() {
+        let sr = 16000u32;
+        let block = 256u32;
+        let frames_n = 64usize;
+        let frames: Vec<Vec<u8>> = (0..frames_n)
+            .map(|k| {
+                encode_frame(
+                    k as u32,
+                    block,
+                    0,
+                    16,
+                    vec![Sub::Constant((k * 1000) as i64)],
+                )
+            })
+            .collect();
+        let total = (frames_n as u64) * u64::from(block);
+        // STREAMINFO 声明 max_blocksize=0（畸形），帧本身仍是 256 样本。
+        let bytes = make_flac(sr, 1, 16, total, 0, &frames, None);
+        let path = write_temp(&bytes);
+        let mut b = FlacBackend::open(&path).expect("应能打开");
+        assert_eq!(b.info.max_blocksize, 0, "夹具应为畸形 STREAMINFO");
+        let want_sample = 30 * u64::from(block) + 128;
+        assert_eq!(
+            b.fast_scan_point(want_sample),
+            None,
+            "max_blocksize=0 必须禁用快速路径"
+        );
+        // 回退线性解码：落点仍须精确到目标样本。
+        let got = b
+            .seek(want_sample as f64 / f64::from(sr))
+            .expect("线性回退 seek 应成功");
+        assert_eq!(got, want_sample as f64 / f64::from(sr));
+        let out = decode_all(&mut b);
+        assert!(!out.is_empty(), "回退路径应能解出数据");
+        let first = (out[0] * 32768.0).round() as i64;
+        assert_eq!(first, 30 * 1000, "线性回退应落在第 30 帧");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 快速路径与线性解码逐样本一致：同一无表流，一份走快速扫描 seek，
+    /// 另一份把 max_blocksize 置 0 强制线性回退；二者落点与后续样本必须
+    /// 完全相同——只证明「更快」不够，还要证明「落点不偏」。
+    #[test]
+    fn fast_seek_samples_match_linear_decode() {
+        let sr = 16000u32;
+        let block = 256u32;
+        let frames_n = 64usize;
+        let frames: Vec<Vec<u8>> = (0..frames_n)
+            .map(|k| {
+                encode_frame(
+                    k as u32,
+                    block,
+                    0,
+                    16,
+                    vec![Sub::Constant((k * 1000) as i64)],
+                )
+            })
+            .collect();
+        let total = (frames_n as u64) * u64::from(block);
+        let bytes = make_flac(sr, 1, 16, total, block as u16, &frames, None);
+        let path = write_temp(&bytes);
+        let target = 30 * u64::from(block) + 128;
+
+        let mut fast = FlacBackend::open(&path).expect("应能打开");
+        fast.seek(target as f64 / f64::from(sr))
+            .expect("快速 seek 应成功");
+        let fast_samples = decode_n(&mut fast, 300);
+
+        let mut linear = FlacBackend::open(&path).expect("应能打开");
+        // 强制线性回退：max_blocksize=0 让快速路径守卫返回 None。
+        linear.info.max_blocksize = 0;
+        linear
+            .seek(target as f64 / f64::from(sr))
+            .expect("线性 seek 应成功");
+        let linear_samples = decode_n(&mut linear, 300);
+
+        assert_eq!(fast_samples.len(), linear_samples.len(), "样本数应一致");
+        assert_eq!(
+            fast_samples, linear_samples,
+            "快速路径落点样本必须与线性解码逐样本一致"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 真实高解析流探针（手动）：`TUNEUX_FLAC_PROBE=<路径> cargo test
+    /// fast_seek_real_probe -- --ignored --nocapture`。无 SEEKTABLE 的
+    /// 96kHz/24bit 流 seek 88 秒应远快于线性解码（断言 < 2s），并与
+    /// 强制线性回退的落点样本逐样本对拍（只证明快不够，还要证明不偏）。
+    #[test]
+    #[ignore = "手动探针：需 TUNEUX_FLAC_PROBE 指向真实 FLAC（会读盘）"]
+    fn fast_seek_real_probe() {
+        let path = match std::env::var("TUNEUX_FLAC_PROBE") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => return,
+        };
+        let mut fast = FlacBackend::open(&path).expect("应能打开");
+        assert!(fast.seek_table.is_none(), "该探针针对无 SEEKTABLE 流");
+        let t0 = std::time::Instant::now();
+        let got = fast.seek(88.0).expect("seek 应成功");
+        let dt = t0.elapsed();
+        println!("快速 seek(88s) → {got:.3}s，耗时 {dt:?}");
+        assert!(dt.as_secs() < 2, "快速 seek 应秒回，实际 {dt:?}");
+        let fast_samples = decode_n(&mut fast, 4096);
+
+        // 落点对拍：强制线性回退（max_blocksize=0 让快速路径守卫返回 None），
+        // 从同一位置取同样窗口逐样本比较。线性回退会真的解码到 88 秒，
+        // 耗时约十余秒，属手动探针可接受成本。
+        let mut linear = FlacBackend::open(&path).expect("应能打开");
+        linear.info.max_blocksize = 0;
+        let t1 = std::time::Instant::now();
+        linear.seek(88.0).expect("线性 seek 应成功");
+        println!("线性 seek(88s) 参考耗时 {:?}", t1.elapsed());
+        let linear_samples = decode_n(&mut linear, 4096);
+        assert_eq!(
+            fast_samples, linear_samples,
+            "快速 seek 落点样本与线性解码不一致——速度提升不得以落点偏移为代价"
+        );
+        println!("落点对拍通过：快速路径与线性解码逐样本一致");
     }
 
     /// 左/侧立体声去相关：right = left - side。
@@ -1693,5 +2119,55 @@ mod tests {
             }
         }
         assert_eq!(diff, 0, "不一致样本数 {diff} / {}", mine_out.len());
+    }
+
+    /// 位读器 64 位全宽读取：消费过少量位后再整读 64 位，高位不得丢失。
+    ///
+    /// 回归：位缓冲是 64 位窗口，旧实现的单次填装在残留 bits>56 时
+    /// `buf << 8` 把最早 7 个 1 移出丢失（读出 0 而非 0xFE00…00）。
+    #[test]
+    fn bitreader_read64_full_width() {
+        // 9 字节：首字节 0x7F（1 个 0 + 7 个 1），其余全 0。
+        let bytes = [0x7Fu8, 0, 0, 0, 0, 0, 0, 0, 0];
+        let path = write_temp(&bytes);
+        let file = File::open(&path).expect("应能打开临时文件");
+        let mut r = BitReader::new(file, 0);
+        assert_eq!(r.read_bits(1).expect("首 bit"), 0);
+        // 后续 64 位 = 7 个 1 + 57 个 0 = 0xFE00_0000_0000_0000。
+        let v = r.read_bits64(64).expect("64 位读取应成功");
+        assert_eq!(v, 0xFE00_0000_0000_0000, "64 位读取不得丢失高位");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 表不可信回退路径遇「截断」与正常解码同口径容忍。
+    ///
+    /// 回归：回退分支曾对任何错误直接上抛（含永不命中的死分支），
+    /// 尾部截断的流上 seek 越过断点时报错失败而非按已到达处理。
+    #[test]
+    fn seek_untrusted_table_truncated_stream_tolerated() {
+        // 两帧流 + 越界 SEEKTABLE 偏移（触发表不可信回退）+ 尾部截断。
+        let frame1 = encode_frame(0, 8, 1, 16, vec![Sub::Constant(100), Sub::Constant(-100)]);
+        let frame2 = encode_frame(1, 8, 1, 16, vec![Sub::Constant(200), Sub::Constant(-200)]);
+        let full = make_flac(
+            44100,
+            2,
+            16,
+            16,
+            8,
+            &[frame1, frame2],
+            Some(vec![(0, 999_999)]),
+        );
+        // 截去尾部 10 字节（破坏第二帧，元数据完整）。
+        let truncated = &full[..full.len() - 10];
+        let path = write_temp(truncated);
+        let mut b = FlacBackend::open(&path).expect("截断流仍应可打开");
+        // seek 越过截断点（0.3s ≈ 13230 样本 > 第一帧 8 样本）：
+        // 回退线性解码遇截断应容忍，并返回实际到达位置，而非请求秒数。
+        let actual = b.seek(0.3).expect("截断流上的 seek 不应失败");
+        assert!(
+            (actual - 8.0 / 44_100.0).abs() < 1e-9,
+            "应返回截断前的实际落点，而非请求秒数：{actual}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -24,8 +24,36 @@ pub struct SavedList {
     pub items: Vec<PlaylistItem>,
     /// 上次退出时的当前曲路径（启动自动选中，不自动播放）。
     pub current: Option<PathBuf>,
-    /// 随机开关。
+    /// 当前 CUE 分轨号（None = 普通曲目或旧格式状态）。
+    pub current_cue: Option<u32>,
+    /// 旧版随机开关（true 等价于 tracks）。
     pub shuffle: bool,
+    /// 随机模式（off / tracks / true_random / albums）。
+    #[serde(default)]
+    pub shuffle_mode: String,
+}
+
+impl SavedList {
+    /// 读取随机模式；旧文件没有该字段（空串）或字段值非法时按布尔开关迁移为 tracks/off。
+    ///
+    /// 空串 = 旧文件没有该字段；非法值 = 历史脏数据或未来版本回退。
+    /// 两种形态都按旧布尔 `shuffle` 迁移（true→tracks / false→off）——
+    /// 显式合法值（含 `"off"`）一律以字段为准，避免覆盖用户的显式选择。
+    pub fn shuffle_mode(&self) -> crate::ShuffleMode {
+        let recognized = matches!(
+            self.shuffle_mode.as_str(),
+            "off" | "tracks" | "true_random" | "albums"
+        );
+        if !recognized {
+            if self.shuffle {
+                crate::ShuffleMode::Tracks
+            } else {
+                crate::ShuffleMode::Off
+            }
+        } else {
+            crate::ShuffleMode::parse(&self.shuffle_mode)
+        }
+    }
 }
 
 /// 播放状态（多播放列表 + 每曲进度）。
@@ -82,7 +110,9 @@ mod tests {
                     cue: None,
                 }],
                 current: Some(PathBuf::from("/music/a.flac")),
+                current_cue: Some(2),
                 shuffle: true,
+                shuffle_mode: "albums".into(),
             }],
             active: 0,
             positions: BTreeMap::from([(PathBuf::from("/music/a.flac"), 123.45)]),
@@ -95,6 +125,8 @@ mod tests {
         let back: PlaylistState = toml::from_str(&text).expect("反序列化");
         assert_eq!(back.lists.len(), 1);
         assert_eq!(back.lists[0].name, "默认");
+        assert_eq!(back.lists[0].shuffle_mode(), crate::ShuffleMode::Albums);
+        assert_eq!(back.lists[0].current_cue, Some(2));
         assert_eq!(back.active, 0);
         assert!(back.positions.contains_key(&PathBuf::from("/music/a.flac")));
         assert!((back.replay_gain[&PathBuf::from("/music/a.flac")] + 6.2).abs() < 1e-9);
@@ -114,6 +146,33 @@ path = "/music/song.flac"
         assert_eq!(state.items.len(), 1);
         assert!(state.shuffle);
         assert!(state.lists.is_empty(), "lists 应为空（待迁移）");
+    }
+
+    #[test]
+    fn legacy_list_shuffle_bool_defaults_to_tracks() {
+        let state: PlaylistState = toml::from_str("[[lists]]\nshuffle = true\n").expect("旧列表");
+        assert_eq!(state.lists[0].shuffle_mode(), crate::ShuffleMode::Tracks);
+    }
+
+    /// 非法 shuffle_mode（历史脏数据 / 未来版本回退）同样按旧布尔迁移；
+    /// 显式合法值（含 "off"）以字段为准，不被旧布尔覆盖。
+    #[test]
+    fn invalid_shuffle_mode_falls_back_to_legacy_bool() {
+        let dirty_on: PlaylistState =
+            toml::from_str("[[lists]]\nshuffle = true\nshuffle_mode = \"random\"\n").expect("脏值");
+        assert_eq!(dirty_on.lists[0].shuffle_mode(), crate::ShuffleMode::Tracks);
+
+        let dirty_off: PlaylistState =
+            toml::from_str("[[lists]]\nshuffle = false\nshuffle_mode = \"random\"\n")
+                .expect("脏值");
+        assert_eq!(dirty_off.lists[0].shuffle_mode(), crate::ShuffleMode::Off);
+
+        let explicit_off: PlaylistState =
+            toml::from_str("[[lists]]\nshuffle = true\nshuffle_mode = \"off\"\n").expect("显式关");
+        assert_eq!(
+            explicit_off.lists[0].shuffle_mode(),
+            crate::ShuffleMode::Off
+        );
     }
 
     /// save_position：>0.5s 记录，≤0.5s 清除。

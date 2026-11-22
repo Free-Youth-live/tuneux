@@ -33,17 +33,6 @@ use tuneux_mediax::metadata;
 // 搜索目标重导出：render/layout.rs 依赖 `crate::tui::app::SearchTarget` 路径。
 pub use self::search::SearchTarget;
 
-/// 后台目录加入的结果消息：目录 + 构建好的条目 + 新探测的元数据
-/// （封面字节已剥离，仅缓存未命中的项）。
-#[allow(clippy::type_complexity)]
-pub type DirAddResult = (
-    PathBuf,
-    Vec<playlist::PlaylistItem>,
-    Vec<(PathBuf, tuneux_mediax::metadata::TrackMetadata)>,
-    // 本批跳过的数据轨总数（cue 中的 MODE1/MODE2 等不可播轨；供 UI 提示）。
-    usize,
-);
-
 /// 应用运行时状态。
 ///
 /// 集中持有 TUI 需要的所有可变状态：文件浏览器与音频引擎。
@@ -64,12 +53,6 @@ pub struct App {
     pub search_load_rx: crossbeam_channel::Receiver<(u64, Vec<fs_browser::Entry>, bool)>,
     /// 搜索收集代次：每次进入搜索 +1，用于丢弃陈旧收集（重进搜索 / 切目录后）。
     pub search_load_gen: u64,
-    /// 目录递归加入的异步构建：后台线程收集 + CUE 展开 + 元数据探测后
-    /// 发回 [`DirAddResult`]。加入是累积语义，多批次全部合入
-    /// （与导航的「最新生效」不同，不用代次丢弃）。
-    pub add_load_tx: crossbeam_channel::Sender<DirAddResult>,
-    /// 目录加入接收端。
-    pub add_load_rx: crossbeam_channel::Receiver<DirAddResult>,
     /// 音频引擎（播放控制、状态读取）。Option 因为引擎初始化可能失败，
     /// 失败时退化为"只能浏览不能播放"，不让整个程序崩溃。
     pub engine: Option<audio::Engine>,
@@ -89,9 +72,15 @@ pub struct App {
     /// ReplayGain 增益缓存：path → 整曲增益（dB）。
     /// 首次播放无缓存（增益 1.0），播放中分析完成后缓存，下次播放生效。
     pub replay_gain_cache: std::collections::BTreeMap<PathBuf, f64>,
+    /// ReplayGain 缓存的使用序（队尾 = 最近使用）：配合 cache_replay_gain
+    /// 的 LRU 上限维护，超限逐出队头（最久未用）。
+    pub replay_gain_order: std::collections::VecDeque<PathBuf>,
+    /// 恢复期元数据后台回填接收端：启动恢复只加条目不阻塞，from_file
+    /// （内含封面字节读取）由 restore-meta 线程完成后逐帧合入缓存。
+    pub restore_meta_rx: crossbeam_channel::Receiver<(PathBuf, metadata::TrackMetadata)>,
     /// 播放列表（按插入序存，显示时按专辑-曲序排序）
     pub playlist: playlist::Playlist,
-    /// 播放状态（播放列表 + 每首进度），退出时保存到独立文件 playlist.toml。
+    /// 播放状态（播放列表 + 每首进度），退出时保存到独立文件 tuneux-playlist.toml。
     pub playlist_state: PlaylistState,
     /// i18n 查询器：请求语言表（`locales/<lang>.txt`）+ zh 内置兜底。
     pub i18n: tuneux_commonx::I18n,
@@ -149,7 +138,9 @@ pub struct App {
     pub last_error: Option<String>,
     /// last_error 的显示起始时间，用于 5 秒后自动清。
     pub last_error_at: Option<std::time::Instant>,
-    /// 连续播放失败计数：列表全损坏时避免自动跳曲无限循环（达到阈值即停止）。
+    /// 连续播放失败计数：列表全损坏时避免自动跳曲无限循环。达到阈值即停止
+    /// 自动跳（计数饱和在上限），用户手动发起点播（play_and_update_current 的
+    /// 手动路径）清零后恢复。
     pub consecutive_failures: u32,
     /// 渲染帧计数（u64 取模防溢出）。每帧 draw 时 +1，
     /// 传给电平表的乱码生成器，让柱图字符随帧变化（看起来"活"）。
@@ -168,6 +159,19 @@ pub struct App {
     pub pending_clear_at: Option<std::time::Instant>,
 }
 
+/// 恢复期元数据回填的路径清单：已失效路径跳过，同一文件只回填一次
+/// （CUE 多分轨与重复条目共用同一整轨文件）。
+fn restore_backfill_paths(items: &[playlist::PlaylistItem]) -> Vec<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for item in items {
+        if item.path.exists() && seen.insert(item.path.clone()) {
+            out.push(item.path.clone());
+        }
+    }
+    out
+}
+
 impl App {
     /// 当前播放曲目路径（属性弹窗显示用）；无当前曲时 None。
     pub fn current_file_path(&self) -> Option<&std::path::Path> {
@@ -179,6 +183,8 @@ impl App {
 
     /// 引擎启动失败时 engine 为 None，程序仍可浏览。
     pub fn new(config: &Config) -> Self {
+        // 主题先于任何渲染初始化；运行中经 t 键 / set_theme 即时切换。
+        crate::tui::palette::init(&config.theme);
         let initial = config.effective_last_dir();
         // 解析配置里的介质风格（同源解析一次，供引擎下发与 App 字段共用）。
         let medium: audio::PlaybackMedium = config
@@ -202,8 +208,12 @@ impl App {
             e.set_medium(medium);
             e.set_replay_gain_enabled(config.replay_gain);
         }
-        // 加载播放状态（独立文件 playlist.toml）
-        let (playlist_state, playlist_status) = crate::config::load_playlist_state_with_status();
+        // 加载播放状态（独立文件 tuneux-playlist.toml）
+        let (mut playlist_state, playlist_status) =
+            crate::config::load_playlist_state_with_status();
+        // 裁剪失效路径：断点与 ReplayGain 表按文件存在性清理（退出侧在
+        // main.rs 同样裁剪一次，双向兜底强杀/崩溃场景）。
+        playlist_state.prune_missing_files();
         // 文件损坏：走 UI 通道提示（此处已在 raw 模式，eprintln 会弄脏备用屏）；
         // 备份与停写锁已在加载函数内完成，本次会话不会覆写原文件。
         // 文案构造用 commonx 统一口径（备份成败两分支，含单元测试）。
@@ -214,27 +224,42 @@ impl App {
         );
 
         let mut playlist = playlist::Playlist::new();
-        playlist.set_shuffle(config.shuffle);
+        // 旧配置迁移：shuffle_mode 缺字段默认空串、旧版写死 "off" 时，
+        // 旧布尔 shuffle=true 的随机档迁移为曲目随机（不静默丢失）。
+        let shuffle_mode = match config.shuffle_mode.as_str() {
+            "off" | "" if config.shuffle => tuneux_mediax::ShuffleMode::Tracks,
+            name => tuneux_mediax::ShuffleMode::parse(name),
+        };
+        playlist.set_shuffle_mode(shuffle_mode);
         playlist.set_view(config.playlist_view);
 
-        // 恢复上次播放列表，并预提取 metadata（使组头歌手/时长立即正确）。
-        // 失效路径（文件已删除/移动）自动跳过。
-        let mut metadata_cache = std::collections::HashMap::new();
+        // 恢复上次播放列表：只加入条目——组头/曲序由条目自带的 album/
+        // track_number 保证正确，启动期不逐首同步 from_file（内含封面字节
+        // 读取，数千条列表会阻塞数十秒）；歌手/时长等元数据由 restore-meta
+        // 线程后台回填（见 restore_meta_rx 字段说明）。失效路径自动跳过。
+        let mut restored_items: Vec<playlist::PlaylistItem> = Vec::new();
         for item in &playlist_state.items {
             if !item.path.exists() {
                 continue;
             }
             playlist.add(item.clone());
-            if !metadata_cache.contains_key(&item.path) {
-                // 与热路径 get_or_extract_metadata 同口径：缓存**不保留封面字节**。
-                // from_file 会填入内嵌封面或同目录约定图片（folder_cover），
-                // 后者使同一专辑的每一首各持一份相同副本——启动恢复既无条数上限、
-                // 也不像热路径那样剥离，2000 首同专辑可达 GB 级重复内存。
-                // 显示也不需要它：封面只随当前曲目保留在 current_metadata。
-                let mut md = metadata::TrackMetadata::from_file(&item.path);
-                md.cover = None;
-                metadata_cache.insert(item.path.clone(), md);
-            }
+            restored_items.push(item.clone());
+        }
+        let (restore_meta_tx, restore_meta_rx) = crossbeam_channel::unbounded();
+        {
+            // 同一文件多条目（CUE 分轨 / 重复）只回填一次；线程启动失败时
+            // 回填静默缺失，元数据在播放时按需提取（优雅降级，不阻塞启动）。
+            let backfill = restore_backfill_paths(&restored_items);
+            let _ = std::thread::Builder::new()
+                .name("tuneux-restore-meta".to_string())
+                .spawn(move || {
+                    for path in backfill {
+                        let mut md = metadata::TrackMetadata::from_file(&path);
+                        // 与热路径 get_or_extract_metadata 同口径：缓存不保留封面字节。
+                        md.cover = None;
+                        let _ = restore_meta_tx.send((path, md));
+                    }
+                });
         }
 
         // 自动选中上次播放的歌曲（高亮落在它上，用户按 Enter 才播放）。
@@ -259,9 +284,8 @@ impl App {
 
         // 目录异步载入通道：后台线程读目录，主循环轮询后应用（大目录不卡 UI）。
         let (dir_load_tx, dir_load_rx) = crossbeam_channel::unbounded();
-        // 浏览器搜索收集与目录加入的后台通道（同机制，见对应字段说明）。
+        // 浏览器搜索收集的后台通道（同机制，见对应字段说明）。
         let (search_load_tx, search_load_rx) = crossbeam_channel::unbounded();
-        let (add_load_tx, add_load_rx) = crossbeam_channel::unbounded();
 
         // 启动期错误合并展示：引擎失败与播放列表损坏共用 last_error 通道。
         let startup_error = match (engine_init_error, playlist_corrupt_msg) {
@@ -281,14 +305,16 @@ impl App {
             search_load_tx,
             search_load_rx,
             search_load_gen: 0,
-            add_load_tx,
-            add_load_rx,
             engine,
             current_metadata: None,
-            metadata_cache,
-            // ReplayGain 缓存：从 playlist.toml 载入上次会话的测量结果
+            metadata_cache: std::collections::HashMap::new(),
+            // ReplayGain 缓存：从 tuneux-playlist.toml 载入上次会话的测量结果
             //（路径 → dB），本次会话内新测量结果经 save_playlist_to_state 回写。
             replay_gain_cache: playlist_state.replay_gain.clone(),
+            // LRU 使用序：队尾 = 最近使用，初始按载入表的键序排列。
+            replay_gain_order: playlist_state.replay_gain.keys().cloned().collect(),
+            // 恢复期元数据回填接收端（App::new 起的 restore-meta 线程写入）。
+            restore_meta_rx,
             playlist,
             playlist_state,
             i18n,
@@ -333,7 +359,14 @@ impl App {
     /// 把当前播放列表与当前曲目写回播放状态（退出时调用，下次启动恢复）。
     pub fn save_playlist_to_state(&mut self) {
         self.playlist_state.items = self.playlist.items().to_vec();
-        self.playlist_state.current = self.current_path.clone();
+        // 本会话只浏览未点播时 current_path 为空：回退当前选中项，
+        // 不要用 None 覆盖上一会话保存的 current（跨会话自动选中失效）。
+        self.playlist_state.current = self.current_path.clone().or_else(|| {
+            self.playlist
+                .selected_track()
+                .and_then(|index| self.playlist.items().get(index))
+                .map(|item| item.path.clone())
+        });
         // 当前曲的 CUE 分轨号：恢复时定位上次播放的分轨（与 fx 同源）。
         self.playlist_state.current_cue = self
             .playlist
@@ -341,7 +374,7 @@ impl App {
             .and_then(|i| self.playlist.items().get(i))
             .and_then(|it| it.cue.as_ref())
             .map(|c| c.index);
-        // ReplayGain 测量缓存同步回持久化状态（随 playlist.toml 落盘，
+        // ReplayGain 测量缓存同步回持久化状态（随 tuneux-playlist.toml 落盘，
         // 下次启动经 App::new 重新载入，跨会话免重复分析）。
         // 修剪：只保留当前列表曲目或文件仍在磁盘的（测量代价高，重加入免重测）。
         self.replay_gain_cache
@@ -418,16 +451,6 @@ mod tests {
         }
     }
 
-    /// 模拟主循环轮询目录加入结果（测试用，阻塞等待保证确定性）。
-    fn drain_add_load(app: &mut App, config: &mut Config) {
-        if let Ok((dir, items, mds, skipped)) = app
-            .add_load_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-        {
-            app.apply_dir_add(dir, items, mds, skipped, config);
-        }
-    }
-
     #[test]
     fn app_key_navigation() {
         let tmp = std::env::temp_dir().join("tuneux_app_nav_test");
@@ -487,6 +510,34 @@ mod tests {
     }
 
     #[test]
+    fn theme_key_cycles_and_search_input_remains_literal() {
+        let mut config = Config {
+            theme: "phosphor".to_string(),
+            ..Config::default()
+        };
+        let mut app = App::new(&config);
+        assert!(app.handle_key(key(KeyCode::Char('t')), &mut config));
+        assert_eq!(config.theme, "classic", "t 应切换并写回配置");
+        assert_eq!(
+            crate::tui::palette::pal().chrome,
+            crate::tui::palette::select("classic").chrome
+        );
+
+        assert!(app.handle_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            &mut config
+        ));
+        assert_eq!(config.theme, "classic", "Ctrl+t 不得切主题");
+
+        app.search_mode = true;
+        app.search_target = SearchTarget::Playlist;
+        assert!(app.handle_key(key(KeyCode::Char('t')), &mut config));
+        assert_eq!(app.search_query, "t", "搜索态应输入字母而非切主题");
+        assert_eq!(config.theme, "classic");
+        crate::tui::palette::set_theme("phosphor");
+    }
+
+    #[test]
     fn custom_keymap_overrides_default() {
         let mut config = Config::default();
         // 把"下一曲"映射到 x 键：按 x 应走 next，而非默认的"清空确认"
@@ -523,89 +574,6 @@ mod tests {
         assert!(app.handle_key(key(KeyCode::Enter), &mut config));
         assert_eq!(app.playlist.items().len(), 2, "应累计 2 首");
         assert_eq!(app.playlist.current_index(), Some(1));
-
-        let _ = fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    #[ignore = "共享扫描池后元数据由工人线程独立读取，测试注入的缓存不可见——待改为真实音频文件测试"]
-    fn add_directory_sorts_by_album_track() {
-        let tmp = std::env::temp_dir().join("tuneux_add_dir_sort_test");
-        let _ = fs::remove_dir_all(&tmp);
-        let album_a = tmp.join("合集/albumA");
-        let album_b = tmp.join("合集/albumB");
-        fs::create_dir_all(&album_a).unwrap();
-        fs::create_dir_all(&album_b).unwrap();
-        fs::File::create(album_a.join("02 - 二.mp3")).unwrap();
-        fs::File::create(album_a.join("01 - 一.mp3")).unwrap();
-        fs::File::create(album_b.join("01 - 一.mp3")).unwrap();
-        // canonicalize 得到真实路径（macOS 上 /var → /private/var），
-        // 与浏览器递归收集时产生的路径保持一致，确保 metadata_cache 命中。
-        let album_a = album_a.canonicalize().unwrap();
-        let album_b = album_b.canonicalize().unwrap();
-
-        let mut config = Config {
-            last_dir: Some(tmp.clone()),
-            ..Config::default()
-        };
-        let mut app = App::new(&config);
-
-        // 注入假元数据：专辑 A 曲序 1/2，专辑 B 曲序 1
-        app.metadata_cache.insert(
-            album_a.join("01 - 一.mp3"),
-            metadata::TrackMetadata {
-                album: Some("A".to_string()),
-                track_number: Some(1),
-                ..Default::default()
-            },
-        );
-        app.metadata_cache.insert(
-            album_a.join("02 - 二.mp3"),
-            metadata::TrackMetadata {
-                album: Some("A".to_string()),
-                track_number: Some(2),
-                ..Default::default()
-            },
-        );
-        app.metadata_cache.insert(
-            album_b.join("01 - 一.mp3"),
-            metadata::TrackMetadata {
-                album: Some("B".to_string()),
-                track_number: Some(1),
-                ..Default::default()
-            },
-        );
-
-        // 选中"合集"目录并添加（浏览器 entries[0] = 合集）；
-        // 目录加入已异步化：模拟主循环轮询合入结果。
-        assert_eq!(app.browser.entries()[0].name(), "合集");
-        app.add_current_browser_to_playlist(&mut config);
-        drain_add_load(&mut app, &mut config);
-
-        // 期望：3 个条目，按专辑-曲序 A/01, A/02, B/01
-        assert_eq!(app.playlist.items().len(), 3);
-        let seq: Vec<(String, u32)> = app
-            .playlist
-            .items()
-            .iter()
-            .map(|i| {
-                (
-                    i.album.clone().unwrap_or_default(),
-                    i.track_number.unwrap_or(0),
-                )
-            })
-            .collect();
-        assert_eq!(
-            seq,
-            vec![
-                ("A".to_string(), 1),
-                ("A".to_string(), 2),
-                ("B".to_string(), 1)
-            ]
-        );
-        // 自动播放/选中第一首 = 排序后的第一首（索引 0）
-        assert_eq!(app.playlist.current_index(), Some(0));
-        assert_eq!(app.playlist.selected_track(), Some(0));
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -1264,5 +1232,250 @@ mod tests {
             bars_drawn > 50,
             "Full 模式下频谱应画出大量柱图，实际只画了 {bars_drawn} 格"
         );
+    }
+
+    /// 旧配置迁移：shuffle_mode 为空串（旧版缺字段默认）或字面 "off"、
+    /// 且旧布尔 shuffle=true 时迁移为曲目随机；旧布尔 false 时不迁移。
+    #[test]
+    fn shuffle_migration_from_legacy_bool() {
+        let config = Config {
+            shuffle_mode: String::new(),
+            shuffle: true,
+            ..Config::default()
+        };
+        let app = App::new(&config);
+        assert_eq!(
+            app.playlist.shuffle_mode(),
+            tuneux_mediax::ShuffleMode::Tracks,
+            "空串 + 旧布尔 true 应迁移为曲目随机"
+        );
+
+        let config = Config {
+            shuffle_mode: "off".to_string(),
+            shuffle: true,
+            ..Config::default()
+        };
+        let app = App::new(&config);
+        assert_eq!(
+            app.playlist.shuffle_mode(),
+            tuneux_mediax::ShuffleMode::Tracks,
+            "字面 off + 旧布尔 true 应迁移为曲目随机"
+        );
+
+        let config = Config {
+            shuffle_mode: "off".to_string(),
+            shuffle: false,
+            ..Config::default()
+        };
+        let app = App::new(&config);
+        assert_eq!(
+            app.playlist.shuffle_mode(),
+            tuneux_mediax::ShuffleMode::Off,
+            "旧布尔 false 时不迁移"
+        );
+    }
+
+    /// Gapless 无缝切曲后频谱峰值白帽清零：上一曲高峰不得压在新曲前奏上
+    ///（与 play_and_update_current 同口径）。
+    #[test]
+    fn gapless_advance_resets_spectrum_peaks() {
+        let mut config = Config::default();
+        config.repeat = config::RepeatMode::Off;
+        let mut app = App::new(&config);
+        app.playlist.add(playlist::PlaylistItem {
+            path: PathBuf::from("/a.mp3"),
+            album: None,
+            track_number: None,
+            cue: None,
+        });
+        app.playlist.add(playlist::PlaylistItem {
+            path: PathBuf::from("/b.mp3"),
+            album: None,
+            track_number: None,
+            cue: None,
+        });
+        app.playlist.jump_to(0);
+        app.current_path = Some(PathBuf::from("/a.mp3"));
+        // 注入非零峰值，模拟上一曲残留白帽
+        let bands = [0.8f32; audio::spectrum::N_BANDS];
+        app.spectrum_peaks
+            .borrow_mut()
+            .update(&bands, std::time::Duration::ZERO);
+        assert!(app.spectrum_peaks.borrow().peaks().iter().any(|&v| v > 0.0));
+
+        app.advance_ui_on_gapless(&config);
+        assert_eq!(
+            app.playlist.current_index(),
+            Some(1),
+            "gapless 后应切到第二首"
+        );
+        assert!(
+            app.spectrum_peaks
+                .borrow()
+                .peaks()
+                .iter()
+                .all(|&v| v == 0.0),
+            "gapless 切曲后峰值白帽应清零"
+        );
+    }
+
+    /// a 键只在浏览器面板可见时生效：隐藏态按 a 不得把不可见浏览器的
+    /// 选中条目加入列表（与 Tab 焦点不变式同口径）。
+    #[test]
+    fn a_key_requires_visible_browser() {
+        let tmp = std::env::temp_dir().join("tuneux_a_key_guard_test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::File::create(tmp.join("song.mp3")).unwrap();
+
+        let mut config = Config {
+            last_dir: Some(tmp.clone()),
+            dedup_on_add: false,
+            ..Config::default()
+        };
+        let mut app = App::new(&config);
+        // 打开浏览器后 a：正常加入
+        assert!(app.handle_key(key(KeyCode::Char('b')), &mut config));
+        assert!(app.handle_key(key(KeyCode::Char('a')), &mut config));
+        assert_eq!(app.playlist.len(), 1, "浏览器可见时 a 应加入选中条目");
+        // 关闭浏览器后 a：不响应（不可见面板条目不得入列表）
+        assert!(app.handle_key(key(KeyCode::Char('b')), &mut config));
+        assert_eq!(app.left_panel, LeftPanel::Hidden);
+        assert!(app.handle_key(key(KeyCode::Char('a')), &mut config));
+        assert_eq!(app.playlist.len(), 1, "浏览器隐藏时 a 不应加入");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// a 键加 .cue 文件：空列表时展开分轨并自动首播
+    ///（与文件分支/目录分支/浏览器 Enter 三处口径一致）。
+    #[test]
+    fn a_key_on_cue_file_autoplays_when_empty() {
+        let tmp = std::env::temp_dir().join("tuneux_a_key_cue_test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::File::create(tmp.join("song.mp3")).unwrap();
+        fs::write(
+            tmp.join("album.cue"),
+            "FILE \"song.mp3\" MP3\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .unwrap();
+
+        let mut config = Config {
+            last_dir: Some(tmp.clone()),
+            ..Config::default()
+        };
+        let mut app = App::new(&config);
+        assert!(app.playlist.is_empty());
+        // 浏览器打开后 a：.cue 展开分轨并自动首播
+        assert!(app.handle_key(key(KeyCode::Char('b')), &mut config));
+        assert!(app.handle_key(key(KeyCode::Char('a')), &mut config));
+        assert_eq!(app.playlist.len(), 1, ".cue 应展开出 1 条分轨");
+        assert_eq!(
+            app.playlist.current_index(),
+            Some(0),
+            "空列表应自动首播第一轨"
+        );
+        assert_eq!(app.playlist.selected_track(), Some(0));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// 封面浏览态按 / 不进入搜索：/ 在封面浏览态被吃掉（封面浏览无搜索），
+    /// 关闭封面后 / 正常进入播放列表搜索。
+    #[test]
+    fn slash_ignored_in_cover_browser() {
+        let mut config = Config::default();
+        let mut app = App::new(&config);
+        app.playlist.add(playlist::PlaylistItem {
+            path: PathBuf::from("/music/a.mp3"),
+            album: Some("A".to_string()),
+            track_number: Some(1),
+            cue: None,
+        });
+        // c 两次进入封面浏览
+        assert!(app.handle_key(key(KeyCode::Char('c')), &mut config));
+        assert!(app.handle_key(key(KeyCode::Char('c')), &mut config));
+        assert_eq!(app.left_panel, LeftPanel::CoverBrowser);
+        assert!(app.handle_key(key(KeyCode::Char('/')), &mut config));
+        assert!(!app.search_mode, "封面浏览态 / 不应进入搜索");
+        // 关闭封面后对照：/ 正常进入搜索
+        assert!(app.handle_key(key(KeyCode::Char('c')), &mut config));
+        assert_eq!(app.left_panel, LeftPanel::Hidden);
+        assert!(app.handle_key(key(KeyCode::Char('/')), &mut config));
+        assert!(app.search_mode, "封面关闭后 / 应正常进入搜索");
+    }
+
+    /// 恢复期回填路径清单：失效路径跳过、同文件多条目（CUE 分轨/重复）
+    /// 只回填一次。
+    #[test]
+    fn restore_backfill_paths_dedups_and_skips_missing() {
+        let tmp = std::env::temp_dir().join("tuneux_restore_backfill_test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let alive = tmp.join("alive.mp3");
+        fs::File::create(&alive).unwrap();
+        let gone = tmp.join("gone.mp3");
+        let items = vec![
+            playlist::PlaylistItem {
+                path: alive.clone(),
+                album: None,
+                track_number: None,
+                cue: None,
+            },
+            playlist::PlaylistItem {
+                path: alive.clone(),
+                album: None,
+                track_number: None,
+                cue: Some(playlist::CueRef {
+                    index: 1,
+                    title: "分轨一".to_string(),
+                    performer: None,
+                    start_ms: 0,
+                    end_ms: None,
+                }),
+            },
+            playlist::PlaylistItem {
+                path: gone.clone(),
+                album: None,
+                track_number: None,
+                cue: None,
+            },
+        ];
+        let paths = restore_backfill_paths(&items);
+        assert_eq!(paths, vec![alive.clone()], "失效路径应跳过、同路径应去重");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// 恢复期元数据排空：有界合入、只补缺失项、不覆盖热路径已提取的缓存。
+    #[test]
+    fn restore_metadata_drain_fills_cache_without_overwrite() {
+        let config = Config::default();
+        let mut app = App::new(&config);
+        // 换用独立通道模拟回填线程（App::new 起的线程清单为空，立即退出）。
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.restore_meta_rx = rx;
+        let path = PathBuf::from("/music/x.mp3");
+        let incoming = metadata::TrackMetadata {
+            title: Some("回填标题".to_string()),
+            ..Default::default()
+        };
+        tx.send((path.clone(), incoming)).unwrap();
+        // 已有缓存项：回填不得覆盖
+        let existing = metadata::TrackMetadata {
+            title: Some("已有标题".to_string()),
+            ..Default::default()
+        };
+        app.metadata_cache.insert(path.clone(), existing);
+        let drained = app.drain_restore_metadata(64);
+        assert_eq!(drained, 1, "应合入 1 条回填");
+        assert_eq!(
+            app.metadata_cache.get(&path).unwrap().title.as_deref(),
+            Some("已有标题"),
+            "已缓存项不得被回填覆盖"
+        );
+        // 断开通道：排空安静返回 0
+        drop(tx);
+        assert_eq!(app.drain_restore_metadata(64), 0, "通道断开后排空返回 0");
     }
 }

@@ -22,13 +22,33 @@ pub fn parse(content: &str) -> Vec<PathBuf> {
 }
 
 /// 把路径列表序列化为 m3u 文本（`#EXTM3U` 头 + 每行一个路径）。
+///
+/// 非 UTF-8 路径（如 Linux 上的 GBK 文件名）无法被 m3u 文本无损承载：
+/// 序列化时跳过——不再用 to_string_lossy 写出 U+FFFD 替换符（那会让往返
+/// 失真并产生「幽灵路径」，重载后指向不存在的文件）。需要知道跳过条数的
+/// 调用方用 `serialize_with_report`。
 pub fn serialize(paths: &[PathBuf]) -> String {
+    serialize_with_report(paths).0
+}
+
+/// 序列化为 m3u 文本并返回（文本, 因非 UTF-8 被跳过的路径条数）。
+///
+/// parse 侧保持兼容：跳过的是无法进入文本格式的路径，解析结果即本函数
+/// 实际写出的行，往返保真。
+pub fn serialize_with_report(paths: &[PathBuf]) -> (String, usize) {
     let mut out = String::from("#EXTM3U\n");
+    let mut skipped = 0usize;
     for p in paths {
-        out.push_str(&p.to_string_lossy());
-        out.push('\n');
+        match p.to_str() {
+            Some(text) => {
+                out.push_str(text);
+                out.push('\n');
+            }
+            // 非 UTF-8 路径：文本格式无法无损承载，跳过并记数。
+            None => skipped += 1,
+        }
     }
-    out
+    (out, skipped)
 }
 
 #[cfg(test)]
@@ -76,6 +96,38 @@ mod tests {
         let content = "\u{feff}#EXTM3U\n/a.mp3\n";
         let paths = parse(content);
         assert_eq!(paths, vec![PathBuf::from("/a.mp3")]);
+    }
+
+    /// 构造一个非 UTF-8 路径：Unix 用任意字节 OsStr，Windows 用未配对
+    /// UTF-16 代理项（OsStr/WTF-8 可承载，但不是合法 UTF-8）。
+    #[cfg(unix)]
+    fn non_utf8_path() -> PathBuf {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(b"/music/\xFF\xFE.mp3"))
+    }
+    #[cfg(windows)]
+    fn non_utf8_path() -> PathBuf {
+        use std::os::windows::ffi::OsStringExt;
+        PathBuf::from(std::ffi::OsString::from_wide(&[0xD800]))
+    }
+
+    /// 非 UTF-8 路径不得被写成 U+FFFD 幽灵路径：跳过并记数，
+    /// UTF-8 路径正常写出，parse 侧往返保真。
+    #[test]
+    fn serialize_skips_non_utf8_paths_with_count() {
+        let normal = PathBuf::from("/a.mp3");
+        let weird = non_utf8_path();
+        let (text, skipped) =
+            serialize_with_report(&[normal.clone(), weird.clone(), PathBuf::from("/b.flac")]);
+        assert_eq!(skipped, 1, "非 UTF-8 路径应跳过并记数");
+        assert!(!text.contains('\u{fffd}'), "输出不得含替换符");
+        assert_eq!(
+            parse(&text),
+            vec![normal, PathBuf::from("/b.flac")],
+            "parse 应得到实际写出的 UTF-8 路径"
+        );
+        // 兼容签名：serialize = serialize_with_report().0，纯非 UTF-8 时只剩头。
+        assert_eq!(serialize(&[weird]), "#EXTM3U\n");
     }
 
     /// 模糊化烟雾测试：任意字节的 m3u 文本经 parse 不得 panic。

@@ -26,7 +26,7 @@ use super::super::filter::FilterEffect;
 use super::super::playback_medium::MediumEffects;
 use super::super::spectrum;
 use super::super::{DecoderCmd, SharedState};
-use super::sample_utils::accumulate_spectrum;
+use super::sample_utils::{accumulate_peak, accumulate_spectrum};
 
 pub(super) const RING_CAPACITY: usize = 48000 * 2 * 2;
 
@@ -182,7 +182,7 @@ pub(super) fn switch_stream_for_playback(
                 state.set_stream_sample_rate(target_sr);
             }
             None => {
-                // 重建失败：回退用初始采样率重建（降级）。极端情况，静默（raw 屏幕）。
+                // 重建失败：回退用初始采样率重建（降级）。
                 *stream =
                     rebuild_stream(device, device_sample_rate, channels, sample_format, state).map(
                         |(s, p)| {
@@ -192,6 +192,12 @@ pub(super) fn switch_stream_for_playback(
                     );
                 *current_stream_sr = device_sample_rate;
                 state.set_stream_sample_rate(device_sample_rate);
+                // 两次重建全败：流保持 None，本次起播永久无声且此前无任何
+                // 提示——写 last_error（与 audio_loop 热切换彻底失败路径
+                // 同口径），用户在状态栏能看到原因而非静默。
+                if stream.is_none() {
+                    state.set_last_error("音频设备不可用：重建输出流失败，已保持静音".to_string());
+                }
             }
         }
         // 新流默认暂停，调用方的 set_playing(true) + play() 会启动它
@@ -297,7 +303,8 @@ impl CallbackCtx {
     }
 
     /// f32 管线主体：取样本 → ReplayGain → 介质 DSP → EQ → 压缩器 →
-    /// 音量限幅 → 静音补尾 → 进度累加 → 电平/频谱/波形累计。
+    /// 滤波 → 电平峰值（音量前）→ 音量限幅 → 静音补尾 → 进度累加 →
+    /// 频谱/波形累计。
     fn process_f32(&mut self, data: &mut [f32]) {
         let stream_channels = self.stream_channels;
         let stream_sample_rate = self.stream_sample_rate;
@@ -383,6 +390,16 @@ impl CallbackCtx {
             }
         }
 
+        // 电平峰值在「音量之前」统计：电平表的黄/红阈值按源 / DSP 电平
+        // 判读，不随音量档位漂移（音量调小后峰值等比例缩水会让它永远到
+        // 不了黄/红档，观感上像"电平表不变色"）。
+        accumulate_peak(
+            &data[..n],
+            stream_channels,
+            &mut self.window_peak_l,
+            &mut self.window_peak_r,
+        );
+
         // 再应用音量（介质 DSP 之后），并做输出限幅：ReplayGain 正增益 +
         // EQ/压缩器补偿叠加可能使 |样本|>1，到 DAC 即硬削波（爆音）。
         // clamp 到 [-1, 1] 是最后一道防线（rg.rs 的 apply_gain_db 限幅
@@ -393,7 +410,14 @@ impl CallbackCtx {
         for s in data[..n].iter_mut() {
             // 一阶斜坡向目标靠拢：消除音量阶跃的 zipper 与 flush 后的咔哒。
             gs += (vol - gs) * coef;
-            *s = (*s * gs).clamp(-1.0, 1.0);
+            let sample = *s * gs;
+            // 浮点 WAV/WavPack 或 DSP 异常都可能带来 NaN/Inf；clamp 不会
+            // 清除 NaN，因此最终出口统一将非有限样本替换为静音。
+            *s = if sample.is_finite() {
+                sample.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
         }
         self.gain_smooth = gs;
         // 不足部分静音
@@ -404,17 +428,14 @@ impl CallbackCtx {
         let frames = (n / stream_channels.max(1)) as u64;
         self.state.add_frames(frames);
 
-        // —— 累计 L/R peak + 频谱环形缓冲 ——
-        // 同一遍循环：算 peak 同时把样本存到环形 buffer（详见
-        // accumulate_spectrum）。buf_idx 由函数内部推进。
+        // —— 频谱环形缓冲 ——（峰值已在音量之前单独统计，见上）
+        // buf_idx 由函数内部推进。
         accumulate_spectrum(
             &data[..n],
             stream_channels,
             &mut self.buf_idx,
             &mut self.l_buf,
             &mut self.r_buf,
-            &mut self.window_peak_l,
-            &mut self.window_peak_r,
         );
 
         self.window_frames += frames;
@@ -634,6 +655,21 @@ mod tests {
         assert!((out[1] + 0.5).abs() < 0.01, "out[1]={}", out[1]);
         assert!((out[2] - 0.25).abs() < 0.01, "out[2]={}", out[2]);
         assert!(out[3..].iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn callback_pipeline_replaces_non_finite_samples_with_silence() {
+        let ring = HeapRb::<f32>::new(16);
+        let (mut prod, cons) = ring.split();
+        let state = Arc::new(SharedState::default());
+        state.set_volume(1.0);
+        let _ = prod.push_slice(&[f32::NAN, f32::INFINITY, 0.25, -0.25]);
+        let mut ctx = CallbackCtx::new(cons, state, 48_000, 2);
+        let mut out = [1.0f32; 4];
+        ctx.process_f32(&mut out);
+        assert!(out.iter().all(|s| s.is_finite()));
+        assert_eq!(out, [0.0, 0.0, out[2], out[3]]);
+        assert!(out[2].abs() < 0.01 && out[3].abs() < 0.01);
     }
 
     /// 非 F32 出口：i16 转换路径与 f32 管线数值一致。

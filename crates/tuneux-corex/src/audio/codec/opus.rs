@@ -32,11 +32,11 @@ const OPUS_TAGS_MAGIC: &[u8; 8] = b"OpusTags";
 /// + 输入采样率 4 + 增益 2 + 映射族 1 = 19 字节。
 const OPUS_HEAD_MIN_LEN: usize = 19;
 
-/// 解析 OpusHead 头包，返回（输入采样率, 声道数, 预跳过样本数）。
+/// 解析 OpusHead 头包，返回（输入采样率, 声道数, 预跳过样本数, Q7.8 dB 输出增益）。
 ///
 /// 按 RFC 7845 §5.1 的字段顺序解析；只接受映射族 0（标准 1~2 声道），
 /// 其它映射族（环绕声等）首版不支持。
-fn parse_opus_head(packet: &[u8]) -> Result<(u32, u8, u16), DecodeError> {
+fn parse_opus_head(packet: &[u8]) -> Result<(u32, u8, u16, i16), DecodeError> {
     if packet.len() < OPUS_HEAD_MIN_LEN || &packet[..8] != OPUS_HEAD_MAGIC {
         return Err(DecodeError::Unsupported("非 OpusHead 头包".to_string()));
     }
@@ -51,7 +51,7 @@ fn parse_opus_head(packet: &[u8]) -> Result<(u32, u8, u16), DecodeError> {
     let channels = packet[9];
     let pre_skip = u16::from_le_bytes([packet[10], packet[11]]);
     let input_sample_rate = u32::from_le_bytes([packet[12], packet[13], packet[14], packet[15]]);
-    // packet[16..18] 为输出增益（dB，Q7.8 定点），解码不依赖，忽略。
+    let output_gain = i16::from_le_bytes([packet[16], packet[17]]);
     let mapping_family = packet[18];
     if mapping_family != 0 {
         return Err(DecodeError::Unsupported(format!(
@@ -59,7 +59,7 @@ fn parse_opus_head(packet: &[u8]) -> Result<(u32, u8, u16), DecodeError> {
         )));
     }
 
-    Ok((input_sample_rate, channels, pre_skip))
+    Ok((input_sample_rate, channels, pre_skip, output_gain))
 }
 
 /// 把 OpusHead 的输入采样率映射为 opus-decoder 支持的五种输出率之一。
@@ -71,6 +71,11 @@ fn choose_output_rate(input_rate: u32) -> u32 {
         8_000 | 12_000 | 16_000 | 24_000 | 48_000 => input_rate,
         _ => 48_000,
     }
+}
+
+/// 将 OpusHead 的 Q7.8 dB 增益换算为 PCM 样本的线性振幅倍率。
+fn output_gain_factor(output_gain_db: i16) -> f32 {
+    10f32.powf(f32::from(output_gain_db) / (20.0 * 256.0))
 }
 
 /// 判断该包是否为头包（OpusHead / OpusTags），解码时应跳过。
@@ -86,7 +91,7 @@ fn is_header_packet(packet: &[u8]) -> bool {
 pub(crate) fn probe_sample_rate(path: &Path) -> Option<u32> {
     // 第一个逻辑包必为 OpusHead（RFC 7845 §4.2），读它即可，不建解码器。
     let head_packet = OggOpusReader::open(path).ok()?.next_packet().ok()??;
-    let (input_rate, _, _) = parse_opus_head(&head_packet).ok()?;
+    let (input_rate, _, _, _) = parse_opus_head(&head_packet).ok()?;
     Some(choose_output_rate(input_rate))
 }
 
@@ -123,6 +128,8 @@ pub(crate) struct OpusBackend {
     pending_samples: Vec<f32>,
     /// 页级 seek 索引（懒构建）：首次 seek 时由 scan_seek_index 生成并缓存。
     seek_index: Option<Vec<OggSeekPoint>>,
+    /// OpusHead 中的 Q7.8 dB 输出增益对应的线性倍率。
+    output_gain: f32,
 }
 
 impl OpusBackend {
@@ -134,7 +141,7 @@ impl OpusBackend {
         let head_packet = reader
             .next_packet()?
             .ok_or_else(|| DecodeError::Unsupported("空的 Ogg 流".to_string()))?;
-        let (input_rate, channels, pre_skip) = parse_opus_head(&head_packet)?;
+        let (input_rate, channels, pre_skip, output_gain_db) = parse_opus_head(&head_packet)?;
 
         if channels == 0 || channels > 2 {
             return Err(DecodeError::Unsupported(format!(
@@ -168,6 +175,7 @@ impl OpusBackend {
             samples_to_skip: pre_skip_out,
             pending_samples: Vec::new(),
             seek_index: None,
+            output_gain: output_gain_factor(output_gain_db),
         })
     }
 
@@ -182,6 +190,11 @@ impl OpusBackend {
             .map_err(map_opus_error)?;
         let total = samples_per_channel * self.channels;
         pcm.truncate(total);
+        if self.output_gain != 1.0 {
+            for sample in &mut pcm {
+                *sample *= self.output_gain;
+            }
+        }
         Ok(pcm)
     }
 
@@ -198,8 +211,9 @@ impl OpusBackend {
 
     /// 从头重扫式 seek（回退路径）：回卷文件、重读头包、重置解码器与预跳过。
     ///
-    /// 用于 granule 页级定位失败（目标超出索引末尾 / 索引为空）时兜底，
-    /// 行为与旧版 seek 完全一致。
+    /// 用于 granule 页级定位失败（目标超出索引末尾 / 索引为空）时兜底；
+    /// 目标超出流末尾时钳到末尾返回 Ok（与 wav/flac/wavpack/cdda 契约一致，
+    /// 末尾秒数按流末 granule / 48_000 换算，与页级路径同口径）。
     fn seek_scan_from_start(&mut self, secs: f64) -> Result<f64, DecodeError> {
         self.reader.rewind()?;
         let head = self
@@ -217,7 +231,12 @@ impl OpusBackend {
 
         loop {
             let Some(packet) = self.reader.next_packet()? else {
-                return Err(DecodeError::Seek("目标位置超出文件末尾".to_string()));
+                // 目标超出末尾：与 wav/flac/wavpack/cdda 统一契约——钳到
+                // 末尾返回 Ok（原返回 Err 会让调用方吞掉后直接 EOF 静默
+                // 停播）。秒数换算与页级路径同口径：granule 恒为 48 kHz
+                // 样本计数（RFC 7845），除以 48_000，不按输出采样率缩放。
+                let end_secs = self.reader.last_granule() as f64 / 48_000.0;
+                return Ok(end_secs);
             };
             if is_header_packet(&packet) {
                 continue;
@@ -258,9 +277,15 @@ impl DecoderBackend for OpusBackend {
     }
 
     fn decode_next(&mut self) -> Result<Option<Vec<f32>>, DecodeError> {
-        // seek 后缓存的跨目标帧优先返回。
+        // seek 后缓存的跨目标帧优先返回；返回前仍应用剩余的预跳过
+        //（seek(0) 恢复 pre-skip 后，首帧的暖机段在此处丢弃）。
         if !self.pending_samples.is_empty() {
-            return Ok(Some(std::mem::take(&mut self.pending_samples)));
+            let mut pending = std::mem::take(&mut self.pending_samples);
+            self.apply_pre_skip(&mut pending);
+            if !pending.is_empty() {
+                return Ok(Some(pending));
+            }
+            // 整块被预跳过吞掉：落入下方循环继续读包（与空帧跳过同口径）。
         }
 
         loop {
@@ -307,7 +332,6 @@ impl DecoderBackend for OpusBackend {
         // 找第一个 granule_position >= 目标的页（线性查找：索引 granule
         // 单调不减，页数级别可接受；二分是可选优化）。
         // 用该页的 prev_granule（页内首包起点）换算需丢弃的前导样本。
-        // 用该页的 prev_granule（页内首包起点）换算需丢弃的前导样本。
         let found = index
             .iter()
             .find(|pt| pt.granule_position >= target_granule)
@@ -319,9 +343,15 @@ impl DecoderBackend for OpusBackend {
                 self.reader.seek_to(point.file_offset)?;
                 self.decoder.reset();
                 self.pending_samples.clear();
-                // pre-skip 已在流的起点消耗（granule 语义内含 pre-skip），
-                // 页级定位后不再重复跳过。
-                self.samples_to_skip = 0;
+                // granule 时钟含 pre-skip：页内 skip 换算自带 pre-skip 偏移，
+                // 常规目标不重复跳过；但目标 0 即回到流首（命中头页），
+                // skip_out=0 时若不恢复 pre-skip，暖机段会当有效样本输出，
+                // 与冷启动 open 行为不一致——此时恢复 pre_skip_out。
+                self.samples_to_skip = if target_granule == 0 {
+                    self.pre_skip_out
+                } else {
+                    0
+                };
 
                 let rate = f64::from(self.params.sample_rate.unwrap_or(48_000));
                 // 页内需丢弃的前导样本（48 kHz 计数 → 输出样本）。
@@ -334,9 +364,10 @@ impl DecoderBackend for OpusBackend {
                         // 流已到末尾：统一后端契约——越界钳到末尾返回 Ok
                         //（与 wav/flac/wavpack/cdda 同口径；原返回 Err
                         // 会让调用方吞掉后直接 EOF 播放静默终止）。
-                        let rate = f64::from(self.params.sample_rate.unwrap_or(48_000));
-                        let end_secs =
-                            point.granule_position as f64 / 48_000.0 * (rate / 48_000.0).min(1.0); // 页级 granule 即近末尾
+                        // 秒数换算：granule 恒为 48 kHz 样本计数（RFC 7845），
+                        // 与解码输出率无关——不得按 rate 缩放（旧式曾对
+                        // 8/12/16/24 kHz 输出率的文件把落点缩小 3~6 倍）。
+                        let end_secs = point.granule_position as f64 / 48_000.0;
                         return Ok(end_secs);
                     };
                     if is_header_packet(&packet) {
@@ -399,14 +430,15 @@ mod tests {
     }
 
     /// 合法 OpusHead（默认字段）：应解析为输入采样率 48000、
-    /// 声道 2、预跳过 312。pre_skip=312 (0x0138)，rate=48000 (0x0000BB80)。
+    /// 声道 2、预跳过 312、输出增益 0。
     #[test]
     fn parse_valid_opus_head_default_fields() {
         let pkt = build_opus_head(1, 2, 312, 48_000, 0, 0);
-        let (rate, ch, pre) = parse_opus_head(&pkt).expect("合法 OpusHead 应解析成功");
+        let (rate, ch, pre, gain) = parse_opus_head(&pkt).expect("合法 OpusHead 应解析成功");
         assert_eq!(rate, 48_000, "输入采样率应为 48000");
         assert_eq!(ch, 2, "声道数应为 2");
         assert_eq!(pre, 312, "预跳过应为 312");
+        assert_eq!(gain, 0, "输出增益应为 0");
     }
 
     /// 合法 OpusHead（自定义字段）：单声道 + 较小预跳过 + 16 kHz。
@@ -415,17 +447,27 @@ mod tests {
     fn parse_valid_opus_head_custom_fields() {
         // pre_skip=120 (0x0078)，rate=16000 (0x00003E80)，output_gain=-128。
         let pkt = build_opus_head(1, 1, 120, 16_000, -128, 0);
-        let (rate, ch, pre) = parse_opus_head(&pkt).expect("应解析");
+        let (rate, ch, pre, gain) = parse_opus_head(&pkt).expect("应解析");
         assert_eq!(rate, 16_000);
         assert_eq!(ch, 1);
         assert_eq!(pre, 120);
+        assert_eq!(gain, -128);
+    }
+
+    #[test]
+    fn output_gain_uses_decibel_amplitude_scale() {
+        assert_eq!(output_gain_factor(0), 1.0);
+        let minus_six_db = output_gain_factor(-512);
+        assert!((minus_six_db - 10f32.powf(-2.0 / 20.0)).abs() < 1e-6);
+        assert!(output_gain_factor(-128) < 1.0);
+        assert!(output_gain_factor(128) > 1.0);
     }
 
     /// 合法 OpusHead：边界值——最小采样率 8 kHz、零预跳过、双声道。
     #[test]
     fn parse_valid_opus_head_edge_values() {
         let pkt = build_opus_head(1, 2, 0, 8_000, 0, 0);
-        let (rate, ch, pre) = parse_opus_head(&pkt).expect("应解析");
+        let (rate, ch, pre, _) = parse_opus_head(&pkt).expect("应解析");
         assert_eq!(rate, 8_000);
         assert_eq!(ch, 2);
         assert_eq!(pre, 0);
@@ -435,7 +477,7 @@ mod tests {
     #[test]
     fn parse_valid_opus_head_24khz() {
         let pkt = build_opus_head(1, 1, 0, 24_000, 0, 0);
-        let (rate, _, _) = parse_opus_head(&pkt).expect("应解析");
+        let (rate, _, _, _) = parse_opus_head(&pkt).expect("应解析");
         assert_eq!(rate, 24_000);
     }
 
@@ -491,5 +533,88 @@ mod tests {
     fn reject_mapping_family_255_returns_unsupported() {
         let pkt = build_opus_head(1, 2, 0, 48_000, 0, 255);
         assert!(parse_opus_head(&pkt).is_err(), "映射族 255 应同样被拒");
+    }
+
+    // ----------------------------------------------------------------
+    // seek 契约与预跳过（合成仅含头包的流，不依赖真实 Opus 音频包）
+    // ----------------------------------------------------------------
+
+    /// 合成一个 Ogg 页（27 字节头 + 段表 + 负载），serial 固定 0x0000_4242。
+    fn ogg_page(
+        header_type: u8,
+        granule: u64,
+        sequence: u32,
+        lacing: &[u8],
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::with_capacity(27 + lacing.len() + payload.len());
+        out.extend_from_slice(b"OggS");
+        out.push(0);
+        out.push(header_type);
+        out.extend_from_slice(&granule.to_le_bytes());
+        out.extend_from_slice(&0x0000_4242u32.to_le_bytes());
+        out.extend_from_slice(&sequence.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.push(lacing.len() as u8);
+        out.extend_from_slice(lacing);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// 写临时 .opus 流：BOS 页 OpusHead + 标签页 OpusTags（无音频包）。
+    fn write_header_only_opus() -> std::path::PathBuf {
+        let head = build_opus_head(1, 2, 312, 48_000, 0, 0);
+        let mut tags = b"OpusTags".to_vec();
+        tags.extend_from_slice(&[0, 0, 0, 0]);
+        let mut stream = ogg_page(0x02, 0, 0, &[head.len() as u8], &head);
+        stream.extend_from_slice(&ogg_page(0x00, 0, 1, &[tags.len() as u8], &tags));
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "tuneux_opus_test_{}_{}.opus",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, stream).expect("应能写入临时文件");
+        path
+    }
+
+    /// 越界 seek 走回退路径（目标超出索引末尾）：修复前整文件重解码后
+    /// 返回 Err，与 wav/flac/wavpack/cdda「越界钳到末尾 Ok」契约矛盾；
+    /// 修复后钳到末尾返回 Ok，末尾秒数按 granule/48000 换算（此处流末
+    /// granule=0 → 0.0），随后 decode_next 干净 EOF。
+    #[test]
+    fn seek_beyond_end_fallback_path_clamps_to_end() {
+        let path = write_header_only_opus();
+        let mut b = OpusBackend::open(&path).expect("应能打开");
+        let r = b.seek(999.0).expect("越界 seek 应钳到末尾返回 Ok");
+        assert_eq!(r, 0.0, "流末 granule=0，换算末尾秒数应为 0.0");
+        assert!(
+            b.decode_next().expect("读").is_none(),
+            "钳到末尾后应立即 EOF"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// seek(0) 恢复 pre-skip：页级路径一律置 samples_to_skip=0 时，
+    /// seek(0) 首帧会把暖机段当有效样本输出，与冷启动 open 不一致；
+    /// 修复后目标 0 恢复 pre_skip_out，且 decode_next 的缓存帧路径
+    /// 会应用剩余预跳过。
+    #[test]
+    fn seek_to_zero_restores_pre_skip_counter() {
+        let path = write_header_only_opus();
+        let mut b = OpusBackend::open(&path).expect("应能打开");
+        let r = b.seek(0.0).expect("seek(0) 应成功");
+        assert_eq!(r, 0.0);
+        assert!(
+            b.samples_to_skip == b.pre_skip_out && b.pre_skip_out == 312,
+            "seek(0) 应恢复 pre-skip（预跳过 312 @48kHz），实际：skip={} pre={}",
+            b.samples_to_skip,
+            b.pre_skip_out
+        );
+        assert!(b.decode_next().expect("读").is_none(), "头包流解码完应 EOF");
+        let _ = std::fs::remove_file(&path);
     }
 }

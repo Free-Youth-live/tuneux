@@ -27,7 +27,8 @@ tuneux-fx 的插件是 WASM 模块（wasmi 解释器执行），运行在能力�
 二、开始之前：当前装载限制（如实说明）
 ────────────────────────────────────────────
 
-当前版本仅装载**官方签名的第一方插件**（均衡器、压缩器、皮肤「午夜蓝」）。
+当前版本仅装载**官方签名的第一方插件**（均衡器、压缩器、皮肤 7 款、
+可视化 2 款）。
 每个插件必须携带有效签名（.sig），验签达到最高信任级才会被装载；
 验签失败、文件缺失一律静默跳过、不影响播放器启动。
 
@@ -47,10 +48,11 @@ tuneux-fx 的插件是 WASM 模块（wasmi 解释器执行），运行在能力�
 多份皮肤共存，用户在「设置 → 皮肤配色…」菜单里切换。例如：
 
   plugins/
-  ├── 皮肤-Norton蓝.wasm       插件本体（WASM 模块，可由 WAT 文本构建）
-  ├── 皮肤-Norton蓝.manifest   能力清单（纯文本，见第四节）
-  ├── 皮肤-Norton蓝.sig        签名（64 字节；当前仅官方可签发，见第二节）
-  ├── 皮肤-午夜蓝.wasm / .manifest / .sig
+  ├── 皮肤-深蓝.wasm           插件本体（WASM 模块，可由 WAT 文本构建）
+  ├── 皮肤-深蓝.manifest       能力清单（纯文本，见第四节）
+  ├── 皮肤-深蓝.sig            签名（64 字节；当前仅官方可签发，见第二节）
+  ├── 皮肤-磷光绿 / 皮肤-经典青 / 皮肤-终端原生 /
+  │   皮肤-黑白 / 皮肤-灰白 / 皮肤-暗彩  三件套同构（随包皮肤共 7 款）
   ├── equalizer.wasm / .manifest / .sig      （效果器插件）
   └── compressor.wasm / .manifest / .sig
 
@@ -69,6 +71,10 @@ tuneux-fx-plugins.log（数据目录下，追加式）。
 
 manifest 是纯文本：每行一个能力短名，# 开头为注释，空行忽略，
 重复条目自动去重。**未知短名会导致整个 manifest 解析失败**（插件不装载）。
+另可用 `id = 插件唯一标识` 声明插件 ID；ID 不得含空白或控制字符，最多
+声明一次。随包皮肤必须声明与文件名对应的逐皮肤 ID（例如文件
+`皮肤-深蓝.wasm` 对应 `id = tuneux-skin:深蓝`），装载时 ID、文件名、
+manifest 原文和签名必须一致。
 
 能力短名一览（v1）：
 
@@ -80,18 +86,21 @@ manifest 是纯文本：每行一个能力短名，# 开头为注释，空行忽
   ui_write        向界面写入有限文本                          预留，未接线
   network         网络请求（宿主代发）                        永久默认拒绝
 
-示例（皮肤插件，skin.manifest）：
+示例（皮肤插件，皮肤-深蓝.manifest）：
 
-  # 只声明需要的能力；多声明的能力不会被授予
+  # id 与文件名绑定；只声明需要的能力
+  id = tuneux-skin:深蓝
   theme
 
 签名规格（v2，2026-09-27 起）：
 
 签名消息为三段按序拼接——插件 id ‖ manifest 原文 ‖ wasm 字节，
 签名算法 Ed25519，.sig 文件为 64 字节原始签名值。三者任一被改动
-一个字节（含能力短名增删），验签即失败，插件静默跳过并记入核查
+一个字节（含能力短名增删或 ID 修改），验签即失败，插件静默跳过并记入核查
 日志。v1 时期签名只覆盖 id ‖ wasm，能力清单不在签名面内；v2 已
-收口。随包 4 件 .sig 均已按 v2 重签（公钥不变）。
+收口。随包 11 件 .sig（均衡器 1、压缩器 1、皮肤 7、可视化 2）均按 v2
+签发（公钥不变）。2026-11-20 起，七份皮肤改用逐皮肤 ID，不能只改文件名
+就复用另一皮肤的签名；签名工具会拒绝缺失或不匹配的皮肤 ID。
 
 ────────────────────────────────────────────
 五、host ABI 函数详解（v1 + v2 增补）
@@ -198,8 +207,15 @@ manifest 是纯文本：每行一个能力短名，# 开头为注释，空行忽
   band_low      三桶能量低频桶颜色（缺省回落 bar_fg）
   band_mid      三桶能量中频桶颜色（缺省回落 bar_fg）
   band_high     三桶能量高频桶颜色（缺省回落 bar_fg）
+  block_spectrum 布尔：频谱柱改为实心色块（缺省 false）
+  monochrome    布尔：封面单色渲染（缺省 false）；fx 中只作用于封面像素，
+                 基础版还让电平表去彩色
+  dim_screen    布尔：封面反射式 TFT 调色（缺省 false）；fx 中只作用于
+                 封面像素，基础版还压暗电平黄 / 红档
   bar_style     频谱柱字符风格：matrix（细字符雨，默认）/ blocks（块字符）
                 / ascii（#*= 复古）/ hanzi（汉字柱，2 列宽、横向分辨率减半）
+
+布尔键取 true / 1 / yes / on 为开，其余值一律视为关。
 
 字符风格说明：字符集宿主内置并逐字符过宽度校验（皮肤只选风格、不自由
 输入字符）——hanzi 为 2 列汉字柱（池取李白《将进酒》摘句）、横向分辨率
@@ -215,23 +231,25 @@ manifest 是纯文本：每行一个能力短名，# 开头为注释，空行忽
 任何皮肤都必须让两者在所选底色上清晰可辨；非法值会回落默认（白 / 深灰），
 语义不随皮肤丢失。
 
-【完整示例：皮肤「午夜蓝」，皮肤-午夜蓝.wat】
+【完整示例：皮肤「深蓝」，皮肤-深蓝.wat】
 
   (module
     (import "host" "theme_register"
       (func $theme_register (param i32 i32) (result i32)))
     (memory (export "memory") 1)
+    ;; 示例只列主要界面色；完整调色板见 crates/tuneux-fx/assets/皮肤-深蓝.wat
     (data (i32.const 0)
-      "name=午夜蓝\nbg=#0d1321\nfg=#c8c8c8\nborder=#5f87af\nborder_type=double\nmenu_bg=#3a4a5f\nmenu_fg=#e8e8e8\nfkey_num=#ffb000\npassthrough=#ffffff\nresample=#5f5f5f")
+      "name=深蓝\nbg=#0000aa\nfg=#aaaaaa\nborder=#55ffff\nborder_type=double\nmenu_bg=#0000aa\nmenu_fg=#aaaaaa\nfkey_num=#ffff55\npassthrough=#ffffff\nresample=#999999")
     ;; init(slot)：注册调色板。slot 参数忽略（皮肤不占效果器槽位）。
     ;; 注意第二个参数是文本的字节长度，须与 data 段实际长度一致。
     (func (export "init") (param $slot i32) (result i32)
-      (call $theme_register (i32.const 0) (i32.const 156)) drop
+      (call $theme_register (i32.const 0) (i32.const 153)) drop
       (i32.const 0))
   )
 
-配套 manifest：
+配套 manifest（假设文件名为 `皮肤-深蓝.wasm`）：
 
+  id = tuneux-skin:深蓝
   theme
 
 ────────────────────────────────────────────

@@ -226,7 +226,7 @@ medium.unknown = \"未知介质\"\n\
 about.brand = \"tuneux-fx · FreeYouth\"\n\
 about.tagline = \"插件化命令行音乐播放器\"\n\
 about.plugins_cat = \"插件\"\n\
-about.formats = \"支持 MP3 · FLAC · WAV · OGG · OPUS · WV · M4A · AAC · ALAC\"\n\
+about.formats = \"支持 MP3 · FLAC · WAV · OGG · OPUS · WV · M4A · AAC · ALAC · DSF/DFF · 经随包 FFmpeg 支持更多格式（APE · WMA · TAK · 视频音轨）\"\n\
 about.keys1 = \"空格 播放/暂停 · n/p 下一曲/上一曲 · ←→ ±5秒 · +/- 音量\"\n\
 about.keys2 = \"b 浏览器 · c 封面 · l 歌词 · v 频谱 · g 分组 · a 加入\"\n\
 about.keys3 = \"1-8 菜单 · : 命令 · m 介质 · e 均衡器 · f 滤波器 · ? 关于 · q 退出\"\n\
@@ -260,6 +260,7 @@ msg.cleared = \"播放列表已清空\"\n\
 msg.cue_fail = \"cue 解析失败或 FILE 引用的音频文件不存在\"\n\
 msg.empty = \"（未播放）\"\n\
 msg.scan_dir = \"正在扫描目录\"\n\
+msg.added = \"已加入 {} 首\"\n\
 msg.skipped_data = \"已跳过 {} 条数据轨（不可播放）\"\n\
 msg.thread_fail = \"线程启动失败\"\n\
 search.esc_exit = \"Esc 退出\"\n\
@@ -278,9 +279,8 @@ msg.unknown_cmd = \"未知命令：{}（输入 help）\"\n\
 msg.usage_bm_del = \"用法：bookmark-del <索引>\"\n\
 msg.usage_repeat = \"用法：repeat <off|list|single>\"\n\
 msg.vol_set = \"音量已设为 {}%\"\n\
-skin.default_dos = \"默认（DOS）\"\n\
+skin.default_navy = \"藏青\"\n\
 skin.hint = \"↑↓ 预览 · Enter 确认 · Esc 取消\"\n\
-skin.terminal_native = \"终端原生\"\n\
 # —— 弹窗与插件管理（2026-10-14 菜单结构调整）——\n\
 panel.shortcuts = \"快捷键一览\"\n\
 panel.bookmarks = \"书签\"\n\
@@ -429,7 +429,7 @@ pub struct Config {
     #[serde(default)]
     pub repeat: RepeatMode,
 
-    /// 皮肤名（plugins/ 下「皮肤-*」清单内按名匹配；空 = 内置默认 DOS 风配色）。
+    /// 皮肤名（空 = 默认「终端原生」；内置「藏青」显式按名保存，缺件可回退）。
     #[serde(default)]
     pub skin: String,
 
@@ -620,7 +620,7 @@ pub struct PlaylistState {
     /// 保证旧版 `tuneux-fx-playlist.toml`（无此字段）仍可正常加载。
     #[serde(default)]
     pub replay_gain: BTreeMap<PathBuf, f64>,
-    /// 书签列表（路径 + 位置 + 标签），随 playlist.toml 持久化。
+    /// 书签列表（路径 + 位置 + 标签），随 tuneux-fx-playlist.toml 持久化。
     #[serde(default)]
     pub bookmarks: tuneux_mediax::bookmark::BookmarkList,
 }
@@ -807,7 +807,13 @@ fn load_from(path: &Path) -> ConfigResult<Config> {
     }
     let text = std::fs::read_to_string(path)?;
     // toml::from_str 解析失败会返回 toml::de::Error，自动装进 Box<dyn Error>
-    let cfg: Config = toml::from_str(&text)?;
+    let mut cfg: Config = toml::from_str(&text)?;
+    // 皮肤名迁移：Norton 蓝 / 午夜蓝 已随 0.6.2 皮肤集合调整移除；旧名回落到
+    // 同色系的「深蓝」（新皮肤），避免静默回落内置默认配置。
+    cfg.skin = match cfg.skin.trim() {
+        "Norton 蓝" | "Norton蓝" | "午夜蓝" => "深蓝".to_string(),
+        other => other.to_string(),
+    };
     Ok(cfg)
 }
 
@@ -860,11 +866,9 @@ pub fn load_playlist_state_with_status() -> (PlaylistState, LoadStatus) {
             }
         };
     }
-    // 首次启动：继承前代同名产品的播放状态（播放列表与断点），平滑迁移。
-    match load_first_existing::<PlaylistState>(&legacy_tuneux_candidates("playlist.toml")) {
-        Some(state) => (state, LoadStatus::Ok),
-        None => (PlaylistState::default(), LoadStatus::Missing),
-    }
+    // 播放状态只认本产品文件 tuneux-fx-playlist.toml：不再读取基础版
+    // tuneux-playlist.toml，也不再探测旧名 playlist.toml（两端数据各自独立）。
+    (PlaylistState::default(), LoadStatus::Missing)
 }
 
 /// 保存播放状态到独立文件 `tuneux-fx-playlist.toml`。
@@ -947,6 +951,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn real_english_table_covers_every_chinese_key() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../locales/en.txt");
+        let en = tuneux_commonx::LangTable::load(&path).expect("真实 en.txt 应可加载");
+        for key in zh_table().keys() {
+            assert!(en.get(key).is_some(), "en.txt 缺少 {key}");
+        }
+    }
+
     /// 旧配置兼容：repeat 字段沿用冻结表示（"off"/"single"/"list"）解析。
     /// 枚举本体下沉数据层（tuneux-mediax）后表示不变，旧 toml 无需迁移。
     #[test]
@@ -970,7 +983,7 @@ mod tests {
             volume: 0.42,
             replay_gain: true,
             repeat: RepeatMode::Single,
-            skin: "午夜蓝".to_string(),
+            skin: "深蓝".to_string(),
             shuffle: true,
             shuffle_mode: "tracks".to_string(),
             playlist_view: PlaylistView::ByAlbum,
@@ -1010,7 +1023,25 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
-    /// 播放状态（playlist.toml）往返：保存后再加载，字段应完全一致。
+    /// 旧皮肤名迁移：Norton 蓝 / 午夜蓝 在 0.6.2 皮肤集合调整中移除，
+    /// 加载时映射为同色系的「深蓝」，避免升级后静默回落内置默认。
+    #[test]
+    fn legacy_skin_names_migrate_to_deepblue() {
+        let tmp = std::env::temp_dir().join("tuneux_fx_skin_migrate_test.toml");
+        for (old, want) in [
+            ("Norton 蓝", "深蓝"),
+            ("Norton蓝", "深蓝"),
+            ("午夜蓝", "深蓝"),
+            ("磷光绿", "磷光绿"),
+        ] {
+            std::fs::write(&tmp, format!("skin = \"{old}\"\n")).expect("写测试配置");
+            let cfg = load_from(&tmp).expect("加载应成功");
+            assert_eq!(cfg.skin, want, "旧皮肤名 {old} 应迁移为 {want}");
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// 播放状态（tuneux-fx-playlist.toml）往返：保存后再加载，字段应完全一致。
     #[test]
     fn playlist_state_roundtrip() {
         let tmp = std::env::temp_dir().join("tuneux_test_playlist_state.toml");

@@ -16,11 +16,11 @@
 
 [package]
 name = "tuneux-max"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 license = "MulanPSL-2.0"
 authors = ["不羁的青春（FreeYouth）"]
-description = "tuneux GUI 版（egui/eframe）——复用 corex/mediax/commonx：dock 12 模块 + 皮肤/插件/命令模式"
+description = "tuneux GUI 版（egui/eframe）——终端原生配色；复用 corex/mediax/commonx，布局与功能对齐 tuneux-fx"
 rust-version = "1.88"
 
 [features]

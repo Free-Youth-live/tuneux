@@ -88,11 +88,15 @@ pub fn parse_key_desc(desc: &str) -> Option<String> {
     Some(out)
 }
 
-/// 把键名部分规范化为小写具名键或单字符（字母 + shift 时统一小写）。
+/// 把键名部分规范化为小写具名键或单字符（字母恒小写，与事件侧同口径）。
+///
+/// 无 SHIFT 的大写字母（如配置写成 `"A"` / `"ctrl+N"`）统一归到小写：
+/// 事件侧终端上报的无修饰字母恒为小写（CapsLock 例外，事件侧也已统一
+/// 归一），保留原大小写会让这类合法配置只在 CapsLock 开启时命中。
 ///
 /// 输出格式与按键事件侧的规范键描述保持同一格式，二者对齐后才能
 /// 命中映射。
-pub fn canonical_key_name(name: &str, shift: bool) -> Option<String> {
+pub fn canonical_key_name(name: &str, _shift: bool) -> Option<String> {
     // 具名键：大小写不敏感
     let named = match name.to_ascii_lowercase().as_str() {
         "space" => Some("space"),
@@ -118,7 +122,7 @@ pub fn canonical_key_name(name: &str, shift: bool) -> Option<String> {
     if chars.next().is_some() {
         return None; // 多字符且非具名键 → 未知
     }
-    let c = if shift && c.is_ascii_alphabetic() {
+    let c = if c.is_ascii_alphabetic() {
         c.to_ascii_lowercase()
     } else {
         c
@@ -147,7 +151,7 @@ pub fn validate_keymap(keymap: &mut HashMap<String, String>, actions: &[&str], r
             return false;
         }
         // 保留键拒绝（q / Ctrl+C 退出底线，不可重映射；大小写不敏感——
-        // 规范化对 ctrl+字母保留原大小写，"Ctrl+C" 规范为 "ctrl+C"）。
+        // 规范化把字母恒归小写，"Ctrl+C" 规范为 "ctrl+c"，与事件侧同口径）。
         if parsed
             .as_deref()
             .is_some_and(|d| reserved.iter().any(|r| r.eq_ignore_ascii_case(d)))
@@ -174,6 +178,12 @@ mod tests {
         assert_eq!(parse_key_desc("shift+n"), Some("shift+n".to_string()));
         assert_eq!(parse_key_desc("Shift+N"), Some("shift+n".to_string()));
         assert_eq!(parse_key_desc("ctrl+c"), Some("ctrl+c".to_string()));
+        // 无 SHIFT 的大写字母恒归小写：与事件侧（终端无修饰字母恒小写）同口径，
+        // 否则配置 "A" / "ctrl+N" 只在 CapsLock 下命中。
+        assert_eq!(parse_key_desc("A"), Some("a".to_string()));
+        assert_eq!(parse_key_desc("N"), Some("n".to_string()));
+        assert_eq!(parse_key_desc("Ctrl+C"), Some("ctrl+c".to_string()));
+        assert_eq!(parse_key_desc("CTRL+N"), Some("ctrl+n".to_string()));
         assert_eq!(
             parse_key_desc("alt + ctrl + q"),
             Some("ctrl+alt+q".to_string())

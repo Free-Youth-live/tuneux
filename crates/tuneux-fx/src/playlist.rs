@@ -120,6 +120,9 @@ impl Playlist {
         self.core.clear();
         self.selected = None;
         self.collapsed_albums.clear();
+        // 回收 scroll：清空后行数为 0，旧偏移会让重加条目后从空行区起画
+        //（与 remove() 的钳制同口径）。
+        self.scroll = 0;
     }
 
     /// 删除指定项（item index），同步调整 current/selected/history/折叠。
@@ -159,11 +162,6 @@ impl Playlist {
     }
 
     /// 全部条目（只读视图）。
-    /// 可变访问全部条目（排序用）。
-    pub fn items_mut(&mut self) -> &mut [PlaylistItem] {
-        self.core.items_mut()
-    }
-
     pub fn items(&self) -> &[PlaylistItem] {
         self.core.items()
     }
@@ -186,11 +184,6 @@ impl Playlist {
     /// 设定随机模式（转发）。
     pub fn set_shuffle_mode(&mut self, mode: tuneux_mediax::ShuffleMode) {
         self.core.set_shuffle_mode(mode);
-    }
-
-    /// 切换随机模式。
-    pub fn set_shuffle(&mut self, on: bool) {
-        self.core.set_shuffle(on);
     }
 
     /// 跳到指定项（用户手动点选）。
@@ -216,11 +209,6 @@ impl Playlist {
     /// 进入上一曲。
     pub fn prev(&mut self, repeat: RepeatMode) -> NavOutcome {
         self.core.prev(repeat)
-    }
-
-    /// 按 (album, track_number, path) 物理排序条目切片。
-    pub fn sort_items(items: &mut [PlaylistItem]) {
-        PlaylistCore::sort_items(items);
     }
 
     /// 计算显示序（委托核心）。
@@ -596,5 +584,20 @@ mod tests {
         assert_eq!(p.current_index(), None);
         assert_eq!(p.selected(), None);
         assert!(!p.is_album_collapsed("未知专辑"));
+    }
+
+    /// clear 必须复位滚动偏移——清空后行数为 0，旧偏移会让
+    /// 重加条目后从空白行区起画（remove 有钳制、clear 曾经漏掉）。
+    #[test]
+    fn clear_resets_scroll() {
+        let mut p = Playlist::new();
+        for i in 0..10 {
+            p.add(item(None, None, &format!("/{i}.mp3")));
+        }
+        p.set_selected(9);
+        p.ensure_visible_in_rows(&p.visible_rows(PlaylistView::Flat), 3);
+        assert!(p.scroll() > 0, "前置：选中末行且窗高 3 应产生滚动偏移");
+        p.clear();
+        assert_eq!(p.scroll(), 0, "清空后滚动偏移必须复位");
     }
 }

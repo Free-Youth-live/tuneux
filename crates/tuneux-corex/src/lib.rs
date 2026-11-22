@@ -23,8 +23,8 @@ mod audio;
 
 // 显式白名单（收官）：杜绝 glob 泄漏，公开面逐项冻结。
 // 死导出已收 pub(crate)：DecoderBackend / DecodeError /
-// codec_name_or_ext / UnknownMedium 零外部消费方；open_backend 仅测试用，
-// 走 test-helpers feature。
+// codec_name_or_ext / UnknownMedium 零外部消费方；open_backend 保留为
+// 条件编译之外的后端工厂入口，test_helpers 另提供测试专用类型。
 pub use audio::codec::decoder::open_backend;
 pub use audio::{
     probe_metadata, spectrum, AudioCmd, AudioParams, CompressorParams, Engine, EqParams,

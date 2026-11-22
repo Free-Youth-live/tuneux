@@ -50,8 +50,7 @@ allow = [
     "Unicode-3.0",
     "Unicode-DFS-2016",
     # 字体条款：egui 默认字体包（epaint_default_fonts）与 wgpu 树引入；
-    # 宽松可随附分发，义务仅为保留许可声明——合规结论沿用家族项目
-    #（AUV-Media）已验证口径，2026-09-27 随 tuneux-max 框架引入。
+    # 均为可随附分发的宽松许可，分发时保留对应许可声明。
     "OFL-1.1",
     "Ubuntu-font-1.0",
     "OpenSSL",
@@ -70,4 +69,10 @@ deny = [
     { crate = "hyper", reason = "内核纯离线：禁止任何联网依赖混入" },
     { crate = "tungstenite", reason = "内核纯离线：禁止任何联网依赖混入" },
     { crate = "libcurl-sys", reason = "内核纯离线：禁止任何联网依赖混入" },
+    { crate = "http", reason = "内核纯离线：禁止任何联网依赖混入" },
+    { crate = "h2", reason = "内核纯离线：禁止任何联网依赖混入" },
+    { crate = "isahc", reason = "内核纯离线：禁止任何联网依赖混入" },
+    { crate = "attohttpc", reason = "内核纯离线：禁止任何联网依赖混入" },
+    { crate = "surf", reason = "内核纯离线：禁止任何联网依赖混入" },
+    { crate = "rustls", reason = "内核纯离线：禁止任何 TLS/联网依赖混入" },
 ]

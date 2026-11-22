@@ -22,6 +22,7 @@
 use std::fs::File;
 use std::path::Path;
 
+use symphonia::core::codecs::audio::well_known::{CODEC_ID_AAC, CODEC_ID_ALAC};
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::probe::Hint;
@@ -81,6 +82,54 @@ pub fn codec_name_or_ext(codec_name: &str, path: &std::path::Path) -> String {
         .and_then(|e| e.to_str())
         .map(|e| e.to_uppercase())
         .unwrap_or_else(|| "?".into())
+}
+
+/// 按 codec ID 解析编码显示名。symphonia 对部分 well-known 编码（ALAC/AAC）
+/// 的 Display 输出十六进制（如 0x2003）而非名称，`codec_display_name` 的
+/// "alac"/"aac" 臂匹配不到、会回落容器扩展名 "M4A"。这里按 ID 显式映射，
+/// 让无损 ALAC 与有损 AAC 可区分；其余编码走 codec_name_or_ext。
+pub(crate) fn codec_name_resolved(
+    codec: symphonia::core::codecs::audio::AudioCodecId,
+    path: &std::path::Path,
+) -> String {
+    if codec == CODEC_ID_ALAC {
+        return "ALAC".into();
+    }
+    if codec == CODEC_ID_AAC {
+        return "AAC".into();
+    }
+    codec_name_or_ext(&codec.to_string(), path)
+}
+
+/// 从 ALAC magic cookie 尾部的 ALACSpecificBox 提取位深。
+///
+/// 背景：isomp4 解析 ALAC 轨时只回填声道与采样率，不回填 bits_per_sample；
+/// 位深只存在于 magic cookie（extra_data）里。cookie 固定为 24 或 48 字节，
+/// 末 24 字节即 ALACSpecificBox，其第 6 字节（下标 5）为 1 字节 bit_depth。
+/// 取值限定 8..=32，越界视为无效数据返回 None。
+fn alac_bits_from_cookie(extra: &[u8]) -> Option<u32> {
+    if extra.len() != 24 && extra.len() != 48 {
+        return None;
+    }
+    let specific = &extra[extra.len() - 24..];
+    let bits = u32::from(specific[5]);
+    (8..=32).contains(&bits).then_some(bits)
+}
+
+/// 位深取值（含 ALAC 补齐）：isomp4 对 ALAC 轨不回填 bits_per_sample，从
+/// magic cookie 补齐；其余编码保持原值（有损格式 None 语义不变）。解码后端
+/// 与播放前探测共用，保证两处位深口径一致（此前 probe 漏补导致无损 ALAC
+/// 被误判为有损）。
+pub(crate) fn bits_per_sample_with_alac(
+    audio_params: &symphonia::core::codecs::audio::AudioCodecParameters,
+) -> Option<u32> {
+    audio_params.bits_per_sample.or_else(|| {
+        if audio_params.codec == CODEC_ID_ALAC {
+            alac_bits_from_cookie(audio_params.extra_data.as_deref().unwrap_or(&[]))
+        } else {
+            None
+        }
+    })
 }
 
 /// 音频文件的技术参数。
@@ -383,9 +432,9 @@ impl SymphoniaBackend {
             // Option<Channels> 的 map 会消费 self，但 audio_params 是借用。
             // 用 as_ref() 先转成 Option<&Channels> 再映射。
             channels: audio_params.channels.as_ref().map(|c| c.count() as u16),
-            bits_per_sample: audio_params.bits_per_sample,
-            // AudioCodecId 的 Display 给出格式名（MP3/FLAC/AAC 等）
-            codec_name: codec_name_or_ext(&audio_params.codec.to_string(), path),
+            bits_per_sample: bits_per_sample_with_alac(audio_params),
+            // 按 codec ID 解析显示名（ALAC/AAC 的 Display 为十六进制，需显式映射）
+            codec_name: codec_name_resolved(audio_params.codec, path),
             track_id,
             // 时长从 track.duration (time_base tick) + time_base 换算
             duration: track.duration.and_then(|dur| {
@@ -530,6 +579,36 @@ pub(crate) fn probe_params(path: &Path) -> Option<AudioParams> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ALAC 位深提取：24/48 字节 cookie 与无效值。
+    #[test]
+    fn alac_bits_from_cookie_sizes() {
+        let mut c24 = [0u8; 24];
+        c24[5] = 16;
+        assert_eq!(alac_bits_from_cookie(&c24), Some(16));
+        let mut c48 = [0u8; 48];
+        c48[29] = 24; // 末 24 字节的第 6 字节
+        assert_eq!(alac_bits_from_cookie(&c48), Some(24));
+        c48[29] = 7; // 低于 8 无效
+        assert_eq!(alac_bits_from_cookie(&c48), None);
+        c24[5] = 33; // 高于 32 无效
+        assert_eq!(alac_bits_from_cookie(&c24), None);
+        assert_eq!(alac_bits_from_cookie(&[0u8; 12]), None); // 长度不符
+    }
+
+    /// 真实语料对拍：测试音频/测试样例.m4a（ALAC 16 bit）——覆盖
+    /// isomp4 不回填位深、经 cookie 补齐的完整链路。
+    #[ignore = "需要 测试音频 夹具；运行：cargo test -- --ignored"]
+    #[test]
+    fn alac_m4a_params_bits_from_corpus() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../测试音频/测试样例.m4a");
+        let backend = open_backend(&path).expect("真实 ALAC 样本可打开");
+        // 编码名现状：symphonia 0.6 的 AudioCodecId Display 为十六进制，
+        // 映射表未命中走扩展名兜底显示 M4A（容器名，非本修范围）；
+        // 本修验证位深链路：cookie 补齐后应为真实位深 16。
+        assert_eq!(backend.params().bits_per_sample, Some(16));
+    }
 
     /// 模糊化烟雾测试：任意字节容器经 open_backend → probe → decode/seek
     /// 不得 panic。覆盖自研后端（WAV / FLAC / WavPack / Ogg-Opus / CD-DA）

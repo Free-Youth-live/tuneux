@@ -8,7 +8,6 @@ use crate::config::Config;
 use crate::fs_browser;
 use crate::playlist;
 use tuneux_corex as audio;
-use tuneux_mediax::metadata;
 
 use super::search::SearchTarget;
 use super::App;
@@ -60,11 +59,11 @@ impl App {
         self.cover_thumb_cache.clear();
     }
 
-    /// "a" 键：把浏览器当前选中条目加入播放列表。
+    /// "a" 键：把浏览器当前选中条目加入播放列表（仅浏览器可见时响应，
+    /// 可见性守卫在 keys.rs 的按键分派层）。
     ///
-    /// 文件分支同步加入（单个文件，开销小）；目录分支异步递归加入
-    /// （[`App::add_dir_async`]），结果由主循环合入——空列表的自动首播
-    /// 也在合入时触发（[`App::apply_dir_add`]）。
+    /// 文件分支同步加入（单个文件，开销小）；目录分支经扫描池异步递归
+    /// 加入，结果由主循环合入——空列表的自动首播由两分支各自触发。
     pub fn add_current_browser_to_playlist(&mut self, config: &mut Config) {
         let Some(entry) = self.browser.current() else {
             return;
@@ -75,6 +74,7 @@ impl App {
                 let path = path.clone();
                 // .cue 文件：按 FILE 引用展开分轨（cue+bin / cue+flac 镜像场景）。
                 if fs_browser::is_cue_file(&path) {
+                    let was_empty = self.playlist.is_empty();
                     match super::cue::cue_items_from_cue_file(&path) {
                         Some((items, skipped, _)) => {
                             if skipped > 0 {
@@ -89,6 +89,14 @@ impl App {
                                 self.playlist.add_many_dedup(items);
                             } else {
                                 self.playlist.add_many(items);
+                            }
+                            if was_empty && !self.playlist.is_empty() {
+                                // 空列表加入 .cue：自动首播（与文件分支/目录分支/
+                                // 浏览器 Enter 三处口径一致）。
+                                let first =
+                                    self.playlist.display_order().first().copied().unwrap_or(0);
+                                self.playlist.set_selected(first);
+                                self.play_and_update_current(first, config, true);
                             }
                         }
                         None => {
@@ -135,7 +143,7 @@ impl App {
                     // （预排序后二者通常相同；跨批次添加时仍以全局显示序为准。）
                     let first = self.playlist.display_order().first().copied().unwrap_or(0);
                     self.playlist.set_selected(first);
-                    self.play_and_update_current(first, config);
+                    self.play_and_update_current(first, config, true);
                 }
             }
             fs_browser::Entry::Dir { path, .. } => {
@@ -148,106 +156,12 @@ impl App {
     }
 
     /// 异步递归收集目录并构建播放列表条目（`a` 键加目录用）：
-    /// 后台线程完成目录遍历、CUE 展开与逐文件元数据探测（重活全在后台，
-    /// 元数据缓存优先——与同步路径同口径），结果由主循环轮询后经
-    /// [`App::apply_dir_add`] 批量合入。大目录加入不再卡 UI。
+    /// 目录遍历、CUE 展开与逐文件元数据探测全在扫描池后台线程（重活
+    /// 不卡 UI），结果经 ScanEvent 由主循环轮询批量合入。
     pub(crate) fn add_dir_async(&mut self, dir: PathBuf) {
         let msg = format!("{}：{}", self.i18n.t("msg.scan_dir"), dir.display());
         self.flash_message(&msg);
         self.scan_pool.submit(dir);
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn add_dir_async_old(&mut self, dir: PathBuf) {
-        // 快照当前元数据缓存给后台线程（命中免探测）；只读不写，无竞争。
-        let cache = self.metadata_cache.clone();
-        let tx = self.add_load_tx.clone();
-        self.flash_message(&format!(
-            "{}：{}",
-            self.i18n.t("msg.scan_dir"),
-            dir.display()
-        ));
-        // 优雅降级：线程启动失败（极罕见）时提示而非 panic。
-        if std::thread::Builder::new()
-            .name("tuneux-dir-add".to_string())
-            .spawn(move || {
-                let mut paths = Vec::new();
-                fs_browser::FsBrowser::collect_music_recursive(
-                    &dir,
-                    &mut paths,
-                    fs_browser::browser_config(),
-                );
-                let (mut items, mds, skipped) = super::cue::build_items_for_paths(&paths, &cache);
-                // 按"专辑-曲序"预排序：让新增批次的插入序 = 显示序，
-                // 添加目录后自动播放/选中的第一首就是专辑-曲序的第一首。
-                playlist::Playlist::sort_items(&mut items);
-                let _ = tx.send((dir, items, mds, skipped));
-            })
-            .is_err()
-        {
-            let msg = self.i18n.t("msg.thread_fail").into_owned();
-            self.flash_message(&msg);
-        }
-    }
-
-    /// 合入一次后台目录加入的结果（主循环轮询与测试共用）：
-    /// 新探测的元数据补入缓存、条目批量加入（按配置去重）、
-    /// 加入前列表为空时自动播放第一首、完成提示。
-    pub(crate) fn apply_dir_add(
-        &mut self,
-        dir: PathBuf,
-        items: Vec<playlist::PlaylistItem>,
-        mds: Vec<(PathBuf, metadata::TrackMetadata)>,
-        skipped_data_tracks: usize,
-        config: &Config,
-    ) {
-        if skipped_data_tracks > 0 {
-            let msg = self
-                .i18n
-                .t("msg.skipped_data")
-                .replace("{}", &skipped_data_tracks.to_string());
-            self.flash_message(&msg);
-        }
-        let was_empty = self.playlist.is_empty();
-        let before = self.playlist.len();
-        let empty_dir = items.is_empty();
-        for (path, md) in mds {
-            // 只补缺失项：不覆盖已有缓存（含当前曲目等热条目）。
-            self.metadata_cache.entry(path).or_insert(md);
-        }
-        if config.dedup_on_add {
-            self.playlist.add_many_dedup(items);
-        } else {
-            self.playlist.add_many(items);
-        }
-        let added = self.playlist.len() - before;
-        if empty_dir || self.playlist.is_empty() {
-            self.flash_message(&format!(
-                "{}：{}",
-                self.i18n.t("msg.no_music"),
-                dir.display()
-            ));
-            return;
-        }
-        if added == 0 {
-            self.flash_message(&format!(
-                "{}：{}",
-                self.i18n.t("msg.all_dup"),
-                dir.display()
-            ));
-            return;
-        }
-        if was_empty {
-            // 加入前列表为空：播放/选中"专辑-曲序"排序后的第一首。
-            let first = self.playlist.display_order().first().copied().unwrap_or(0);
-            self.playlist.set_selected(first);
-            self.play_and_update_current(first, config);
-        }
-        self.flash_message(&format!(
-            "{}：{}",
-            self.i18n.t("msg.added").replace("{}", &added.to_string()),
-            dir.display()
-        ));
     }
 
     /// 异步收集当前目录树（浏览器搜索 `/` 用）：后台线程递归收集，
@@ -349,7 +263,7 @@ impl App {
                                 .unwrap_or(0)
                         };
                         self.playlist.jump_to(play_idx);
-                        self.play_and_update_current(play_idx, config);
+                        self.play_and_update_current(play_idx, config, true);
                     }
                     None => {
                         self.last_error = Some(self.i18n.t("msg.cue_fail").into_owned());
@@ -402,7 +316,7 @@ impl App {
                         .unwrap_or(0)
                 };
                 self.playlist.jump_to(play_idx);
-                self.play_and_update_current(play_idx, config);
+                self.play_and_update_current(play_idx, config, true);
             } else {
                 let md = self.get_or_extract_metadata(&path);
                 let item = playlist::PlaylistItem {
@@ -422,13 +336,13 @@ impl App {
                     // 去重命中：文件已在列表，定位并立即播放（而非静默无反应）。
                     if let Some(idx) = self.playlist.items().iter().position(|it| it.path == path) {
                         self.playlist.jump_to(idx);
-                        self.play_and_update_current(idx, config);
+                        self.play_and_update_current(idx, config, true);
                     }
                 } else {
                     let new_idx = self.playlist.len() - 1;
                     // 手动点选播放：压入 history，使 p 键能回到点选前的曲目。
                     self.playlist.jump_to(new_idx);
-                    self.play_and_update_current(new_idx, config);
+                    self.play_and_update_current(new_idx, config, true);
                 }
             }
         }

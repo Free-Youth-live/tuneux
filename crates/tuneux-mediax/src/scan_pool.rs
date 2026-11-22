@@ -20,12 +20,26 @@ use crate::playlist_item::PlaylistItem;
 // 公共类型
 // =============================================================================
 
+/// 扫描池回传给 UI 的事件。
+#[derive(Debug)]
+pub enum ScanEvent {
+    /// 一个文件展开出的可加入条目（CUE 可包含多轨）。
+    Items(Vec<PlaylistItem>),
+    /// CUE 无法展开，必须保留诊断，不能让同名整轨被跳过后无声消失。
+    CueError {
+        /// 无法解析或找不到音频的 CUE 路径。
+        path: PathBuf,
+        /// 供 UI 显示的错误说明。
+        message: String,
+    },
+}
+
 /// 并行扫描池（walker + N 工人）。
 pub struct ScanPool {
     /// 扫描请求发送端（UI → walker）。
     req_tx: Sender<PathBuf>,
-    /// 结果接收端（工人 → UI；每项一批）。
-    res_rx: Receiver<Vec<PlaylistItem>>,
+    /// 事件接收端（工人 → UI；每项一批）。
+    res_rx: Receiver<ScanEvent>,
     /// 在途扫描条目数（>0 = 扫描中）。
     pending: Arc<AtomicUsize>,
 }
@@ -46,17 +60,17 @@ impl ScanPool {
         Self::with_workers(n_workers)
     }
 
-    /// 创建指定工人数的扫描池。
+    /// 创建指定工人数的扫描池；0 按 1 处理，确保任务可完成。
     pub fn with_workers(n_workers: usize) -> Self {
         let (req_tx, req_rx) = unbounded::<PathBuf>();
         let (work_tx, work_rx) = unbounded::<PathBuf>();
-        let (res_tx, res_rx) = unbounded::<Vec<PlaylistItem>>();
+        let (res_tx, res_rx) = unbounded::<ScanEvent>();
         let pending = Arc::new(AtomicUsize::new(0));
 
         // —— walker：遍历目录树，按目录过滤同名整轨镜像后喂工人 ——
         //
         // pending 计数规则（防假完成 + 防永久泄漏）：
-        // · 根目录投入即 +1（终态 pop 后归还）——保证整个遍历期间 > 0；
+        // · 根请求在 submit 时 +1（终态 pop 后归还）——覆盖排队期，防假完成；
         // · 子目录 push 进 stack 时 +1（L-S3：否则「根只含子目录」
         //   的树在目录列出完毕归还后 pending 瞬时归零 → 收尾判定提前触发）；
         // · 文件 send 给工人时 +1（工人在处理完成后归还）；
@@ -76,7 +90,7 @@ impl ScanPool {
                         let mut visited: std::collections::HashSet<PathBuf> =
                             std::collections::HashSet::new();
                         let mut stack = vec![root];
-                        pend.fetch_add(1, Ordering::Relaxed); // 根目录 +1
+                        // 根请求在 submit 时已登记，pop 后由守卫归还。
                         while let Some(dir) = stack.pop() {
                             // RAII 守卫：无论这个目录的处理如何退出，
                             // 计数都必然归还（L-S4）。
@@ -139,7 +153,7 @@ impl ScanPool {
         }
 
         // —— 标签工人：并行处理单个文件（标签读取 / CUE 展开） ——
-        for wid in 0..n_workers {
+        for wid in 0..n_workers.max(1) {
             let work_rx = work_rx.clone();
             let res_tx = res_tx.clone();
             let pend = pending.clone();
@@ -149,31 +163,39 @@ impl ScanPool {
                     while let Ok(fp) = work_rx.recv() {
                         // RAII 守卫：无论处理如何退出（含 panic），计数归还。
                         let _guard = PendingGuard(&pend);
-                        let is_cue = fp
-                            .extension()
-                            .and_then(|x| x.to_str())
-                            .is_some_and(|x| x.eq_ignore_ascii_case("cue"));
-                        let items: Vec<PlaylistItem> = if is_cue {
-                            // L-S5：CUE 展开失败不再静默吞掉——发一条空批
-                            // 带路径信息，调用方可据此提示用户（与 cue.rs 的
-                            // 「调用方提示」契约对齐）。不吞掉的另一个理由：
-                            // 同名整轨已被镜像去重跳过，CUE 失败意味着
-                            // 这张专辑零曲目入表且无任何痕迹。
-                            crate::cue::cue_items_from_cue_file(&fp)
-                                .map(|(v, _, _)| v)
-                                .unwrap_or_default()
-                        } else {
-                            let md = TrackMetadata::from_file(&fp);
-                            vec![PlaylistItem {
-                                path: fp,
-                                album: md.album,
-                                track_number: md.track_number,
-                                cue: None,
-                            }]
-                        };
-                        if !items.is_empty() {
-                            let _ = res_tx.send(items);
-                        }
+                        // panic 隔离：单个坏文件崩溃不得杀死工人线程（否则 pending
+                        // 永不归还，全部工人死亡后界面永久「扫描中」）。
+                        let fp_error = fp.clone();
+                        let outcome =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                let is_cue = fp
+                                    .extension()
+                                    .and_then(|x| x.to_str())
+                                    .is_some_and(|x| x.eq_ignore_ascii_case("cue"));
+                                if is_cue {
+                                    match crate::cue::cue_items_from_cue_file(&fp) {
+                                        Some((items, _, _)) => ScanEvent::Items(items),
+                                        None => ScanEvent::CueError {
+                                            path: fp.clone(),
+                                            message: "CUE 解析失败、音频文件缺失或没有可播音轨"
+                                                .into(),
+                                        },
+                                    }
+                                } else {
+                                    let md = TrackMetadata::from_file(&fp);
+                                    ScanEvent::Items(vec![PlaylistItem {
+                                        path: fp,
+                                        album: md.album,
+                                        track_number: md.track_number,
+                                        cue: None,
+                                    }])
+                                }
+                            }));
+                        let event = outcome.unwrap_or(ScanEvent::CueError {
+                            path: fp_error,
+                            message: "内部错误：处理文件时异常退出（已跳过该文件）".into(),
+                        });
+                        let _ = res_tx.send(event);
                         // _guard Drop：归还计数
                     }
                 });
@@ -188,11 +210,14 @@ impl ScanPool {
 
     /// 投递扫描请求（目录或文件路径）。
     pub fn submit(&self, path: PathBuf) {
-        let _ = self.req_tx.send(path);
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        if self.req_tx.send(path).is_err() {
+            self.pending.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
-    /// 非阻塞取一批结果（无结果返回 None）。
-    pub fn try_recv(&self) -> Option<Vec<PlaylistItem>> {
+    /// 非阻塞取一个事件（无事件返回 None）。
+    pub fn try_recv(&self) -> Option<ScanEvent> {
         self.res_rx.try_recv().ok()
     }
 
@@ -200,19 +225,23 @@ impl ScanPool {
     pub fn pending(&self) -> usize {
         self.pending.load(Ordering::Relaxed)
     }
+
+    /// 是否可宣告本轮完成：工人完成且 UI 已排空全部结果。
+    pub fn is_idle(&self) -> bool {
+        self.pending() == 0 && self.res_rx.is_empty()
+    }
 }
 
-/// 音频扩展名判断（与 corex KNOWN_AUDIO_EXTS 同源）。
+/// 音频扩展名判断——直接引用 corex 事实源（tuneux_corex::KNOWN_AUDIO_EXTS）。
 fn is_audio_ext(ext: &str) -> bool {
+    // 同步纪律：本函数不持有任何清单副本，与 corex 零分叉；格式增删只改
+    // corex 一处。2026-11-15 审查发现此处旧副本多出 aiff/aif 与 corex
+    // 分叉——扫描池收入的条目在文件浏览器（按 corex 清单过滤）不可见，
+    // 本修复删除副本、改为引用事实源（mediax 依赖 corex，方向不变）。
     // 注："ts" 会命中 TypeScript 同名扩展——支持 MPEG-TS 视频容器取音轨
     //（视频容器取音轨为既定功能）的已知取舍；仅影响用户显式选中的目录
     //（浏览器工厂层会过滤不可播项），不单独排除。
-    const AUDIO_EXTS: &[&str] = &[
-        "flac", "wav", "mp3", "ogg", "opus", "wv", "m4a", "aiff", "aif", "aac", "alac", "mp4",
-        "wma", "ape", "dsf", "dff", "mkv", "avi", "ts", "m2ts", "wmv", "mpg", "mpeg", "vob", "mov",
-        "rmvb", "flv", "tak", "mpc", "shn", "ac3", "dts", "tta",
-    ];
-    AUDIO_EXTS.contains(&ext)
+    tuneux_corex::KNOWN_AUDIO_EXTS.contains(&ext)
 }
 
 /// pending 计数的 RAII 守卫：Drop 时自动归还（防工人 panic / walker
@@ -222,5 +251,76 @@ struct PendingGuard<'a>(&'a AtomicUsize);
 impl Drop for PendingGuard<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn next_event(pool: &ScanPool) -> ScanEvent {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(event) = pool.try_recv() {
+                return event;
+            }
+            assert!(Instant::now() < deadline, "扫描结果超时");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn zero_workers_still_processes_and_releases_count() {
+        let path = std::env::temp_dir().join(format!(
+            "tuneux_scan_zero_workers_{}.mp3",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"test").unwrap();
+        let pool = ScanPool::with_workers(0);
+        pool.submit(path.clone());
+        assert_eq!(pool.pending(), 1, "提交即登记，不能出现假完成");
+        match next_event(&pool) {
+            ScanEvent::Items(items) => assert_eq!(items[0].path, path),
+            _ => panic!("普通文件应产生条目"),
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while pool.pending() != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(pool.pending(), 0);
+        assert!(pool.is_idle());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 扩展名清单与 corex 事实源同源（引用而非副本）：修复前本模块副本
+    /// 多出 aiff/aif 与 corex 分叉，扫描池收入的条目在文件浏览器不可见。
+    #[test]
+    fn audio_exts_reference_corex_source() {
+        assert!(is_audio_ext("flac"));
+        assert!(is_audio_ext("mp3"));
+        assert!(is_audio_ext("wv"));
+        assert!(!is_audio_ext("aiff"), "aiff 不在 corex 清单，不得收入");
+        assert!(!is_audio_ext("aif"), "aif 不在 corex 清单，不得收入");
+        assert!(!is_audio_ext("txt"));
+        assert!(!is_audio_ext("cue"), "cue 走独立分支，不算音频扩展名");
+    }
+
+    #[test]
+    fn invalid_cue_reports_error_instead_of_empty_batch() {
+        let path = std::env::temp_dir().join(format!(
+            "tuneux_scan_invalid_cue_{}.cue",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"not a cue").unwrap();
+        let pool = ScanPool::with_workers(1);
+        pool.submit(path.clone());
+        match next_event(&pool) {
+            ScanEvent::CueError {
+                path: error_path, ..
+            } => assert_eq!(error_path, path),
+            _ => panic!("损坏的 CUE 应报告错误"),
+        }
+        let _ = std::fs::remove_file(path);
     }
 }

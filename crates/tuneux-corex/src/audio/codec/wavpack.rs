@@ -355,7 +355,7 @@ impl<'a> BsReader<'a> {
         }
         if n == limit {
             let d = self.read_egc_count()?;
-            n = d + limit;
+            n = d.checked_add(limit)?;
         }
         Some(n)
     }

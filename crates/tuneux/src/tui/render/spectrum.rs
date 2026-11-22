@@ -2,9 +2,9 @@
 //!
 //! 职责：所有"随音频信号实时变化"的可视化组件——
 //! - 顶部条右侧的实时电平柱图（`draw_level_meter` / `draw_vu_row`）；
-//! - 主区的 Matrix 风格频谱面板（`draw_audio_panel`）；
-//! - 以及两者共用的 splitmix64 伪随机数 `rng_next`
-//!   （用于"乱码字符"效果，避免引入 rand 依赖）。
+//! - 主区的 Matrix 风格频谱面板（`draw_audio_panel`）。
+//!
+//! 随机字符序列与频谱主体绘制由 `tuneux-displayx` 共享实现。
 
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -13,48 +13,10 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
+use crate::tui::palette;
 use tuneux_corex as audio;
+use tuneux_displayx::rng_next;
 use tuneux_mediax::BarStyle;
-
-/// splitmix64 一步：给定 u64 状态，原地推进并返回一个伪随机 u64。
-///
-/// 用于电平乱码区和频谱的随机字符生成，避免引入 `rand` 依赖。
-/// splitmix64 是 Sebastiano Vigna 设计的简单且分布良好的伪随机算法。
-pub(crate) fn rng_next(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E3779B97F4A7C15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-    z ^ (z >> 31)
-}
-
-/// 把 N_BANDS 频段 max-pool 到 `total_w` 显示列：每显示列取对应连续频段的
-/// 最大值，保证任意宽度下画满、峰值不丢（宽屏剩余列补 0）。
-fn pool_to_columns(bands: &[f32; audio::spectrum::N_BANDS], total_w: usize) -> Vec<f32> {
-    let n = audio::spectrum::N_BANDS;
-    if total_w >= n {
-        let mut v = bands.to_vec();
-        v.resize(total_w, 0.0);
-        v
-    } else {
-        let bands_per_col = n as f32 / total_w as f32;
-        let mut v = Vec::with_capacity(total_w);
-        for col in 0..total_w {
-            let start = ((col as f32 * bands_per_col) as usize).min(n);
-            let end = (((col + 1) as f32 * bands_per_col) as usize)
-                .min(n)
-                .max(start + 1);
-            let mut max_v = 0.0f32;
-            for &b in &bands[start..end] {
-                if b > max_v {
-                    max_v = b;
-                }
-            }
-            v.push(max_v);
-        }
-        v
-    }
-}
 
 /// 实时电平柱图：左右声道分别用一条**水平**柱显示。
 ///
@@ -84,7 +46,7 @@ pub(super) fn draw_level_meter(
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         format!(" {} ", i18n.t("panel.level")),
         Style::default()
-            .fg(Color::Cyan)
+            .fg(palette::pal().chrome)
             .add_modifier(Modifier::BOLD),
     ));
     let inner = block.inner(area);
@@ -116,7 +78,7 @@ pub(super) fn draw_level_meter(
 /// 2 格）；非 Matrix 风格用 bar_style 风格池（与电平 / 频谱同族）。
 const BAND_MATRIX_POOL: &[&str] = &["█", "▓", "▒", "░"];
 
-/// 三桶能量面板（顶部条中栏）：低 / 中 / 高各一行，柱长随面板宽度伸缩。
+/// 三桶能量面板（顶部条中栏）：高 / 中 / 低自上而下各一行，柱长随面板宽度伸缩。
 ///
 /// 数据 = 引擎实时频谱（对数 256 段）每桶取最大值（平均会把纯音 /
 /// 稀疏频谱峰值稀释为零）；字符池判定与电平表同口径：Matrix（默认）
@@ -133,7 +95,7 @@ pub(super) fn draw_band_column(
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         format!(" {} ", i18n.t("panel.bands")),
         Style::default()
-            .fg(Color::Cyan)
+            .fg(palette::pal().chrome)
             .add_modifier(Modifier::BOLD),
     ));
     let inner = block.inner(area);
@@ -164,10 +126,11 @@ pub(super) fn draw_band_column(
         i18n.t("spectrum.mid"),
         i18n.t("spectrum.high"),
     );
+    // 显示序：高频在上、低频在下（与刻度直觉一致：越往上频率越高）。
     let buckets = [
-        (low_name.as_ref(), bucket_max(0, b1)),
-        (mid_name.as_ref(), bucket_max(b1, b2)),
         (high_name.as_ref(), bucket_max(b2, n)),
+        (mid_name.as_ref(), bucket_max(b1, b2)),
+        (low_name.as_ref(), bucket_max(0, b1)),
     ];
     // Matrix（默认）= 纯方块渐进（█▓▒░ 从实到虚，按柱宽均匀分布）；
     // 其余风格随 bar_style 池逐格随机取用（与电平 / 频谱同观感）。
@@ -187,9 +150,13 @@ pub(super) fn draw_band_column(
     }
     let mut rng = seed;
     let mut lines: Vec<Line> = Vec::with_capacity(buckets.len());
+    // 三桶配色：统一取主题柱体色；未达到的格位仍是暗点。
+    // 显示序为高频在上、低频在下。
+    let pal = palette::pal();
     for (name, energy) in buckets {
         let active = (energy * bar_cols as f32).ceil() as usize;
-        let mut spans: Vec<Span> = vec![Span::styled(name, Style::default().fg(Color::DarkGray))];
+        let mut spans: Vec<Span> =
+            vec![Span::styled(name, Style::default().fg(palette::pal().dim))];
         for i in 0..bar_cols {
             if i < active {
                 // Matrix 池按柱位均匀渐变（越左越实）；风格池逐格随机。
@@ -198,10 +165,10 @@ pub(super) fn draw_band_column(
                 } else {
                     pool[(rng_next(&mut rng) as usize) % pool.len()]
                 };
-                spans.push(Span::styled(ch, Style::default().fg(Color::LightGreen)));
+                spans.push(Span::styled(ch, Style::default().fg(pal.bar)));
             } else {
                 let blank: &str = if col_w == 2 { "· " } else { "·" };
-                spans.push(Span::styled(blank, Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(blank, Style::default().fg(palette::pal().dim)));
             }
         }
         lines.push(Line::from(spans));
@@ -233,14 +200,26 @@ fn draw_vu_row(
     let w = area.width as usize;
     let level = level.clamp(0.0, 1.0);
 
-    // 颜色按电平阈值（<60% 绿、60-85% 黄、≥85% 红）
-    let color = if level < 0.6 {
-        Color::Green
+    // 颜色按电平阈值（<60% 绿、60-85% 黄、≥85% 红）；单色主题去阈值
+    // 彩色，恒用柱身色（液晶观感不出现绿黄红）。非真彩终端统一量化输出。
+    let pal = palette::pal();
+    let dim = pal.dim_screen;
+    let color = if pal.monochrome {
+        pal.bar
+    } else if level < 0.6 {
+        pal.ok
     } else if level < 0.85 {
-        Color::Yellow
+        if dim {
+            Color::Rgb(154, 138, 58)
+        } else {
+            Color::Yellow
+        }
+    } else if dim {
+        Color::Rgb(160, 64, 56)
     } else {
         Color::Red
     };
+    let color = tuneux_displayx::color_for_terminal(color, tuneux_displayx::env_truecolor());
 
     // —— 标签："{L|R} {百分比} " ——
     // 固定宽度，方便柱体起点对齐
@@ -256,7 +235,7 @@ fn draw_vu_row(
     spans.push(Span::styled(
         label_text,
         Style::default()
-            .fg(Color::Cyan)
+            .fg(palette::pal().chrome)
             .add_modifier(Modifier::BOLD),
     ));
 
@@ -275,7 +254,7 @@ fn draw_vu_row(
         } else {
             // 不活跃部分：暗灰短横线（让"空"也可见但不抢眼）
             let blank: &str = if col_w == 2 { "· " } else { "·" };
-            spans.push(Span::styled(blank, Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(blank, Style::default().fg(palette::pal().dim)));
         }
     }
 
@@ -314,13 +293,12 @@ pub(super) fn draw_audio_panel(
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         format!(" {} ", i18n.t("panel.spectrum")),
         Style::default()
-            .fg(Color::Cyan)
+            .fg(palette::pal().chrome)
             .add_modifier(Modifier::BOLD),
     ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let n_bands = audio::spectrum::N_BANDS;
     if inner.width < 2 || inner.height < 2 {
         return;
     }
@@ -329,94 +307,29 @@ pub(super) fn draw_audio_panel(
     let spectrum = engine
         .as_ref()
         .map(|e| {
-            let [l, r] = e.spectrum_lr();
-            let mut merged = [0.0f32; audio::spectrum::N_BANDS];
-            for i in 0..n_bands {
-                merged[i] = ((l[i] + r[i]) / 2.0).clamp(0.0, 1.0);
-            }
-            merged
+            let [left, right] = e.spectrum_lr();
+            tuneux_displayx::merge_spectrum_channels(&left, &right)
         })
         .unwrap_or([0.0; audio::spectrum::N_BANDS]);
 
-    let total_w = inner.width as usize;
-    let h = inner.height as usize;
-    let bar_max_h = h.saturating_sub(1); // 最底行是基线
-    let col_w = style.col_width(); // hanzi 风格 2 列一柱，横向分辨率减半
-    let total_cols = total_w / col_w;
-    let active = total_cols.min(n_bands);
-
-    // —— 峰值保持白帽 ——
-    // 绿柱实时跟随当前能量；白帽保存每频段历史峰值，能量低于峰值时按固定
-    // 每秒速率线性缓落（明显慢于绿柱），且永不低于当前能量。峰值在频段维度
-    // 保持，窗口改宽不重置；当前能量与峰值分别 max-pool 到显示列后绘制。
+    // 峰值在频段维度保持，窗口改宽不重置；显示列池化与绘制由双端共享层完成。
     let peaks_out = peaks.borrow_mut().update(&spectrum, dt);
-    let display_spectrum = pool_to_columns(&spectrum, total_cols);
-    let display_peaks = pool_to_columns(&peaks_out, total_cols);
-    let mut bar_hs = vec![0usize; active];
-    let mut peak_hs = vec![0usize; active];
-    for i in 0..active {
-        bar_hs[i] = (display_spectrum[i] * bar_max_h as f32).ceil() as usize;
-        peak_hs[i] = (display_peaks[i] * bar_max_h as f32).ceil() as usize;
-    }
-
-    // 柱身单色亮绿（LightGreen），柱顶白色峰值帽；字符池随 bar_style
-    //（宿主内置字符集，hanzi 为 2 列宽）。
-    const BAR_COLOR: Color = Color::LightGreen;
-    let pool = style.pool();
-    let blank: &'static str = if col_w == 2 { "  " } else { " " };
-    let baseline_ch: &'static str = if col_w == 2 { "──" } else { "─" };
-
-    let mut rng = frame_tick;
-    let mut lines: Vec<Line> = Vec::with_capacity(h);
-
-    // 主循环：按行从上到下渲染频谱面板的每一行。
-    //   - row 0 是顶行（最远，最"矮"的柱顶能到这）
-    //   - row h-1 是基线行（柱底），单独画 ─
-    // 柱子是"从下往上长"的：value 越大 → bar_h 越大 → 柱顶离基线越远。
-    for row in 0..h {
-        let mut spans: Vec<Span> = Vec::with_capacity(total_w);
-
-        if row == h - 1 {
-            // 基线行：每个柱位画基线字符（深灰，不抢眼）
-            for _ in 0..total_cols {
-                spans.push(Span::styled(
-                    baseline_ch,
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-        } else {
-            // 当前行距基线的"高度距离"（row 0 → h-1, from_bottom = h-1 → 1）
-            let from_bottom = h - 1 - row;
-            // active 列画频谱（峰值帽 + 绿柱），超宽屏尾部留空。
-            for i in 0..active {
-                let bar_h = bar_hs[i];
-                let peak_h = peak_hs[i];
-                if peak_h > 0 && from_bottom == peak_h {
-                    // 白色峰值帽（可能悬浮在绿柱上方）。
-                    let r = rng_next(&mut rng);
-                    let ch = pool[(r as usize) % pool.len()];
-                    spans.push(Span::styled(ch, Style::default().fg(Color::White)));
-                } else if bar_h > 0 && from_bottom <= bar_h {
-                    // 绿色柱体。
-                    let r = rng_next(&mut rng);
-                    let ch = pool[(r as usize) % pool.len()];
-                    spans.push(Span::styled(ch, Style::default().fg(BAR_COLOR)));
-                } else {
-                    spans.push(Span::raw(blank));
-                }
-            }
-            // 4K 屏等超宽场景：多出的列留空
-            for _ in active..total_cols {
-                spans.push(Span::raw(blank));
-            }
-        }
-        // 列宽整除不尽的右缘余量补空（仅 2 列风格遇奇数宽度时出现）。
-        if total_cols * col_w < total_w {
-            spans.push(Span::raw(" "));
-        }
-        lines.push(Line::from(spans));
-    }
-    frame.render_widget(Paragraph::new(lines), inner);
+    let pal = palette::pal();
+    tuneux_displayx::draw_spectrum(
+        frame,
+        inner,
+        &spectrum,
+        &peaks_out,
+        frame_tick,
+        tuneux_displayx::SpectrumStyle {
+            pool: style.pool(),
+            col_width: style.col_width(),
+            is_solid: pal.block_spectrum,
+            bar_color: pal.bar,
+            peak_color: pal.peak_fg.unwrap_or(Color::White),
+            grid_color: pal.dim,
+        },
+    );
 }
 
 /// 示波器：左右声道时域波形（双边，中线上下摆动）。
@@ -434,7 +347,7 @@ pub(super) fn draw_oscilloscope(
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         format!(" {} ", i18n.t("panel.oscilloscope")),
         Style::default()
-            .fg(Color::Cyan)
+            .fg(palette::pal().chrome)
             .add_modifier(Modifier::BOLD),
     ));
     let inner = block.inner(area);
@@ -490,7 +403,7 @@ fn draw_wave_band(
             spans.push(Span::styled(
                 label_text.clone(),
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(palette::pal().chrome)
                     .add_modifier(Modifier::BOLD),
             ));
         } else {
@@ -504,9 +417,12 @@ fn draw_wave_band(
             if (wave_row - row as f32).abs() < 0.5 {
                 // 波形点用风格池字符（随帧变化）。
                 let ch = pool[(rng_next(&mut rng) as usize) % pool.len()];
-                spans.push(Span::styled(ch, Style::default().fg(Color::Green)));
+                spans.push(Span::styled(ch, Style::default().fg(palette::pal().ok)));
             } else if row == mid {
-                spans.push(Span::styled(mid_ch, Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(
+                    mid_ch,
+                    Style::default().fg(palette::pal().dim),
+                ));
             } else {
                 spans.push(Span::raw(blank));
             }
@@ -556,5 +472,61 @@ mod tests {
         // 无引擎 = 三桶全空：每桶占满内宽（24 列终端：内宽 22 - 标签 2 = 20 格），
         // 三桶共 60 个占位符「·」（Matrix 单列池）。
         assert_eq!(text.matches('·').count(), 60, "每桶应占满内宽：{text:?}");
+    }
+
+    /// 电平表阈值色契约：<60% 主题绿、60–85% 黄、≥85% 红。
+    /// 主题化（裸色值收口到调色板）之后仍必须成立——这是「电平表变色」的守护。
+    #[test]
+    fn level_meter_threshold_colors_survive_theme() {
+        fn bar_colors(level: f32) -> Vec<Color> {
+            let backend = ratatui::backend::TestBackend::new(40, 1);
+            let mut terminal = ratatui::Terminal::new(backend).expect("建终端");
+            terminal
+                .draw(|f| {
+                    super::draw_vu_row(f, f.area(), level, "L", 0, BarStyle::Matrix);
+                })
+                .expect("绘制");
+            let buf = terminal.backend().buffer();
+            (0..buf.area.width).map(|x| buf[(x, 0)].fg).collect()
+        }
+        let low = bar_colors(0.3);
+        assert!(
+            low.iter().any(|c| *c == palette::pal().ok),
+            "低档应为主题绿：{low:?}"
+        );
+        let mid = bar_colors(0.7);
+        assert!(mid.contains(&Color::Yellow), "中档应为黄：{mid:?}");
+        let high = bar_colors(0.95);
+        assert!(high.contains(&Color::Red), "高档应为红：{high:?}");
+    }
+
+    /// 三桶显示序：高频在上、低频在下。
+    #[test]
+    fn band_rows_ordered_high_to_low() {
+        let backend = ratatui::backend::TestBackend::new(24, 5);
+        let mut terminal = ratatui::Terminal::new(backend).expect("建终端");
+        terminal
+            .draw(|f| {
+                super::draw_band_column(
+                    f,
+                    f.area(),
+                    &None,
+                    0,
+                    BarStyle::Matrix,
+                    &crate::config::build_i18n("zh"),
+                );
+            })
+            .expect("绘制");
+        let buf = terminal.backend().buffer();
+        let row_of = |ch: char| {
+            (0..buf.area.height)
+                .find(|&y| (0..buf.area.width).any(|x| buf[(x, y)].symbol().starts_with(ch)))
+                .expect("标签应存在")
+        };
+        let (high, mid, low) = (row_of('高'), row_of('中'), row_of('低'));
+        assert!(
+            high < mid && mid < low,
+            "高频应在上：高{high} 中{mid} 低{low}"
+        );
     }
 }

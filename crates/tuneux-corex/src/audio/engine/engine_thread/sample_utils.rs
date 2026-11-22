@@ -3,19 +3,50 @@
 //! 从 engine_thread.rs 拆分（文件过大）；这些函数均为纯输入→输出，
 //! 不持有任何线程状态，可独立单测。
 //!
-//! - adapt_channels：文件通道数 → 设备通道数转换（上混复制通道衰减 -3dB）
+//! - adapt_channels：文件通道数 → 设备通道数转换（单声道上混等功率居中，
+//!   多声道源的复制通道衰减 -3dB）
 //! - push_all：向 ringbuf 推入整帧数据（帧对齐保护）
-//! - accumulate_spectrum：音频回调内累加 FFT 输入缓冲与窗口峰值
+//! - accumulate_peak：音频回调内在**音量之前**累计窗口峰值（电平表数据源）
+//! - accumulate_spectrum：音频回调内累加 FFT 输入缓冲（频谱数据源）
 
 use crate::audio::engine::spectrum;
 use ringbuf::{traits::*, HeapProd};
 use std::time::Duration;
 
-/// 把交错样本写入 L/R 频谱环形缓冲，并累计 L/R 峰值。
+/// 累计窗口内 L/R 峰值（窗口结束时读出作为电平表数值）。
+///
+/// **调用点必须在「音量」之前**：电平表的黄/红阈值（60% / 85%）按
+/// 源/DSP 电平判读，不能随音量档位漂移——否则音量调小后峰值等比例
+/// 缩水，永远到不了黄/红档，观感上就是"电平表不变色"。
+///
+/// 单声道（1 通道）时右声道与左声道同峰值（与频谱缓冲的复制口径一致）。
+pub(super) fn accumulate_peak(data: &[f32], channels: usize, peak_l: &mut f32, peak_r: &mut f32) {
+    let ch = channels.max(1);
+    for (i, &s) in data.iter().enumerate() {
+        let abs_s = s.abs();
+        match i % ch {
+            0 => {
+                if abs_s > *peak_l {
+                    *peak_l = abs_s;
+                }
+                // 单声道：右声道峰值与左同步（等功率上混后两侧同幅）。
+                if ch == 1 {
+                    *peak_r = (*peak_r).max(abs_s);
+                }
+            }
+            1 => {
+                *peak_r = (*peak_r).max(abs_s);
+            }
+            _ => {} // >2 声道：额外声道暂忽略（音乐多为单/立体声）
+        }
+    }
+}
+
+/// 把交错样本写入 L/R 频谱环形缓冲。
 ///
 /// 处理单声道/立体声/多声道：
 /// - 每帧（`channels` 个样本）写入 `l_buf`/`r_buf` 的同一位置；
-/// - 单声道（1 通道）时右声道复制左声道，保证左右频谱/电平一致；
+/// - 单声道（1 通道）时右声道复制左声道，保证左右频谱一致；
 /// - 写入完成后推进 `buf_idx`（环形偏移）。
 ///
 /// 这是频谱可视化的数据源：窗口结束时把 buffer 重排后做 FFT。
@@ -26,33 +57,21 @@ pub(super) fn accumulate_spectrum(
     buf_idx: &mut usize,
     l_buf: &mut [f32; spectrum::FFT_SIZE_FOR_BUF],
     r_buf: &mut [f32; spectrum::FFT_SIZE_FOR_BUF],
-    window_peak_l: &mut f32,
-    window_peak_r: &mut f32,
 ) {
     let ch = channels.max(1);
     let mut local_frame: usize = 0;
     for (i, &s) in data.iter().enumerate() {
-        let abs_s = s.abs();
         let ch_idx = i % ch;
         let write_pos = (*buf_idx + local_frame) % spectrum::FFT_SIZE_FOR_BUF;
         match ch_idx {
             0 => {
-                if abs_s > *window_peak_l {
-                    *window_peak_l = abs_s;
-                }
                 l_buf[write_pos] = s;
-                // 单声道：右声道复制左声道
+                // 单声道：右声道复制左声道（保证 L/R 频谱一致）
                 if ch == 1 {
                     r_buf[write_pos] = s;
-                    if abs_s > *window_peak_r {
-                        *window_peak_r = abs_s;
-                    }
                 }
             }
             1 => {
-                if abs_s > *window_peak_r {
-                    *window_peak_r = abs_s;
-                }
                 r_buf[write_pos] = s;
             }
             _ => {} // >2 声道：额外声道暂忽略（音乐多为单/立体声）
@@ -108,29 +127,42 @@ pub(super) fn push_all(producer: &mut HeapProd<f32>, samples: &[f32], channels: 
 
 /// 通道数适配：文件通道 ≠ 设备通道时的简单转换。
 ///
-/// - from < to：上混，复制通道填充。
-///   **复制的通道衰减 -3dB**（×0.7071）保持响度一致：mono → stereo 时
-///   `[L] → [L, L×0.7071]`，原始左声道不动，复制的右声道减半功率，
-///   避免单声道文件在立体声设备上整体响度翻倍。
+/// - from < to：上混。
+///   **单声道源（from=1）：等功率居中**——两声道同乘 1/√2（×0.7071），
+///   能量和不变（响度与单声道一致）且声像居中。旧式 `[L, L×0.7071]`
+///   （左声道原样、复制声道衰减）声像偏左且总能量 1.5×，“不翻倍”与
+///   “居中”两个目标各只完成一半，已废弃。
+///   多声道源（from>1）：原始通道原样输出，超出源通道数的复制通道
+///   衰减 -3dB；
 /// - from > to：下混，取前 to 个通道（简化，不做加权）；
 /// - 相等：直接返回。
 pub(super) fn adapt_channels(samples: &[f32], from_ch: usize, to_ch: usize) -> Vec<f32> {
     if from_ch == to_ch || from_ch == 0 || to_ch == 0 {
         return samples.to_vec();
     }
-    // 复制通道的衰减系数：-3dB ≈ 0.7071（功率减半，响度与原始声道一致）
-    const DUP_GAIN: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    // 上混增益：-3dB ≈ 0.7071（功率减半）——单声道等功率居中时两声道
+    // 同乘此系数（能量和不变）；多声道源的复制通道也用它衰减。
+    const UP_GAIN: f32 = std::f32::consts::FRAC_1_SQRT_2;
     let frames = samples.len() / from_ch;
     let mut out = Vec::with_capacity(frames * to_ch);
     if from_ch < to_ch {
         for f in 0..frames {
             let base = f * from_ch;
+            if from_ch == 1 {
+                // 单声道 → 多声道：等功率居中——全部输出通道同乘 1/√2，
+                // 响度与源一致且声像居中（不得只衰减复制通道）。
+                for _ in 0..to_ch {
+                    out.push(samples[base] * UP_GAIN);
+                }
+                continue;
+            }
             for c in 0..to_ch {
-                // 原始通道原样输出；超出源通道数的复制通道衰减 -3dB
+                // 多声道源上混：原始通道原样输出；超出源通道数的复制通道
+                // 衰减 -3dB。
                 let v = if c < from_ch {
                     samples[base + c]
                 } else {
-                    samples[base] * DUP_GAIN
+                    samples[base] * UP_GAIN
                 };
                 out.push(v);
             }
@@ -153,25 +185,27 @@ mod tests {
     use ringbuf::HeapRb;
 
     /// 单声道：每样本一帧，buf_idx 必须逐帧推进。
-    /// 通道上混：mono → stereo 时复制的通道衰减 -3dB（×0.7071），
-    /// 原始通道不动，避免单声道响度翻倍。
+    /// 通道上混：mono → stereo 等功率居中——两声道同乘 1/√2（×0.7071），
+    /// 能量和不变（响度与单声道一致）且声像居中。
+    ///
+    /// 回归：旧式 `[L, L×0.7071]`（左声道原样、复制声道衰减）声像偏左
+    /// 且总能量 1.5×——本断言两声道同幅，偏置形态必红。
     #[test]
-    fn adapt_channels_mono_to_stereo_attenuates_dup() {
+    fn adapt_channels_mono_to_stereo_equal_power() {
         let mono = [0.8_f32, -0.4, 0.5, -0.2];
         let stereo = adapt_channels(&mono, 1, 2);
         // 4 帧 → 8 样本
         assert_eq!(stereo.len(), 8, "mono 4 帧应上混为 8 样本");
-        // 原始通道（L）原样；复制通道（R）衰减
-        assert_eq!(stereo[0], 0.8, "L 原样");
-        assert!(
-            (stereo[1] - 0.8 * std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6,
-            "R 衰减 -3dB"
-        );
-        assert_eq!(stereo[2], -0.4, "L 原样");
-        assert!(
-            (stereo[3] - (-0.4 * std::f32::consts::FRAC_1_SQRT_2)).abs() < 1e-6,
-            "R 衰减 -3dB"
-        );
+        for (i, &m) in mono.iter().enumerate() {
+            assert!(
+                (stereo[i * 2] - m * std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6,
+                "L 应 ×0.7071（帧 {i}）"
+            );
+            assert!(
+                (stereo[i * 2 + 1] - m * std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6,
+                "R 应与 L 同幅（帧 {i}）"
+            );
+        }
     }
 
     /// 通道下混：stereo → mono 取第一通道，不衰减。
@@ -192,10 +226,11 @@ mod tests {
         assert_eq!(out, stereo);
     }
 
-    /// 组合回归（重采样通道对齐）：mono 44.1k 经 adapt 上混后再重采样到
-    /// 48k——重采样器按设备通道数（2）构造时，L/R 各自独立滤波、比例保持
-    ///（R ≈ L×0.7071）；若按文件通道数（1）错配构造，滤波窗跨越交错样本
-    /// 会造成声道串扰、比例被破坏。
+    /// 组合回归（重采样通道对齐）：mono 44.1k 经 adapt 等功率上混后再
+    /// 重采样到 48k——重采样器按设备通道数（2）构造时，L/R 各自独立
+    /// 滤波、同幅关系保持（等功率上混后 R == L，比例 ≈ 1.0）；若按文件
+    /// 通道数（1）错配构造，滤波窗跨越交错样本会造成声道串扰、
+    /// 同幅关系被破坏。
     #[test]
     fn mono_upsampled_then_resampled_keeps_channel_ratio() {
         use crate::audio::engine::resample::Resample;
@@ -204,7 +239,7 @@ mod tests {
         let mono: Vec<f32> = (0..n)
             .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
             .collect();
-        // adapt 上混为立体声（L 原样、R ×0.7071）。
+        // adapt 等功率上混为立体声（L == R == mono × 0.7071）。
         let stereo = adapt_channels(&mono, 1, 2);
         assert_eq!(stereo.len(), n * 2);
         // 按设备通道数构造重采样器（与解码循环送入数据的实际通道数一致）。
@@ -215,7 +250,7 @@ mod tests {
             "输出样本数应 ≈ 输入×48/44.1（实际 {}）",
             out.len()
         );
-        // 线性滤波器对两通道分别作用：R 通道应恒 ≈ L 通道 × 0.7071。
+        // 线性滤波器对两通道分别作用：R 应恒 ≈ L（同幅，比例 ≈ 1.0）。
         //（跳过首尾滤波器瞬态，取中段逐帧断言比例）
         let frames = out.len() / 2;
         let mut checked = 0;
@@ -225,8 +260,8 @@ mod tests {
             if l.abs() > 1e-3 {
                 let ratio = r / l;
                 assert!(
-                    (ratio - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.01,
-                    "帧 {f} 通道比例 {ratio} 偏离 0.7071（串扰迹象）"
+                    (ratio - 1.0).abs() < 0.01,
+                    "帧 {f} 通道比例 {ratio} 偏离 1.0（串扰迹象）"
                 );
                 checked += 1;
             }
@@ -239,19 +274,9 @@ mod tests {
         let mut l_buf = [0.0f32; spectrum::FFT_SIZE_FOR_BUF];
         let mut r_buf = [0.0f32; spectrum::FFT_SIZE_FOR_BUF];
         let mut buf_idx = 0usize;
-        let mut pl = 0.0f32;
-        let mut pr = 0.0f32;
 
         let mono = [0.1, 0.2, 0.3, 0.4];
-        accumulate_spectrum(
-            &mono,
-            1,
-            &mut buf_idx,
-            &mut l_buf,
-            &mut r_buf,
-            &mut pl,
-            &mut pr,
-        );
+        accumulate_spectrum(&mono, 1, &mut buf_idx, &mut l_buf, &mut r_buf);
 
         // 单声道每样本一帧，应推进 4
         assert_eq!(buf_idx, 4, "单声道 buf_idx 应推进样本数");
@@ -263,9 +288,23 @@ mod tests {
         // R 复制 L
         assert_eq!(r_buf[0], 0.1);
         assert_eq!(r_buf[3], 0.4);
-        // peak L/R 均为最大值 0.4
-        assert!((pl - 0.4).abs() < 1e-6);
-        assert!((pr - 0.4).abs() < 1e-6);
+    }
+
+    /// 峰值累计：单声道左右同峰值；立体声分别取最大绝对值。
+    #[test]
+    fn accumulate_peak_takes_max_per_channel() {
+        let mut pl = 0.0f32;
+        let mut pr = 0.0f32;
+        accumulate_peak(&[0.1, -0.7, 0.3], 1, &mut pl, &mut pr);
+        assert!((pl - 0.7).abs() < 1e-6, "单声道 L 峰值 {pl}");
+        assert!((pr - 0.7).abs() < 1e-6, "单声道 R 复制峰值 {pr}");
+
+        let mut pl = 0.0f32;
+        let mut pr = 0.0f32;
+        // 立体声 2 帧：L0 R0 L1 R1
+        accumulate_peak(&[0.1, -0.2, 0.9, -0.4], 2, &mut pl, &mut pr);
+        assert!((pl - 0.9).abs() < 1e-6, "立体声 L 峰值 {pl}");
+        assert!((pr - 0.4).abs() < 1e-6, "立体声 R 峰值 {pr}");
     }
 
     /// 立体声：每对 L+R 一帧，L/R 分别写入，peak 分别累计。
@@ -274,20 +313,10 @@ mod tests {
         let mut l_buf = [0.0f32; spectrum::FFT_SIZE_FOR_BUF];
         let mut r_buf = [0.0f32; spectrum::FFT_SIZE_FOR_BUF];
         let mut buf_idx = 0usize;
-        let mut pl = 0.0f32;
-        let mut pr = 0.0f32;
 
         // 立体声 2 帧：L0 R0 L1 R1
         let stereo = [0.1, -0.2, 0.3, -0.4];
-        accumulate_spectrum(
-            &stereo,
-            2,
-            &mut buf_idx,
-            &mut l_buf,
-            &mut r_buf,
-            &mut pl,
-            &mut pr,
-        );
+        accumulate_spectrum(&stereo, 2, &mut buf_idx, &mut l_buf, &mut r_buf);
 
         // 2 帧推进 2
         assert_eq!(buf_idx, 2);
@@ -295,9 +324,6 @@ mod tests {
         assert_eq!(l_buf[1], 0.3);
         assert_eq!(r_buf[0], -0.2);
         assert_eq!(r_buf[1], -0.4);
-        // peak L = 0.3，peak R = 0.4
-        assert!((pl - 0.3).abs() < 1e-6);
-        assert!((pr - 0.4).abs() < 1e-6);
     }
 
     /// 环形回绕：buf_idx 越过缓冲末尾后应取模回绕。
@@ -305,21 +331,11 @@ mod tests {
     fn mono_wraps_around_buffer_end() {
         let mut l_buf = [0.0f32; spectrum::FFT_SIZE_FOR_BUF];
         let mut r_buf = [0.0f32; spectrum::FFT_SIZE_FOR_BUF];
-        let mut pl = 0.0f32;
-        let mut pr = 0.0f32;
 
         // 从缓冲末尾前 2 格开始写 4 个单声道样本，应回绕到开头
         let mut buf_idx = spectrum::FFT_SIZE_FOR_BUF - 2;
         let mono = [1.0, 2.0, 3.0, 4.0];
-        accumulate_spectrum(
-            &mono,
-            1,
-            &mut buf_idx,
-            &mut l_buf,
-            &mut r_buf,
-            &mut pl,
-            &mut pr,
-        );
+        accumulate_spectrum(&mono, 1, &mut buf_idx, &mut l_buf, &mut r_buf);
 
         assert_eq!(buf_idx, 2, "回绕后 buf_idx 应为 4 - 2");
         assert_eq!(l_buf[spectrum::FFT_SIZE_FOR_BUF - 2], 1.0);

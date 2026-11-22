@@ -57,6 +57,22 @@ impl MediaKeyEvent {
     }
 }
 
+/// 媒体键事件单轮读取上限：防止持续事件流占住产品主循环。
+pub const MEDIA_KEY_DRAIN_LIMIT: usize = 16;
+
+/// 从媒体键通道读取一轮事件：至多消费 `limit` 个原始事件，并合并同类事件。
+///
+/// 超过上限的事件保留在通道内供下一轮处理；返回值保持不同事件的首次出现顺序。
+pub fn drain_media_key_events(rx: &Receiver<MediaKeyEvent>, limit: usize) -> Vec<MediaKeyEvent> {
+    let mut events = Vec::new();
+    for event in rx.try_iter().take(limit) {
+        if !events.contains(&event) {
+            events.push(event);
+        }
+    }
+    events
+}
+
 /// 媒体键监听句柄：事件接收端 + 共享状态回灌口。
 ///
 /// 主循环每帧把引擎真实状态（是否播放/曲目标题）写入共享状态，
@@ -89,6 +105,7 @@ pub fn spawn_media_key_listener(
     }
     #[cfg(target_os = "windows")]
     {
+        let _ = (service_name, identity);
         let rx = windows::spawn_windows_listener()?;
         Some(MediaKeyHandle {
             rx,
@@ -378,15 +395,14 @@ mod windows {
                 // rdev::listen 内部安装 WH_KEYBOARD_LL 并跑 GetMessageA 泵，
                 // 阻塞本线程直到进程退出；监听不拦截事件（pass-through），
                 // 不影响其他程序正常接收媒体键。
-                if let Err(_) = rdev::listen(move |event| {
+                // 钩子安装失败时监听线程退出，不影响正常播放。
+                let _ = rdev::listen(move |event| {
                     if let rdev::EventType::KeyPress(key) = event.event_type {
                         if let Some(ev) = map_key(key) {
                             let _ = tx.try_send(ev);
                         }
                     }
-                }) {
-                    // 钩子安装失败（罕见）：静默忽略，媒体键不可用。
-                }
+                });
             }) {
             Ok(h) => h,
             Err(_) => {
@@ -447,5 +463,42 @@ mod tests {
     fn spawn_returns_option_without_panic() {
         // 无论平台/环境，调用本身不应 panic；返回 None 或 Some 均可接受。
         let _ = spawn_media_key_listener("org.mpris.MediaPlayer2.tuneux", "tuneux");
+    }
+
+    /// 单轮读取不超过上限，同类事件只保留首次出现，余量留到下一轮。
+    #[test]
+    fn media_key_drain_is_bounded_and_coalesced() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        for event in [
+            MediaKeyEvent::Next,
+            MediaKeyEvent::Next,
+            MediaKeyEvent::VolumeUp,
+        ] {
+            tx.send(event).unwrap();
+        }
+        for _ in 3..MEDIA_KEY_DRAIN_LIMIT {
+            tx.send(MediaKeyEvent::Prev).unwrap();
+        }
+        let remaining = 3;
+        for _ in 0..remaining {
+            tx.send(MediaKeyEvent::VolumeDown).unwrap();
+        }
+
+        let events = drain_media_key_events(&rx, MEDIA_KEY_DRAIN_LIMIT);
+        assert_eq!(
+            events,
+            vec![
+                MediaKeyEvent::Next,
+                MediaKeyEvent::VolumeUp,
+                MediaKeyEvent::Prev
+            ],
+            "应保留不同事件的首次顺序并合并同类事件"
+        );
+        assert_eq!(rx.len(), remaining, "超额事件必须留在通道内");
+
+        let rest = drain_media_key_events(&rx, MEDIA_KEY_DRAIN_LIMIT);
+        assert_eq!(rest, vec![MediaKeyEvent::VolumeDown]);
+        assert!(rx.is_empty(), "第二轮应读完余量");
+        assert!(drain_media_key_events(&rx, 0).is_empty());
     }
 }

@@ -123,7 +123,13 @@ impl I18n {
 /// 机制归通用层（本函数），**文案归产品**——`zh_fallback` 由各产品作为「锚」
 /// 构造注入（`zh_table()` 留在产品 crate，由 key 完整性校验脚本守护）。`lang == "zh"` 或文件缺失时 primary 为空表，走 zh 兜底；绝不 panic。
 pub fn build_i18n(lang: &str, zh_fallback: LangTable) -> I18n {
-    let primary = if lang == "zh" {
+    // lang 只允许纯文件名形态（字母数字 + 连字符/下划线）：直接拼路径会把
+    // 配置里的 `../` 或分隔符带进 locales 目录之外，读出任意存在的文件。
+    // 非法形态一律回落 zh 兜底（不 panic、不读盘）。
+    let lang_valid = lang
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    let primary = if lang == "zh" || lang.is_empty() || !lang_valid {
         LangTable::default()
     } else {
         std::env::current_exe()
@@ -227,5 +233,15 @@ mod tests {
         // 空表 + 任意 key 也应回退到 key 本身。
         let i18n = I18n::default();
         assert_eq!(i18n.t("任意 key"), "任意 key");
+    }
+
+    #[test]
+    fn invalid_lang_falls_back_without_path_escape() {
+        // 非法 lang（路径穿越 / 分隔符 / 空串）必须回落空 primary（zh 兜底），
+        // 不得按字面拼路径去读 locales 目录之外的文件。
+        for lang in ["../escape", "..\\escape", "a/b", "en;rm", ".."] {
+            let i18n = build_i18n(lang, LangTable::parse("play = \"播放\"\n"));
+            assert_eq!(i18n.t("play"), "播放", "lang={lang} 应回落 zh 兜底");
+        }
     }
 }

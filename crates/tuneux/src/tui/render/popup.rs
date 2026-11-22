@@ -13,6 +13,26 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
+use crate::tui::palette;
+
+/// 弹窗底：清掉下层内容后按主题重铺底色/字色。
+///
+/// 弹窗先 Clear 再画，若只清不铺，未显式着色的行会落到终端默认配色上——
+/// 浅色主题（浅底深字）在深色终端里会出现深色弹窗 + 深字不可读。这里统一
+/// 用主题底色/字色铺满弹窗区，保证任意终端下弹窗同主题。
+fn paint_popup_base(frame: &mut ratatui::Frame, area: Rect) {
+    let pal = palette::pal();
+    let mut style = Style::default();
+    if let Some(bg) = pal.bg {
+        style = style.bg(bg);
+    }
+    if let Some(fg) = pal.fg {
+        style = style.fg(fg);
+    }
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(Block::default().style(style), area);
+}
+
 /// "关于"弹窗：居中显示版本号、简介、特性、开源声明与版权。
 ///
 /// 由 `?` 键唤起，覆盖在主界面之上；任意键关闭（见 `App::handle_key`）。
@@ -28,12 +48,12 @@ pub(super) fn draw_about(frame: &mut ratatui::Frame, area: Rect, i18n: &tuneux_c
         width: box_w,
         height: box_h,
     };
-    // Clear 清空弹窗区域，避免下层的界面内容透出来造成叠字。
-    frame.render_widget(ratatui::widgets::Clear, box_area);
+    // 清空弹窗区域（避免下层叠字）并按主题重铺底色/字色。
+    paint_popup_base(frame, box_area);
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         format!(" {} ", i18n.t("panel.about")),
         Style::default()
-            .fg(Color::Cyan)
+            .fg(palette::pal().chrome)
             .add_modifier(Modifier::BOLD),
     ));
     let inner = block.inner(box_area);
@@ -47,14 +67,14 @@ pub(super) fn draw_about(frame: &mut ratatui::Frame, area: Rect, i18n: &tuneux_c
             Span::styled(
                 format!("tuneux\u{2122} v{version}"),
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(palette::pal().title_fg.unwrap_or(Color::Yellow))
                     .add_modifier(Modifier::BOLD),
             ),
             // 商标：紧随版本号之后，青色加粗；\u{00AE} 是普通文本注册商标符号 ®
             Span::styled(
                 "  不羁的青春\u{00AE} FreeYouth\u{00AE}",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(palette::pal().chrome)
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
@@ -77,7 +97,7 @@ pub(super) fn draw_about(frame: &mut ratatui::Frame, area: Rect, i18n: &tuneux_c
         Line::from(""),
         Line::from(Span::styled(
             i18n.t("about.close").into_owned(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette::pal().dim),
         )),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
@@ -116,18 +136,18 @@ pub(super) fn draw_properties(
         width: box_w,
         height: box_h,
     };
-    frame.render_widget(ratatui::widgets::Clear, box_area);
+    paint_popup_base(frame, box_area);
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         format!(" {} ", i18n.t("popup.properties")),
         Style::default()
-            .fg(Color::Cyan)
+            .fg(palette::pal().chrome)
             .add_modifier(Modifier::BOLD),
     ));
     let inner = block.inner(box_area);
     frame.render_widget(block, box_area);
 
     let label = |k: &str| format!("{}: ", i18n.t(k));
-    let dim = Style::default().fg(Color::DarkGray);
+    let dim = Style::default().fg(palette::pal().dim);
     let mut lines: Vec<Line> = Vec::new();
     // 引擎回落：FFmpeg 长尾曲目的文件探测只有兜底记录（技术字段全
     // None）时，用后端 open 实测的源参数补缺（元数据优先，码率不补）。
@@ -139,7 +159,7 @@ pub(super) fn draw_properties(
     match &overlaid {
         None => lines.push(Line::styled(
             i18n.t("msg.empty").into_owned(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette::pal().dim),
         )),
         Some(md) => {
             let w = inner.width as usize;
@@ -152,7 +172,7 @@ pub(super) fn draw_properties(
                     w,
                 ),
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(palette::pal().title_fg.unwrap_or(Color::Yellow))
                     .add_modifier(Modifier::BOLD),
             ));
             lines.push(Line::styled(
@@ -214,7 +234,7 @@ pub(super) fn draw_properties(
     }
     let hint = Line::styled(
         i18n.t("about.close").into_owned(),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(palette::pal().dim),
     );
     lines.push(hint);
     frame.render_widget(Paragraph::new(lines), inner);

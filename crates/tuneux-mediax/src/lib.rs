@@ -31,9 +31,12 @@ pub use cue::{
     parse_cue_sheet, CueExpansion, CueParseError, CueSheet, CueTrack,
 };
 pub use playback_decision::{
-    resume_secs, single_repeat_decision, toggle_decision, PlaybackDecision,
+    advance_failure_count, resume_secs, single_repeat_decision, toggle_decision, PlaybackDecision,
+    CONSECUTIVE_FAILURE_LIMIT,
 };
 pub use playlist::{PlaylistCore, PlaylistView, ShuffleMode, SplitMix64};
-pub use playlist_item::{clamp_seek_to_cue, CueRef, NavOutcome, PlaylistItem};
+pub use playlist_item::{
+    clamp_seek_to_cue, cue_relative_position, CueRef, NavOutcome, PlaylistItem,
+};
 pub use playlist_state::{PlaylistState, SavedList};
 pub use repeat::RepeatMode;

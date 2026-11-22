@@ -230,6 +230,11 @@ impl FsBrowser {
     /// entries 维持一级列表、[`FsBrowser::set_filter`] 只记关键字不过滤。
     /// 必须成对调用 [`FsBrowser::end_search`] 恢复一级条目。
     pub fn begin_search(&mut self) {
+        // 幂等保护：已处于搜索态时重复调用不得覆盖 saved_entries
+        //（否则 end_search 恢复出错误内容）。
+        if self.searching {
+            return;
+        }
         self.saved_entries = self.entries.clone();
         self.saved_selected = self.selected;
         self.saved_scroll = self.scroll;
@@ -826,7 +831,10 @@ mod tests {
         assert_eq!(br.entries().len(), 4, "递归收集应含子目录文件");
         br.set_filter("稻");
         assert_eq!(br.entries().len(), 1, "应匹配子目录里的稻香.mp3");
-        assert_eq!(br.entries()[0].name(), "周杰伦/稻香.mp3");
+        assert_eq!(
+            br.entries()[0].name(),
+            format!("周杰伦{}稻香.mp3", std::path::MAIN_SEPARATOR)
+        );
         br.end_search();
         assert_eq!(br.entries().len(), 3, "退出后应恢复一级条目");
         let _ = fs::remove_dir_all(&tmp);
@@ -849,7 +857,10 @@ mod tests {
         let collected = collect_recursive_entries(br.cwd(), cfg());
         br.apply_search_collected(collected.0, collected.1);
         assert_eq!(br.entries().len(), 1);
-        assert_eq!(br.entries()[0].name(), "周杰伦/稻香.mp3");
+        assert_eq!(
+            br.entries()[0].name(),
+            format!("周杰伦{}稻香.mp3", std::path::MAIN_SEPARATOR)
+        );
         let _ = fs::remove_dir_all(&tmp);
     }
 

@@ -1,0 +1,8 @@
+# 插件 manifest 是文本文件且字节参与 v2 签名（id‖manifest‖wasm，见 pinx ids.rs 契约注释）。
+# 行尾必须跨平台钉死：Windows 默认 autocrlf=true 会把检出件转 CRLF，导致验签失败、
+# 全部第一方插件静默降级。以 -text 按二进制字节直通，
+# 工作树与仓库 blob 字节一致，签名与验签两侧同源。
+plugins/*.manifest -text
+# 签名与 WASM 均为二进制，禁止文本行尾转换和文本 diff 检查。
+plugins/*.sig binary
+plugins/*.wasm binary

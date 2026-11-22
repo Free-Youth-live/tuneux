@@ -6,20 +6,19 @@
 #       Windows x86_64 / Windows arm64。
 #
 # 每个平台产出两个压缩包：
-# - tuneux-<ver>-<平台>    ：基础版二进制 + 使用手册-tuneux + locales/ 语言表；
+# - tuneux-<ver>-<平台>    ：基础版二进制 + 使用手册-tuneux + LICENSE（木兰宽松许可证第2版）+ locales/ 语言表；
 # - tuneux-fx-<ver>-<平台> ：插件版二进制 + 使用手册-tuneux-fx + 插件开发指南 + plugins/ 插件目录 + locales/ 语言表。
 # max 平台面为 mac 双架构 / win x64（Linux 应用包后续支持），产出：
 # - tuneux-max-<ver>-<平台>：mac = 可双击的 tuneux-max.app bundle（zip 封装，
 #   外层版本文件夹内含 .app 与手册同级）；win = exe（GUI 子系统，双击无控制台窗）。
 #   均含 locales/ 语言表、plugins/ 第一方插件、ffmpeg/ 组件、手册与第三方许可
 #   （含内嵌字体的 OFL 文本）。
-# **max 仅随 v0.6+ 标签构建**（版本线口径 2026-10-08：0.5.x 线为双 TUI 维护版，
-#   max 不随发，产物 6×2 = 12 个；v0.6+ 起为 6×2 + 3 = 15 个）。
+# **max 通常随 v0.6+ 标签构建**；0.5.x 与 v0.6.2 例外，仅发双 TUI。
+#   双 TUI 产物为 6×2 = 12 个；其余 v0.6+ 标签为 6×2 + 3 = 15 个。
 #
-# 发布关卡（任一不过整单不发）：checks（格式/静态检查/测试/内容自检）+
+# 发布关卡（任一不过整单不发）：checks（格式/静态检查/测试）+
 # deny（依赖四项核查）+ build-ffmpeg（组件构建）+ build（六平台编译）+
-# build-max（GUI 三平台），release 需全部通过（0.5.x 标签下 build-max 为
-# skipped，同样放行）。
+# build-max（GUI 三平台；0.5.x 与 v0.6.2 标签下 skipped，同样放行）。
 #
 # —— Linux 构建基线 ——
 # ubuntu-latest（24.04，glibc 2.39）上直接构建的产物要求新版 glibc，
@@ -50,8 +49,7 @@ concurrency:
 
 jobs:
   checks:
-    # 质量关卡：格式 / 静态检查（零告警）/ 测试 / 内容自检（结构自检 +
-    # API 面断言 + i18n key 完整性 + 重复自检），任一不过则整单不发。
+    # 质量关卡：格式 / 静态检查（零告警）/ 测试，任一不过则整单不发。
     # 与 build / deny 并行执行，不增加发布串行时长。
     name: 质量检查
     runs-on: ubuntu-latest
@@ -66,8 +64,6 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: 测试
         run: cargo test --workspace
-      - name: 内容与结构自检
-        run: "true"
 
   deny:
     # 依赖核查关卡：四项（漏洞公告/禁用依赖/许可/源）任一不过则整单不发。
@@ -313,6 +309,8 @@ jobs:
           cp "$BIN/tuneux" pkg/tuneux/
           cp 使用手册-tuneux.txt pkg/tuneux/
           cp THIRD-PARTY-LICENSES.txt pkg/tuneux/
+          # 木兰宽松许可证（第2版）随包
+          cp LICENSE pkg/tuneux/
           # 官方英文语言表（配置 lang = "en" 启用；文件缺失自动回退中文）
           cp -R locales pkg/tuneux/locales
           # 手册标题行注入版本号：__VERSION__ → 实际版本（来自 tag）
@@ -328,6 +326,8 @@ jobs:
           sed -i.bak "s/__VERSION__/${VER}/" "pkg/tuneux-fx/使用手册-tuneux-fx.txt" && rm -f "pkg/tuneux-fx/使用手册-tuneux-fx.txt.bak"
           cp 插件开发指南.txt pkg/tuneux-fx/
           cp THIRD-PARTY-LICENSES.txt pkg/tuneux-fx/
+          # 木兰宽松许可证（第2版）随包
+          cp LICENSE pkg/tuneux-fx/
           cp -R plugins pkg/tuneux-fx/plugins
           # 官方英文语言表（菜单「设置 → 语言」切换，即时生效）
           cp -R locales pkg/tuneux-fx/locales
@@ -347,6 +347,8 @@ jobs:
           Copy-Item "$bin/tuneux.exe" pkg/tuneux/
           Copy-Item 使用手册-tuneux.txt pkg/tuneux/
           Copy-Item THIRD-PARTY-LICENSES.txt pkg/tuneux/
+          # 木兰宽松许可证（第2版）随包
+          Copy-Item LICENSE pkg/tuneux/
           # 官方英文语言表（配置 lang = "en" 启用；文件缺失自动回退中文）
           Copy-Item -Recurse locales pkg/tuneux/locales
           $m = Get-Content "pkg/tuneux/使用手册-tuneux.txt" -Raw
@@ -362,6 +364,8 @@ jobs:
           Set-Content "pkg/tuneux-fx/使用手册-tuneux-fx.txt" -Value ($m -replace '__VERSION__', $ver) -NoNewline -Encoding UTF8
           Copy-Item 插件开发指南.txt pkg/tuneux-fx/
           Copy-Item THIRD-PARTY-LICENSES.txt pkg/tuneux-fx/
+          # 木兰宽松许可证（第2版）随包
+          Copy-Item LICENSE pkg/tuneux-fx/
           Copy-Item -Recurse plugins pkg/tuneux-fx/plugins
           # 官方英文语言表（菜单「设置 → 语言」切换，即时生效）
           Copy-Item -Recurse locales pkg/tuneux-fx/locales
@@ -390,9 +394,9 @@ jobs:
     # 恢复时：在下方 matrix 加回 linux-x86_64（os: ubuntu-latest /
     # target: x86_64-unknown-linux-gnu / ext: tar.gz，ubuntu 原生构建——
     # winit/x11 交叉编译是深坑，不赌），并接线该脚本。
-    # 0.5.x 线不随发（2026-10-08 版本线口径）：仅 v0.6+ 标签构建；
-    # 手动触发按输入 tag 同样判定。
-    if: ${{ !startsWith(github.ref, 'refs/tags/v0.5.') && !startsWith(github.event.inputs.tag, 'v0.5.') }}
+    # 0.5.x 不随发；v0.6.2 仅发双 TUI，本 job 主动跳过。
+    # 后续 v0.6+ 标签恢复构建；手动触发按输入 tag 同样判定。
+    if: ${{ !startsWith(github.ref, 'refs/tags/v0.5.') && !startsWith(github.event.inputs.tag, 'v0.5.') && github.ref_name != 'v0.6.2' && github.event.inputs.tag != 'v0.6.2' }}
     name: max-${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -454,6 +458,8 @@ jobs:
           mkdir -p "$STAGE"
           cp -R "pkg/tuneux-max.app" "$STAGE/"
           cp "pkg/使用手册-tuneux-max.txt" "$STAGE/"
+          # 木兰宽松许可证（第2版）：外层一份开箱可见（Resources 内另有一份随 .app）
+          cp LICENSE "$STAGE/"
           ditto -c -k --keepParent "$STAGE" "tuneux-max-${VER}-${{ matrix.name }}.zip"
 
       - name: 打包（Windows）
@@ -468,6 +474,8 @@ jobs:
           $m = Get-Content "pkg/tuneux-max/使用手册-tuneux-max.txt" -Raw
           Set-Content "pkg/tuneux-max/使用手册-tuneux-max.txt" -Value ($m -replace '__VERSION__', $ver) -NoNewline -Encoding UTF8
           Copy-Item THIRD-PARTY-LICENSES.txt pkg/tuneux-max/
+          # 木兰宽松许可证（第2版）随包
+          Copy-Item LICENSE pkg/tuneux-max/
           # 内嵌字体 OFL 文本保留义务（Sarasa Mono SC 嵌入二进制）
           Copy-Item crates/tuneux-max/assets/LICENSE-SarasaMonoSC-OFL.txt pkg/tuneux-max/
           Copy-Item -Recurse locales pkg/tuneux-max/locales
@@ -499,8 +507,8 @@ jobs:
     environment: release
     permissions:
       contents: write
-    # build-max 在 0.5.x 标签下被主动跳过（skipped）：其余关卡全绿即可发布；
-    # 0.6+ 标签下 build-max 必须成功。
+    # build-max 在 0.5.x 与 v0.6.2 标签下主动跳过（skipped）：其余关卡全绿即可发布；
+    # 其余 v0.6+ 标签下 build-max 必须成功。
     # 首条 startsWith(github.ref, 'refs/tags/')：仅「推送 tag」触发发布，
     # workflow_dispatch 演练只验证构建链与产物、不创建 Release（免去演练后
     # 手删 Release，也杜绝误批演练产物）。若确需经 dispatch 发布，去掉该条即可
@@ -519,6 +527,20 @@ jobs:
       # 发布注记要从 CHANGELOG 提取，需检出仓库（本 job 其余步骤只用产物）
       - name: 检出代码
         uses: actions/checkout@v4
+
+      # 版本一致性：tag 必须与三产品 Cargo.toml 的 version 完全一致——
+      # 两个版本源（关于弹窗读 CARGO_PKG_VERSION、手册读 tag）错位会让
+      # 用户看到两个版本号，发布链上机器兜底。
+      - name: 版本一致性（tag 与三产品 Cargo.toml）
+        run: |
+          VER="${TAG#v}"
+          for c in tuneux tuneux-fx tuneux-max; do
+            if ! grep -q "^version = \"$VER\"$" "crates/$c/Cargo.toml"; then
+              echo "❌ crates/$c/Cargo.toml 的 version 与 tag $TAG 不一致"
+              exit 1
+            fi
+          done
+          echo "✓ 版本一致性：三产品 Cargo.toml 与 tag 一致"
 
       - name: 下载产物
         uses: actions/download-artifact@v4

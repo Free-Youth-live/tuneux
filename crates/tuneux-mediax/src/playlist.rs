@@ -498,7 +498,7 @@ impl PlaylistCore {
     /// 计算显示序：按 (album, track_number) 排序，无专辑的项排末尾。
     /// 返回 indices 数组（插入序索引保持不变）。
     ///
-    /// 结果缓存于 `display_order_cache`：列表未变更时多次调用零开销。
+    /// 缓存未变更时免重新排序，但仍会克隆索引数组；调用方应避免逐行重复调用。
     pub fn display_order(&self) -> Vec<usize> {
         if let Some(cached) = self.display_order_cache.borrow().as_ref() {
             return cached.clone();
@@ -597,10 +597,19 @@ impl PlaylistCore {
         // 当前曲所在组的剩余未播（组内按曲序）
         if let Some(cur) = self.current {
             if let Some(g) = groups.iter().find(|g| g.contains(&cur)) {
+                // 只从「当前曲之后」的未播曲续播：手动跳到专辑中段时不得
+                // 回退到组内曲序最前的未播曲（否则整张按 2,1,3,4 顺序播放）。
+                let cur_pos = g.iter().position(|i| Some(*i) == self.current);
                 let rest: Vec<usize> = g
                     .iter()
                     .copied()
-                    .filter(|i| Some(*i) != self.current && !self.history.contains(i))
+                    .enumerate()
+                    .filter(|(pos, i)| {
+                        cur_pos.is_some_and(|cp| *pos > cp)
+                            && Some(*i) != self.current
+                            && !self.history.contains(i)
+                    })
+                    .map(|(_, i)| i)
                     .collect();
                 if let Some(next) = rest.first() {
                     return Some(*next);

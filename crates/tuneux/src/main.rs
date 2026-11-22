@@ -38,6 +38,18 @@ use crate::tui::render::{draw, layout_metrics};
 /// 简化代码。配置/音频/IO 错误对用户均不致命，调用方据此回退。
 type AppResult<T> = Result<T, Box<dyn std::error::Error>>;
 
+/// 从媒体键通道读取一轮事件，再映射为基础版 keymap 动作名。
+/// 有界读取与同类合并由 commonx 统一实现。
+fn drain_media_key_events(
+    rx: &crossbeam_channel::Receiver<tuneux_commonx::media_key::MediaKeyEvent>,
+    limit: usize,
+) -> Vec<&'static str> {
+    tuneux_commonx::media_key::drain_media_key_events(rx, limit)
+        .into_iter()
+        .map(|ev| ev.action())
+        .collect()
+}
+
 /// 程序入口。
 ///
 /// 流程：
@@ -89,10 +101,15 @@ fn install_panic_hook() {
 /// 2. `EnterAlternateScreen`：切换到备用屏幕缓冲，退出时自动恢复。
 fn init_terminal() -> AppResult<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(io::stdout());
-    let terminal = Terminal::new(backend)?;
-    Ok(terminal)
+    let terminal = (|| {
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        let backend = CrosstermBackend::new(io::stdout());
+        Ok(Terminal::new(backend)?)
+    })();
+    if terminal.is_err() {
+        let _ = restore_terminal();
+    }
+    terminal
 }
 
 /// 恢复终端到正常状态。
@@ -100,8 +117,10 @@ fn init_terminal() -> AppResult<Terminal<CrosstermBackend<Stdout>>> {
 /// 必须在程序退出前调用，否则终端会停留在 raw 模式，
 /// 用户看不到输入也无法正常使用 shell。
 fn restore_terminal() -> AppResult<()> {
-    disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
+    let raw_result = disable_raw_mode();
+    let screen_result = execute!(io::stdout(), LeaveAlternateScreen);
+    raw_result?;
+    screen_result?;
     Ok(())
 }
 
@@ -125,6 +144,7 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>, config: &mut Config) ->
     let mut last_save = std::time::Instant::now();
     // 上一帧时刻：用于计算帧间隔，驱动频谱峰值按秒衰减（帧率无关）。
     let mut last_frame = std::time::Instant::now();
+    let mut scan_added = 0usize;
 
     loop {
         // 在绘制前，根据当前终端尺寸调整浏览器滚动偏移，确保选中项可见。
@@ -183,29 +203,46 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>, config: &mut Config) ->
                 app.browser.apply_search_collected(entries, truncated);
             }
         }
-        // 目录递归加入的后台结果：批量合入（条目 + 新探测元数据补缓存）。
-        // 多批次全部生效——加入是累积语义（与导航的「最新生效」不同）。
-        // 共享扫描池结果排空（每帧至多 64 条，与 max/fx 同款）
+        // 多批次累积加入；显示排序由 Playlist 的 display_order 负责，
+        // 不重排内部条目，以免 current/history 中的索引失效。
         {
             let mut drained = 0;
             while drained < 64 {
                 match app.scan_pool.try_recv() {
-                    Some(batch) => {
+                    Some(tuneux_mediax::scan_pool::ScanEvent::Items(batch)) => {
+                        let was_idle = app.current_path.is_none();
                         drained += batch.len();
-                        app.playlist.add_many(batch);
+                        scan_added += if config.dedup_on_add {
+                            app.playlist.add_many_dedup(batch)
+                        } else {
+                            let count = batch.len();
+                            app.playlist.add_many(batch);
+                            count
+                        };
+                        if was_idle && app.playlist.current_index().is_none() {
+                            app.playlist.jump_to(0);
+                            app.handle_nav_outcome(playlist::NavOutcome::Switch(0), config, false);
+                        }
+                    }
+                    Some(tuneux_mediax::scan_pool::ScanEvent::CueError { path, message }) => {
+                        drained += 1;
+                        app.flash_message(&format!("{}：{message}", path.display()));
                     }
                     None => break,
                 }
             }
-            // 扫描完成时按专辑-曲序排序（与旧单线程版行为一致）
-            if app.scan_pool.pending() == 0 && drained > 0 {
-                let items = app.playlist.items_mut();
-                playlist::Playlist::sort_items(items);
+            if app.scan_pool.is_idle() && scan_added > 0 {
+                app.flash_message(
+                    &app.i18n
+                        .t("msg.added")
+                        .replace("{}", &scan_added.to_string()),
+                );
+                scan_added = 0;
             }
         }
-        if let Ok((dir, items, mds, skipped)) = app.add_load_rx.try_recv() {
-            app.apply_dir_add(dir, items, mds, skipped, config);
-        }
+        // 恢复期元数据后台回填：逐帧有界合入（与扫描池同款节流），只补缺失项
+        // ——启动恢复不再逐首同步 from_file（内含封面字节读取）阻塞数十秒。
+        app.drain_restore_metadata(64);
         // 播放列表行每帧只算一次，供滚动可见性校正与渲染共用（与 fx 同源）。
         let rows = app.playlist_rows();
         app.browser.ensure_visible(metrics.browser_visible_h);
@@ -262,10 +299,11 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>, config: &mut Config) ->
             .is_some_and(|e| e.poll_track_switched().is_some());
         if gapless_switched {
             app.consecutive_failures = 0;
-            // ReplayGain：无缝切曲也保存旧曲分析结果（引擎在切换时已写入）
+            // ReplayGain：无缝切曲也保存旧曲分析结果（引擎在切换时已写入）；
+            // 经 cache_replay_gain 走 LRU 上限，防止增益表无界累积。
             if let Some(db) = app.engine.as_ref().and_then(|e| e.take_measured_gain_db()) {
                 if let Some(path) = app.current_path.clone() {
-                    app.replay_gain_cache.insert(path, db);
+                    app.cache_replay_gain(path, db);
                 }
             }
             app.advance_ui_on_gapless(config);
@@ -276,7 +314,7 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>, config: &mut Config) ->
             app.consecutive_failures = 0;
             if let Some(db) = app.engine.as_ref().and_then(|e| e.take_measured_gain_db()) {
                 if let Some(path) = app.current_path.clone() {
-                    app.replay_gain_cache.insert(path, db);
+                    app.cache_replay_gain(path, db);
                 }
             }
         }
@@ -284,7 +322,7 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>, config: &mut Config) ->
             let outcome = app.playlist.next(config.repeat);
             match outcome {
                 playlist::NavOutcome::Switch(_) | playlist::NavOutcome::Repeat => {
-                    app.handle_nav_outcome(outcome, config);
+                    app.handle_nav_outcome(outcome, config, false);
                 }
                 playlist::NavOutcome::End => {
                     // 列表到尽头且关闭循环：什么都不做（流已自动暂停）
@@ -292,13 +330,12 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>, config: &mut Config) ->
             }
         }
         if got_failed {
-            app.consecutive_failures += 1;
-            if app.consecutive_failures >= 10 {
-                // 连续失败达到上限：停止自动跳曲，避免列表全损坏时无限循环刷屏。
-                let msg = app.i18n.t("msg.consecutive_fail").into_owned();
-                app.flash_message(&msg);
-                app.consecutive_failures = 0;
-            } else {
+            // 三端共用同一份失败决议（mediax），语义见其函数文档：
+            // 未达上限继续自动跳曲；达到上限计数饱和、停止自动跳曲。
+            let (count, keep_skipping) =
+                tuneux_mediax::advance_failure_count(app.consecutive_failures);
+            app.consecutive_failures = count;
+            if keep_skipping {
                 // 播放失败：强制跳下一首（单曲循环按"顺序"语义，不重复失败曲）。
                 // 错误提示已由 refresh_last_error 显示（"打开失败/解码错误"）。
                 let skip_repeat = if config.repeat == RepeatMode::Single {
@@ -308,8 +345,14 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>, config: &mut Config) ->
                 };
                 let outcome = app.playlist.next(skip_repeat);
                 if let playlist::NavOutcome::Switch(_) = outcome {
-                    app.handle_nav_outcome(outcome, config);
+                    app.handle_nav_outcome(outcome, config, false);
                 }
+            } else {
+                // 连续失败达到上限：真正停止自动跳曲，避免列表全损坏时
+                // 逐首尝试刷屏。计数保持在上限不清零——用户手动发起点播
+                // （play_and_update_current 的手动路径）才清零恢复。
+                let msg = app.i18n.t("msg.consecutive_fail").into_owned();
+                app.flash_message(&msg);
             }
         }
 
@@ -327,11 +370,12 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>, config: &mut Config) ->
                     .unwrap_or_default();
                 *title.lock().unwrap_or_else(|e| e.into_inner()) = title_str;
             }
-            while let Ok(ev) = handle.rx.try_recv() {
-                let action = ev.action().to_string();
-                if app.execute_action(&action, config) {
-                    // 动作已消费（播放/暂停/切曲）
-                }
+            // 洪泛防护：每轮至多消费 MEDIA_KEY_DRAIN_LIMIT 条，同类事件合并
+            //（连发音量加只执行一次），见 drain_media_key_events。
+            for action in
+                drain_media_key_events(&handle.rx, tuneux_commonx::media_key::MEDIA_KEY_DRAIN_LIMIT)
+            {
+                let _ = app.execute_action(action, config);
             }
         }
 
@@ -361,8 +405,42 @@ fn run(mut terminal: Terminal<CrosstermBackend<Stdout>>, config: &mut Config) ->
             last_save = std::time::Instant::now();
         }
     }
-    // 退出前保存播放列表 + 进度到独立文件 playlist.toml，下次启动自动恢复。
+    // 退出前保存播放列表 + 进度到独立文件 tuneux-playlist.toml，下次启动自动恢复。
+    // 先裁剪失效路径（断点与 ReplayGain 表按文件存在性清理，防删除文件后
+    // 跨会话无界累积）；启动侧 App::new 同样裁剪一次，双向兜底强杀场景。
+    app.playlist_state.prune_missing_files();
     app.save_playlist_to_state();
     config::save_playlist_state(&app.playlist_state);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 媒体键排空：单轮消费有界（洪泛不拖垮主循环）+ 同类事件合并
+    /// （每种动作只执行一次），剩余事件保留在通道供后续轮次消费。
+    #[test]
+    fn media_key_drain_caps_and_merges() {
+        use tuneux_commonx::media_key::MediaKeyEvent;
+        let (tx, rx) = crossbeam_channel::bounded(64);
+        // 交错投递事件：首轮 16 条内多类事件都出现，验证合并而非漏消费。
+        for _ in 0..20 {
+            tx.send(MediaKeyEvent::Next).unwrap();
+            tx.send(MediaKeyEvent::VolumeUp).unwrap();
+        }
+        tx.send(MediaKeyEvent::Prev).unwrap();
+        let actions = drain_media_key_events(&rx, tuneux_commonx::media_key::MEDIA_KEY_DRAIN_LIMIT);
+        assert_eq!(
+            actions,
+            vec!["next", "volume_up"],
+            "同类事件应合并为一次执行"
+        );
+        // 单轮只消费 16 条：41 - 16 = 25 条保留在通道，供后续轮次继续消费。
+        let mut remaining = 0;
+        while rx.try_recv().is_ok() {
+            remaining += 1;
+        }
+        assert_eq!(remaining, 25, "超出单轮上限的事件应保留到下一轮");
+    }
 }

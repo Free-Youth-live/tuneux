@@ -8,7 +8,7 @@
 [package]
 # 包名 tuneux-fx；可执行文件名 tuneux-fx
 name = "tuneux-fx"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 # 木兰宽松许可证 v2
 license = "MulanPSL-2.0"
@@ -26,13 +26,14 @@ path = "src/main.rs"
 tuneux-corex = { path = "../tuneux-corex" }
 # 共享媒体数据层（m3u / 书签等非音频、非 UI 领域逻辑）
 tuneux-mediax = { path = "../tuneux-mediax" }
+tuneux-displayx = { path = "../tuneux-displayx" }
 # 发行版通用机制：键位解析 / 配置路径 / 媒体键 / 目录浏览内核
 #（media-key：fx 需要系统媒体键，显式启用）
 tuneux-commonx = { path = "../tuneux-commonx", features = ["media-key"] }
 # 插件宿主运行时（WASM 控制面 + 能力仲裁）；加载第一方均衡器插件
 tuneux-pinx = { path = "../tuneux-pinx" }
 # 依赖版本统一由 workspace 根 [workspace.dependencies] 管理
-ratatui.workspace = true
+ratatui = { workspace = true, features = ["crossterm"] }
 unicode-width.workspace = true
 crossterm.workspace = true
 serde.workspace = true

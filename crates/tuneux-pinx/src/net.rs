@@ -108,7 +108,8 @@ pub struct Host {
 pub fn parse_url(url: &str, allow_plain_http: bool) -> Result<Host, UrlError> {
     // 1. scheme
     let (scheme, rest) = url.split_once("://").ok_or(UrlError::Malformed)?;
-    let scheme_ok = match scheme {
+    // RFC 3986：scheme 大小写不敏感。
+    let scheme_ok = match scheme.to_ascii_lowercase().as_str() {
         "https" => true,
         "http" => allow_plain_http,
         _ => false,
@@ -141,6 +142,12 @@ pub fn parse_url(url: &str, allow_plain_http: bool) -> Result<Host, UrlError> {
     if host_part.is_empty() {
         return Err(UrlError::Malformed);
     }
+    // 主机部分仍含 ':' = 多冒号结构（未加方括号的 IPv6 类形态，如 "::1"
+    // 拆出主机 ":"、端口 1）：合法 authority 至多一个 ':'（分隔端口），
+    // 其余形态一律结构非法——域名不可能含冒号。
+    if host_part.contains(':') {
+        return Err(UrlError::Malformed);
+    }
     // 6. 非 ASCII 主机（IDN 同形）拒绝
     if !host_part.is_ascii() {
         return Err(UrlError::NonAsciiHost);
@@ -156,8 +163,11 @@ pub fn parse_url(url: &str, allow_plain_http: bool) -> Result<Host, UrlError> {
     if name.is_empty() {
         return Err(UrlError::Malformed);
     }
-    // 8. IPv4 字面量拒绝（全数字与点的组合）
-    if name.chars().all(|c| c.is_ascii_digit() || c == '.') && name.contains('.') {
+    // 8. IP 字面量拒绝：标准库地址解析覆盖点分 IPv4 与（裸）IPv6；
+    // 十进制单数 IPv4（如 2130706433 → 127.0.0.1）与 0x 十六进制形态
+    // 标准库不解析，但 url 规范接受，用整数可解析性补判——纯数字主机名
+    // 本就不是合法域名（白名单只收域名）。
+    if is_ip_literal(&name) {
         return Err(UrlError::IpLiteralHost);
     }
     Ok(Host { name, port })
@@ -215,10 +225,29 @@ impl DomainWhitelist {
     }
 }
 
+/// 判定主机名是否为 IP 字面量（点分 IPv4 / 十进制·十六进制单数 IPv4 / IPv6）。
+///
+/// 标准库 `IpAddr::from_str` 覆盖点分 IPv4 与（裸/压缩）IPv6；单数 IPv4
+/// （`2130706433`）与 `0x` 十六进制形态是 WHATWG URL 规范接受的 IPv4
+/// 字面量，标准库不解析，用整数可解析性补判——纯数字主机名不是合法
+/// 域名，拒绝无副作用。
+fn is_ip_literal(name: &str) -> bool {
+    if name.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    if name.parse::<u32>().is_ok() {
+        return true;
+    }
+    if let Some(hex) = name.strip_prefix("0x") {
+        return u32::from_str_radix(hex, 16).is_ok();
+    }
+    false
+}
+
 /// 白名单条目规范化：小写、至多去一个尾点；非法形态返回 None。
 fn normalize_entry(entry: &str) -> Option<String> {
     let e = entry.trim();
-    if e.is_empty() || !e.is_ascii() || e.contains('@') {
+    if e.is_empty() || !e.is_ascii() || e.contains('@') || e.contains(':') {
         return None;
     }
     let mut name = e.to_ascii_lowercase();
@@ -231,10 +260,9 @@ fn normalize_entry(entry: &str) -> Option<String> {
     if name.is_empty() {
         return None;
     }
-    // IP 字面量不入白名单（与请求侧同口径）
-    if name.starts_with('[')
-        || (name.chars().all(|c| c.is_ascii_digit() || c == '.') && name.contains('.'))
-    {
+    // IP 字面量不入白名单（与请求侧同口径的 is_ip_literal 判定；
+    // 方括号形态虽不会出现在合法域名里，也一并拒绝防漏）。
+    if name.starts_with('[') || is_ip_literal(&name) {
         return None;
     }
     Some(name)
@@ -499,6 +527,27 @@ mod tests {
             parse_url("https://[::1]/", false),
             Err(UrlError::IpLiteralHost)
         );
+        // 十进制单数 IPv4 与 0x 十六进制形态（旧式启发只拦「全数字与点」
+        // 带点组合，这两类漏过预检）
+        assert_eq!(
+            parse_url("https://2130706433/", false),
+            Err(UrlError::IpLiteralHost)
+        );
+        assert_eq!(
+            parse_url("https://0x7f000001/", false),
+            Err(UrlError::IpLiteralHost)
+        );
+        // 裸 IPv6 不带方括号：多冒号结构在端口拆分后主机仍含 ':'，
+        // 按结构非法拒绝（域名不可能含冒号；带方括号形态在步骤 4 已拒）
+        assert_eq!(parse_url("https://::1/", false), Err(UrlError::Malformed));
+        assert_eq!(
+            parse_url("https://1:2:3:4:5:6:7:8/", false),
+            Err(UrlError::Malformed)
+        );
+        // 白名单条目同口径拒绝
+        assert_eq!(normalize_entry("2130706433"), None);
+        assert_eq!(normalize_entry("::1"), None);
+        assert_eq!(normalize_entry("0x7f000001"), None);
     }
 
     #[test]

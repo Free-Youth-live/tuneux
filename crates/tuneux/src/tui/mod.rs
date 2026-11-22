@@ -10,4 +10,5 @@
 //!   `render/popup.rs`（"关于"弹窗）中
 
 pub mod app;
+pub mod palette;
 pub mod render;

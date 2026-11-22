@@ -1,0 +1,22 @@
+# =============================================================================
+# tuneux-displayx · TUI 共享渲染层（lib）
+#
+# 版权所有 © 2026 不羁的青春（FreeYouth）
+# 本项目采用木兰宽松许可证，第 2 版（MulanPSL-2.0）开源。
+# =============================================================================
+
+[package]
+name = "tuneux-displayx"
+version = "0.1.0"
+edition = "2021"
+license = "MulanPSL-2.0"
+authors = ["不羁的青春（FreeYouth）"]
+description = "tuneux 基础版与 fx 的 TUI 共享渲染层"
+rust-version = "1.88"
+
+[dependencies]
+ratatui.workspace = true
+unicode-width.workspace = true
+
+[lints]
+workspace = true

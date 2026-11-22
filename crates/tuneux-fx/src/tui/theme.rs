@@ -2,9 +2,9 @@
 //!
 //! 界面配色 = 一份调色板数据（各界面角色的颜色 + 边框线型），本身不含
 //! 任何渲染逻辑；渲染层按调色板画。调色板只来自**皮肤插件**（插件向
-//! 宿主注册，插件只供色、不碰渲染）；无皮肤 / 未选皮肤时用内置默认
-//! [`Palette::default`]（DOS 风配色）；「终端原生配色」是选择器里的
-//! 独立项（[`Palette::terminal`]）。
+//! 宿主注册，插件只供色、不碰渲染）；无皮肤 / 未选皮肤时用内置藏青
+//! [`Palette::default`]（藏青配色）；终端原生观感由随包皮肤承担，
+//! [`Palette::terminal`] 同时作为皮肤解析的缺省基底。
 
 use ratatui::style::Color;
 use ratatui::widgets::BorderType;
@@ -54,15 +54,21 @@ pub struct Palette {
     pub band_high: Option<Color>,
     /// 频谱柱字符风格（皮肤键 `bar_style`）。
     pub bar_style: BarStyle,
+    /// 实心色块频谱（皮肤键 `block_spectrum`）。
+    pub block_spectrum: bool,
+    /// 单色封面渲染（皮肤键 `monochrome`）。
+    pub monochrome: bool,
+    /// 反射式 TFT 封面渲染（皮肤键 `dim_screen`）。
+    pub dim_screen: bool,
 }
 
 pub use tuneux_mediax::BarStyle;
 
 impl Default for Palette {
-    /// 内置默认：DOS 风配色（深蓝底 + 双线青框 + 灰字 + 灰底菜单栏 + 黄键号）。
+    /// 内置藏青：藏青配色（深蓝底 + 双线青框 + 灰字 + 灰底菜单栏 + 黄键号）。
     /// 这是无皮肤 / 未选皮肤时的开箱观感；频谱与电平表字段为 None = 各自
-    /// 内置默认（亮绿柱 / 白帽 / 深灰基线 / 绿黄红阈值）。「终端原生配色」
-    /// 由 [`Palette::terminal`] 承担（皮肤选择器里的独立项）。
+    /// 内置藏青（亮绿柱 / 白帽 / 深灰基线 / 绿黄红阈值）；终端原生观感由
+    /// 随包皮肤承担，不再另设同名内置选择项。
     fn default() -> Self {
         Self {
             bg: Some(Color::Rgb(16, 22, 58)),
@@ -84,13 +90,16 @@ impl Default for Palette {
             band_mid: None,
             band_high: None,
             bar_style: BarStyle::Matrix,
+            block_spectrum: false,
+            monochrome: false,
+            dim_screen: false,
         }
     }
 }
 
 impl Palette {
-    /// 终端原生配色（全 None 沿用终端默认色 + 单线框）。
-    /// 皮肤选择器清单里的「终端原生」项——给想跟随终端配色的用户留的退路。
+    /// 终端原生配色（全 None 沿用终端默认色 + 单线框），也是皮肤解析基底。
+    /// 选择器里的终端原生观感由随包皮肤提供。
     pub fn terminal() -> Self {
         Self {
             bg: None,
@@ -112,19 +121,47 @@ impl Palette {
             band_mid: None,
             band_high: None,
             bar_style: BarStyle::Matrix,
+            block_spectrum: false,
+            monochrome: false,
+            dim_screen: false,
         }
+    }
+
+    /// 按终端色深调整实际输出；皮肤文本解析仍保留原始 RGB 值。
+    pub fn for_terminal(mut self, is_truecolor: bool) -> Self {
+        if !is_truecolor {
+            let adapt = |color| tuneux_displayx::color_for_terminal(color, false);
+            self.bg = self.bg.map(adapt);
+            self.fg = self.fg.map(adapt);
+            self.border = self.border.map(adapt);
+            self.menu_bg = self.menu_bg.map(adapt);
+            self.menu_fg = self.menu_fg.map(adapt);
+            self.fkey_num = self.fkey_num.map(adapt);
+            self.bar_fg = self.bar_fg.map(adapt);
+            self.peak_fg = self.peak_fg.map(adapt);
+            self.grid_fg = self.grid_fg.map(adapt);
+            self.level_low = self.level_low.map(adapt);
+            self.level_mid = self.level_mid.map(adapt);
+            self.level_high = self.level_high.map(adapt);
+            self.band_low = self.band_low.map(adapt);
+            self.band_mid = self.band_mid.map(adapt);
+            self.band_high = self.band_high.map(adapt);
+            self.passthrough_fg = adapt(self.passthrough_fg);
+            self.resample_fg = adapt(self.resample_fg);
+        }
+        self
     }
 
     /// 从皮肤文本解析调色板（插件皮肤）。
     ///
     /// 格式：每行 `键=值`，`#` 开头为注释、空行忽略。颜色为 `#rrggbb`
     /// 十六进制、`none`（沿用终端默认）或具名色；未知键 / 非法值宽松忽略——
-    /// 坏皮肤不阻断插件加载，缺失字段回落中性默认（同 [`Palette::default`]）。
+    /// 坏皮肤不阻断插件加载，缺失字段回落终端原生基底（同 [`Palette::terminal`]）。
     /// 只要存在任意含 `=` 的行即视为皮肤已注册（返回 `Some`，哪怕全是
     /// 未知键）；文本完全无键值对（空 / 纯注释）才返回 `None`。
     pub fn from_skin(text: &str) -> Option<Self> {
         // 皮肤在终端原生底上覆盖（缺失字段 = 沿用终端默认）——与「默认项 =
-        // DOS 风」分离：默认观感由 Palette::default() 承担，皮肤只负责改色。
+        // 藏青回退」分离：内置回退由 Palette::default() 承担，皮肤只负责改色。
         let mut pal = Palette::terminal();
         let mut any = false;
         for line in text.lines() {
@@ -163,6 +200,9 @@ impl Palette {
                 "bar_style" => {
                     pal.bar_style = BarStyle::from_name(v).unwrap_or_default();
                 }
+                "block_spectrum" => pal.block_spectrum = parse_bool(v),
+                "monochrome" => pal.monochrome = parse_bool(v),
+                "dim_screen" => pal.dim_screen = parse_bool(v),
                 "passthrough" => {
                     if let Some(c) = parse_color(v) {
                         pal.passthrough_fg = c;
@@ -229,6 +269,39 @@ fn parse_color(v: &str) -> Option<Color> {
     })
 }
 
+/// 皮肤布尔键解析：大小写不敏感；`true/1/yes/on` 为真，其余（含未知值）为假。
+fn parse_bool(v: &str) -> bool {
+    matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on")
+}
+
+/// 将封面像素映射到主题，并按终端能力保留 RGB 或量化为 ANSI 16 色。
+pub fn cover_pixel(p: &Palette, r: u8, g: u8, b: u8, a: u8) -> Color {
+    cover_pixel_with_capability(p, r, g, b, a, tuneux_displayx::env_truecolor())
+}
+
+fn cover_pixel_with_capability(
+    p: &Palette,
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+    is_truecolor: bool,
+) -> Color {
+    tuneux_displayx::cover_pixel(
+        &tuneux_displayx::CoverStyle {
+            bg: p.bg,
+            fg: p.fg,
+            is_monochrome: p.monochrome,
+            is_dim_screen: p.dim_screen,
+            is_truecolor,
+        },
+        r,
+        g,
+        b,
+        a,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,8 +341,8 @@ mod tests {
     #[test]
     fn skin_name_extraction() {
         assert_eq!(
-            skin_name("name=午夜蓝\nbg=#000000\n"),
-            Some("午夜蓝".to_string())
+            skin_name("name=深蓝\nbg=#000000\n"),
+            Some("深蓝".to_string())
         );
         assert_eq!(skin_name("bg=#000000\n"), None);
         assert_eq!(skin_name("name=\n"), None);
@@ -300,8 +373,36 @@ mod tests {
     }
 
     #[test]
-    fn default_is_dos_style() {
-        // 内置默认 = DOS 风配色（v0.5.0 观感）：深蓝底 + 双线青框 + 黄键号。
+    fn from_skin_parses_display_flags() {
+        let mono =
+            Palette::from_skin("bg=#ffffff\nfg=#000000\nmonochrome=true\nblock_spectrum=true\n")
+                .expect("单色皮肤");
+        assert!(mono.monochrome && mono.block_spectrum);
+        assert!(!mono.dim_screen);
+        assert_eq!(
+            cover_pixel_with_capability(&mono, 10, 20, 30, 0, true),
+            mono.bg.unwrap_or(Color::Black)
+        );
+
+        let dim =
+            Palette::from_skin("bg=#9ca494\nfg=#2d352d\ndim_screen=true\n").expect("暗彩皮肤");
+        assert!(dim.dim_screen);
+        match cover_pixel_with_capability(&dim, 0, 0, 0, 255, true) {
+            Color::Rgb(r, g, b) => {
+                assert!(r > 40 && g > 40 && b > 40, "反射式封面应抬高黑位");
+                assert!(g >= r && g >= b, "黑位应带灰绿调");
+            }
+            _ => panic!("反射式封面应为 Rgb"),
+        }
+        assert_eq!(
+            cover_pixel_with_capability(&dim, 200, 100, 50, 0, true),
+            dim.bg.unwrap_or(Color::Black)
+        );
+    }
+
+    #[test]
+    fn default_is_navy_style() {
+        // 内置藏青 = 藏青配色（v0.5.0 观感）：深蓝底 + 双线青框 + 黄键号。
         let pal = Palette::default();
         assert_eq!(pal.bg, Some(Color::Rgb(16, 22, 58)));
         assert_eq!(pal.fg, Some(Color::Gray));
@@ -312,9 +413,43 @@ mod tests {
         assert_eq!(pal.fkey_num, Some(Color::Yellow));
         assert_eq!(pal.passthrough_fg, Color::White);
         assert_eq!(pal.resample_fg, Color::DarkGray);
-        // 频谱 / 电平表为 None = 内置默认（亮绿柱 / 白帽 / 绿黄红阈值）。
+        // 频谱 / 电平表为 None = 内置藏青（亮绿柱 / 白帽 / 绿黄红阈值）。
         assert_eq!(pal.bar_fg, None);
         assert_eq!(pal.bar_style, BarStyle::Matrix);
+    }
+
+    #[test]
+    fn terminal_fallback_quantizes_every_rgb_role() {
+        let original = Palette::from_skin(
+            "bg=#9ca494\nfg=#2d352d\nbar_fg=#41706c\nlevel_mid=#9a8a3a\nlevel_high=#a04038\n",
+        )
+        .expect("皮肤");
+        let pal = original.for_terminal(false);
+        let optional = [
+            pal.bg,
+            pal.fg,
+            pal.border,
+            pal.menu_bg,
+            pal.menu_fg,
+            pal.fkey_num,
+            pal.bar_fg,
+            pal.peak_fg,
+            pal.grid_fg,
+            pal.level_low,
+            pal.level_mid,
+            pal.level_high,
+            pal.band_low,
+            pal.band_mid,
+            pal.band_high,
+        ];
+        for color in optional
+            .into_iter()
+            .flatten()
+            .chain([pal.passthrough_fg, pal.resample_fg])
+        {
+            assert!(!matches!(color, Color::Rgb(..)), "仍输出 RGB：{color:?}");
+        }
+        assert_eq!(original.for_terminal(true), original, "真彩保持原色");
     }
 
     #[test]

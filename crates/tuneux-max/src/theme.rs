@@ -1,474 +1,531 @@
-//! # 新 UI 主题：调色板 + 视觉下发 + 字体链
+//! # 主题：终端原生 + 皮肤插件
 //!
-//! 视觉基准 = tuneux-fx：默认主题为 fx 开箱的 DOS 风（深蓝底、青框、
-//! 灰字、黄键号、亮绿频谱、白峰帽）；另备纯终端黑白「term」。
+//! 默认是「终端原生」：不铺品牌底色、跟随系统深浅色，选中反白。
+//! 皮肤插件（WASM，theme 能力）注册的调色板文本可切换为显式配色；
+//! 两者共用同一套取色令牌 [`Palette`]。
 //!
-//! 纪律：调色板是唯一色彩来源——渲染层只读 Palette 字段取色，
-//! 不得私藏硬编码色（语义阈值色 level_* 也入板）。
-//!
-//! 字体：内置 Sarasa Mono SC（assets/SarasaMonoSC-Regular.ttf，
-//! v1.0.42 官方原件，OFL）作主字体，系统字体二级回退；Proportional /
-//! Monospace 两族都挂（egui 默认只带拉丁字体，不挂 CJK 回退中文全是
-//! 豆腐块）。用户可向 fonts/ 目录投放自定义字体，经字体菜单切换。
+//! 参考共享 UI 骨架的做法：主题**双槽位**写入（Dark/Light 各一套）。
 
-use eframe::egui::{self, Color32, CornerRadius, Stroke};
+use std::sync::Mutex;
 
-/// 新 UI 调色板（egui 色彩空间）。
-#[derive(Debug, Clone, PartialEq)]
-pub struct Palette {
-    /// 窗口/面板底色。
-    pub bg: Color32,
-    /// 沉下面板色（菜单栏/功能键栏底）。
-    pub panel_bg: Color32,
-    /// 正文字色。
-    pub fg: Color32,
-    /// 弱字色（提示/次级/菜单数字前缀）。
-    pub fg_weak: Color32,
-    /// 强调色（焦点边框/当前曲目/功能键号/选中悬停）。
-    pub accent: Color32,
-    /// 悬停底色。
-    pub sel_bg: Color32,
-    /// 非焦点边框色。
-    pub border: Color32,
-    /// 网格/空位点色。
-    pub grid: Color32,
-    /// 频谱柱/三桶能量色。
-    pub spec_bar: Color32,
-    /// 频谱峰值白帽色。
-    pub peak_fg: Color32,
-    /// 直通语义色（亮）。
-    pub pass_fg: Color32,
-    /// 降级语义色（暗）。
-    pub resample_fg: Color32,
-    /// 电平阈值色：<60%。
-    pub level_low: Color32,
-    /// 电平阈值色：60–85%。
-    pub level_mid: Color32,
-    /// 电平阈值色：≥85%。
-    pub level_high: Color32,
-    /// 可视化字符池风格（皮肤 bar_style 键；默认 Matrix 细字雨）。
-    pub bar_style: tuneux_mediax::BarStyle,
-    /// 面板框饰风格：true = TUI 制框（标题嵌上边线、底色断线的
-    /// ratatui Block 风）；false = GUI 头部条（完整边框 + panel_bg
-    /// 标题带，彻底去 TUI 观感）。dos/term 与皮肤插件为 true；
-    /// 经典浅色系为 false。
-    pub tui_chrome: bool,
-}
+use eframe::egui::{self, Color32, Stroke, Theme, ThemePreference, Visuals};
+use tuneux_mediax::BarStyle;
 
-impl Default for Palette {
-    /// 默认 = fx 开箱 DOS 风（深蓝底 + 青框 + 灰字 + 黄强调）。
-    fn default() -> Self {
-        Self {
-            bg: Color32::from_rgb(16, 22, 58),
-            panel_bg: Color32::from_rgb(12, 17, 45),
-            fg: Color32::from_rgb(192, 192, 192),
-            fg_weak: Color32::from_rgb(120, 122, 150),
-            accent: Color32::from_rgb(255, 255, 85),
-            sel_bg: Color32::from_rgb(40, 50, 120),
-            border: Color32::from_rgb(0, 200, 220),
-            grid: Color32::from_rgb(90, 92, 120),
-            spec_bar: Color32::from_rgb(144, 238, 144),
-            peak_fg: Color32::WHITE,
-            pass_fg: Color32::WHITE,
-            resample_fg: Color32::from_rgb(105, 105, 105),
-            level_low: Color32::from_rgb(80, 200, 80),
-            level_mid: Color32::from_rgb(220, 200, 80),
-            level_high: Color32::from_rgb(230, 80, 80),
-            bar_style: tuneux_mediax::BarStyle::Matrix,
-            tui_chrome: true,
-        }
-    }
-}
+/// 当前生效的皮肤（全局，供渲染层取色；`None` = 终端原生）。
+static SKIN: Mutex<Option<Skin>> = Mutex::new(None);
 
-/// 按 id 取内置主题；未知 id 返回 None（调用方回退默认）。
-pub fn builtin(id: &str) -> Option<Palette> {
-    match id {
-        "dos" => Some(Palette::default()),
-        // 纯终端黑白：与终端原生配色观感一致。
-        "term" => Some(Palette {
-            bg: Color32::from_rgb(12, 12, 12),
-            panel_bg: Color32::from_rgb(17, 17, 17),
-            fg: Color32::from_rgb(204, 204, 204),
-            fg_weak: Color32::from_rgb(118, 118, 118),
-            accent: Color32::from_rgb(86, 156, 214),
-            sel_bg: Color32::from_rgb(0, 55, 218),
-            border: Color32::from_rgb(118, 118, 118),
-            grid: Color32::from_rgb(51, 51, 51),
-            spec_bar: Color32::from_rgb(204, 204, 204),
-            peak_fg: Color32::WHITE,
-            pass_fg: Color32::WHITE,
-            resample_fg: Color32::from_rgb(105, 105, 105),
-            ..Palette::default()
-        }),
-        // 经典暗色风格：Win 经典浅灰底 + 蓝色高亮（亮色皮肤；
-        // apply_visuals 按底色亮度自动切换亮/暗控件基底）。
-        // 经典暗色风格：近黑底、
-        // 浅灰字、蓝色强调/分组头、银灰反色选中、列头带、技术状态栏、
-        // 频谱坐标轴——结构特征全部调色板驱动，dos/term 不受影响。
-        "classic-dark" => Some(Palette {
-            bg: Color32::from_rgb(28, 28, 28),
-            panel_bg: Color32::from_rgb(38, 38, 38),
-            fg: Color32::from_rgb(214, 214, 214),
-            fg_weak: Color32::from_rgb(138, 138, 138),
-            accent: Color32::from_rgb(91, 155, 213),
-            sel_bg: Color32::from_rgb(52, 52, 52),
-            border: Color32::from_rgb(74, 74, 74),
-            grid: Color32::from_rgb(58, 58, 58),
-            spec_bar: Color32::from_rgb(74, 159, 216),
-            peak_fg: Color32::from_rgb(224, 224, 224),
-            pass_fg: Color32::from_rgb(120, 200, 120),
-            resample_fg: Color32::from_rgb(130, 130, 130),
-            level_low: Color32::from_rgb(80, 200, 80),
-            level_mid: Color32::from_rgb(220, 200, 80),
-            level_high: Color32::from_rgb(230, 80, 80),
-            bar_style: tuneux_mediax::BarStyle::Matrix,
-            tui_chrome: false,
-        }),
-        // 经典浅色：Win32 经典控件风——
-        // 白色播放列表为主体、#F0F0F0 经典 3D 面板灰作工具/沉底、深蓝强调、
-        // 淡蓝选中（经典“选中但未聚焦”色）、绿色频谱柱。亮色皮肤，
-        // apply_visuals 按底色亮度自动切亮色控件基底，与经典暗色互为表里；
-        // dos/term 不受影响。
-        "classic-light" => Some(Palette {
-            bg: Color32::from_rgb(255, 255, 255),
-            panel_bg: Color32::from_rgb(240, 240, 240),
-            fg: Color32::from_rgb(0, 0, 0),
-            fg_weak: Color32::from_rgb(128, 128, 128),
-            accent: Color32::from_rgb(0, 60, 143),
-            sel_bg: Color32::from_rgb(192, 216, 240),
-            border: Color32::from_rgb(160, 160, 160),
-            grid: Color32::from_rgb(212, 208, 200),
-            spec_bar: Color32::from_rgb(46, 158, 68),
-            peak_fg: Color32::from_rgb(128, 128, 128),
-            pass_fg: Color32::from_rgb(0, 128, 0),
-            resample_fg: Color32::from_rgb(128, 128, 128),
-            level_low: Color32::from_rgb(0, 160, 0),
-            level_mid: Color32::from_rgb(192, 160, 0),
-            level_high: Color32::from_rgb(208, 0, 0),
-            bar_style: tuneux_mediax::BarStyle::Blocks,
-            tui_chrome: false,
-        }),
-        // 科技深色：电光青强调 + 冷灰蓝底。
-        "tech-dark" => Some(Palette {
-            bg: Color32::from_rgb(26, 29, 36),
-            panel_bg: Color32::from_rgb(20, 22, 28),
-            fg: Color32::from_rgb(220, 224, 232),
-            fg_weak: Color32::from_rgb(107, 114, 128),
-            accent: Color32::from_rgb(0, 212, 255),
-            sel_bg: Color32::from_rgb(0, 45, 68),
-            border: Color32::from_rgb(42, 46, 56),
-            grid: Color32::from_rgb(38, 42, 52),
-            spec_bar: Color32::from_rgb(0, 180, 220),
-            peak_fg: Color32::WHITE,
-            pass_fg: Color32::from_rgb(144, 238, 144),
-            resample_fg: Color32::from_rgb(80, 86, 96),
-            level_low: Color32::from_rgb(0, 200, 100),
-            level_mid: Color32::from_rgb(255, 179, 0),
-            level_high: Color32::from_rgb(255, 61, 61),
-            bar_style: tuneux_mediax::BarStyle::Matrix,
-            tui_chrome: false,
-        }),
-        _ => None,
-    }
-}
-
-/// 内置主题目录（id, 显示名）——皮肤选择菜单用；显示名为专名不译。
-pub fn builtin_list() -> [(&'static str, &'static str); 5] {
-    [
-        ("dos", "fx DOS"),
-        ("term", "Terminal"),
-        ("classic-dark", "经典暗色"),
-        ("classic-light", "经典浅色"),
-        ("tech-dark", "科技深色"),
-    ]
-}
-
-/// 皮肤默认模块集（结构模块开关）：dos/term = fx 极简集（全关，
-/// 开箱即 fx 观感）；经典双肤 = 现代 GUI 集（全开）。用户经右键/菜单的
-/// 加装记录存配置 mod_over（按皮肤分桶），换肤自动套用该皮肤默认+覆盖。
-pub fn default_modules(id: &str) -> &'static [(&'static str, bool)] {
-    match id {
-        // 经典双肤同默认集：现代 GUI 结构模块全开
-        "classic-dark" | "classic-light" | "tech-dark" => &[
-            ("transport", true),
-            ("col_header", true),
-            ("status_tech", true),
-            ("spec_axis", true),
-            ("group_rule", true),
-            ("group_covers", true),
-        ],
-        _ => &[
-            ("transport", false),
-            ("col_header", false),
-            ("status_tech", false),
-            ("spec_axis", false),
-            ("group_rule", false),
-            ("group_covers", false),
-        ],
-    }
-}
-
-/// 解析皮肤色值：#rrggbb（ASCII 先行校验——多字节字符可拼出恰好
-/// 6 字节，字节切片会落在字符边界中间；非 ASCII 一律宽松忽略）。
-/// 值 none = 不覆盖该键（保持基底）。
-fn parse_color(v: &str) -> Option<Color32> {
-    let hex = v.strip_prefix('#')?;
-    if hex.len() == 6 && hex.is_ascii() {
-        let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-        let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-        let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-        Some(Color32::from_rgb(r, g, b))
-    } else {
-        None
-    }
-}
-
-/// 从皮肤文本构建调色板（fx 皮肤键规范、term 基底覆盖式——皮肤文件
-/// 两端通用）。max 侧映射：menu_bg→panel_bg、menu_fg→fg、
-/// fkey_num→accent、bar_fg→spec_bar、grid_fg→grid、passthrough→
-/// pass_fg、resample→resample_fg、sel_bg→sel_bg；border_type /
-/// bar_style / band_* 为 TUI 专有键，忽略。
-pub fn from_skin(text: &str) -> Option<Palette> {
-    let mut pal = builtin("term")?;
-    let mut any = false;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((k, v)) = line.split_once('=') else {
-            continue;
-        };
-        let (k, v) = (k.trim(), v.trim());
-        if let Some(c) = parse_color(v) {
-            any = true;
-            match k {
-                "bg" => pal.bg = c,
-                "fg" => pal.fg = c,
-                "border" => pal.border = c,
-                "menu_bg" => pal.panel_bg = c,
-                "menu_fg" => pal.fg = c,
-                "fkey_num" => pal.accent = c,
-                "bar_fg" => pal.spec_bar = c,
-                "peak_fg" => pal.peak_fg = c,
-                "grid_fg" => pal.grid = c,
-                "level_low" => pal.level_low = c,
-                "level_mid" => pal.level_mid = c,
-                "level_high" => pal.level_high = c,
-                "passthrough" => pal.pass_fg = c,
-                "resample" => pal.resample_fg = c,
-                "sel_bg" => pal.sel_bg = c,
-                _ => {}
-            }
-        } else if k == "bar_style" {
-            // 字符池风格（非色值；fx 皮肤同键同语义）
-            if let Some(bs) = tuneux_mediax::BarStyle::from_name(v) {
-                pal.bar_style = bs;
-                any = true;
-            }
-        }
-    }
-    any.then_some(pal)
-}
-
-/// 从皮肤文本提取皮肤名（name= 行；缺省 None 由调用方兜底文件名）。
-pub fn skin_name(text: &str) -> Option<String> {
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(v) = line.strip_prefix("name=") {
-            let v = v.trim();
-            if !v.is_empty() {
-                return Some(v.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// 调色板 → egui Visuals（每帧下发，主题切换即时生效）。
-pub fn apply_visuals(ctx: &egui::Context, pal: &Palette) {
-    // 亮/暗基底按底色亮度选（classic = 亮色，dos/term = 暗色）
-    let lum = (pal.bg.r() as u32 * 299 + pal.bg.g() as u32 * 587 + pal.bg.b() as u32 * 114) / 1000;
-    let mut v = if lum > 140 {
-        egui::Visuals::light()
-    } else {
-        egui::Visuals::dark()
-    };
-    let square = CornerRadius::same(0);
-    v.panel_fill = pal.bg;
-    v.window_fill = pal.panel_bg;
-    v.extreme_bg_color = pal.panel_bg;
-    v.faint_bg_color = pal.panel_bg;
-    v.override_text_color = Some(pal.fg);
-    v.weak_text_color = Some(pal.fg_weak);
-    v.window_corner_radius = square;
-    v.menu_corner_radius = square;
-    v.selection.bg_fill = pal.sel_bg.linear_multiply(0.6);
-    v.selection.stroke = Stroke::new(1.0_f32, pal.accent);
-    // 扁平 TUI：去全部浮影；窗/弹层描边统一为调色板边框色
-    v.window_shadow = egui::epaint::Shadow::NONE;
-    v.popup_shadow = egui::epaint::Shadow::NONE;
-    v.window_stroke = Stroke::new(1.0_f32, pal.border);
-    for w in [
-        &mut v.widgets.noninteractive,
-        &mut v.widgets.inactive,
-        &mut v.widgets.hovered,
-        &mut v.widgets.active,
-        &mut v.widgets.open,
-    ] {
-        w.corner_radius = square;
-        w.bg_fill = Color32::TRANSPARENT;
-        w.bg_stroke = Stroke::NONE;
-        w.fg_stroke = Stroke::new(1.0_f32, pal.fg);
-    }
-    v.widgets.hovered.bg_fill = pal.sel_bg;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, pal.accent);
-    v.widgets.active.bg_fill = pal.sel_bg;
-    v.widgets.open.bg_fill = pal.panel_bg;
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, pal.fg_weak);
-    ctx.set_visuals(v);
-}
-
-/// 内置主字体：Sarasa Mono SC Regular（更纱黑体·等宽简体）。
-/// v1.0.42 官方发布原件（SHA-256 82e09460f6f55010…，24.4MB 未子集化）；
-/// 拉丁出自 Iosevka、CJK 出自思源黑体，半角/全角宽度严格 2:1。
-pub static EMBEDDED_CJK_FONT: &[u8] = include_bytes!("../assets/SarasaMonoSC-Regular.ttf");
-
-/// 内置字体的显示名。
-pub const EMBEDDED_FONT_NAME: &str = "Sarasa Mono SC";
-
-/// 一个可用字体（显示名 + 字体文件字节）。
-pub struct FontEntry {
-    /// 显示名（内置名或文件名主干）。
+/// 一套皮肤配色（插件文本解析结果；缺省字段沿用默认）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Skin {
+    /// 显示名（`name=` 键；缺省用插件文件名兜底）。
     pub name: String,
-    /// 字体文件内容。
-    pub data: Vec<u8>,
+    /// 面板底色。
+    pub bg: Option<Color32>,
+    /// 正文色。
+    pub fg: Option<Color32>,
+    /// 边框色。
+    pub border: Option<Color32>,
+    /// 菜单/浮层底色。
+    pub menu_bg: Option<Color32>,
+    /// 菜单文字。
+    pub menu_fg: Option<Color32>,
+    /// 快捷键键名色。
+    pub key: Option<Color32>,
+    /// 直通技术参数色。
+    pub passthrough: Option<Color32>,
+    /// 次要文字 / 降级参数色。
+    pub dim: Option<Color32>,
+    /// 频谱柱体色。
+    pub bar: Option<Color32>,
+    /// 频谱峰值帽色。
+    pub peak: Option<Color32>,
+    /// 电平低档色。
+    pub level_low: Option<Color32>,
+    /// 电平中档色。
+    pub level_mid: Option<Color32>,
+    /// 电平高档色。
+    pub level_high: Option<Color32>,
+    /// 频段低频桶色。
+    pub band_low: Option<Color32>,
+    /// 频段中频桶色。
+    pub band_mid: Option<Color32>,
+    /// 频段高频桶色。
+    pub band_high: Option<Color32>,
+    /// 频谱基线 / 空位弱色。
+    pub grid: Option<Color32>,
+    /// 频谱柱字符风格（皮肤键 `bar_style`，非法回落 Matrix）。
+    pub bar_style: BarStyle,
+    /// 频谱实心色块模式（皮肤键 `block_spectrum`，单色皮肤启用）。
+    pub block_spectrum: bool,
 }
 
-/// 字体目录扫描位置：exe 同目录 fonts/（bundle 口径）+ 用户配置目录
-/// fonts/（安装到只读位置时的用户扩展口径）。将来新增字体 = 丢一个
-/// .ttf/.otf 进目录，菜单自动出现，无需改代码重编译。
-fn font_dirs() -> Vec<std::path::PathBuf> {
-    let mut dirs = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(d) = exe.parent() {
-            dirs.push(d.join("fonts"));
-        }
-    }
-    if let Some(d) = dirs::data_dir() {
-        dirs.push(d.join("tuneux-max").join("fonts"));
-    }
-    dirs
-}
-
-/// 字体目录：内置 Sarasa Mono SC 恒在首位，随后是 fonts/ 目录扫描结果（按名排序）。
-/// 损坏 / 不可读的文件静默跳过（字体缺失不致命，回退内置）。
-pub fn font_catalog() -> Vec<FontEntry> {
-    let mut out = vec![FontEntry {
-        name: EMBEDDED_FONT_NAME.to_string(),
-        data: EMBEDDED_CJK_FONT.to_vec(),
-    }];
-    let mut file_fonts: Vec<FontEntry> = Vec::new();
-    for dir in font_dirs() {
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
+impl Skin {
+    /// 解析皮肤插件注册的调色板文本（`key=value` 行）。
+    ///
+    /// 未知键忽略；`bar_style` 经风格名解析（非法回落 Matrix）、
+    /// `block_spectrum` 按布尔解析；一个可识别键都没有时返回 `None`。
+    pub fn parse(text: &str, fallback_name: &str) -> Option<Self> {
+        let mut skin = Skin {
+            name: fallback_name.to_string(),
+            bg: None,
+            fg: None,
+            border: None,
+            menu_bg: None,
+            menu_fg: None,
+            key: None,
+            passthrough: None,
+            dim: None,
+            bar: None,
+            peak: None,
+            level_low: None,
+            level_mid: None,
+            level_high: None,
+            band_low: None,
+            band_mid: None,
+            band_high: None,
+            grid: None,
+            bar_style: BarStyle::default(),
+            block_spectrum: false,
         };
-        for e in rd.flatten() {
-            let p = e.path();
-            let is_font = p
-                .extension()
-                .and_then(|x| x.to_str())
-                .is_some_and(|x| matches!(x.to_ascii_lowercase().as_str(), "ttf" | "otf"));
-            if !is_font {
+        let mut any = false;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+            let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
-            if let Ok(data) = std::fs::read(&p) {
-                file_fonts.push(FontEntry {
-                    name: stem.to_string(),
-                    data,
-                });
+            let key = key.trim();
+            let value = value.trim();
+            let parsed = parse_color(value);
+            match key {
+                "name" => {
+                    if !value.is_empty() {
+                        skin.name = value.to_string();
+                        any = true;
+                    }
+                }
+                "bg" => {
+                    skin.bg = parsed;
+                    any = true;
+                }
+                "fg" => {
+                    skin.fg = parsed;
+                    any = true;
+                }
+                "border" => {
+                    skin.border = parsed;
+                    any = true;
+                }
+                "menu_bg" => {
+                    skin.menu_bg = parsed;
+                    any = true;
+                }
+                "menu_fg" => {
+                    skin.menu_fg = parsed;
+                    any = true;
+                }
+                "fkey_num" => {
+                    skin.key = parsed;
+                    any = true;
+                }
+                "passthrough" => {
+                    skin.passthrough = parsed;
+                    any = true;
+                }
+                "resample" => {
+                    skin.dim = parsed;
+                    any = true;
+                }
+                "bar_fg" => {
+                    skin.bar = parsed;
+                    any = true;
+                }
+                "peak_fg" => {
+                    skin.peak = parsed;
+                    any = true;
+                }
+                "grid_fg" => {
+                    skin.grid = parsed;
+                    any = true;
+                }
+                "bar_style" => {
+                    skin.bar_style = BarStyle::from_name(value).unwrap_or_default();
+                    any = true;
+                }
+                "block_spectrum" => {
+                    skin.block_spectrum = parse_bool(value);
+                    any = true;
+                }
+                "level_low" => {
+                    skin.level_low = parsed;
+                    any = true;
+                }
+                "level_mid" => {
+                    skin.level_mid = parsed;
+                    any = true;
+                }
+                "level_high" => {
+                    skin.level_high = parsed;
+                    any = true;
+                }
+                "band_low" => {
+                    skin.band_low = parsed;
+                    any = true;
+                }
+                "band_mid" => {
+                    skin.band_mid = parsed;
+                    any = true;
+                }
+                "band_high" => {
+                    skin.band_high = parsed;
+                    any = true;
+                }
+                _ => {}
             }
         }
+        any.then_some(skin)
     }
-    file_fonts.sort_by(|a, b| a.name.cmp(&b.name));
-    out.extend(file_fonts);
-    out
+
+    /// 由皮肤推导取色令牌。
+    pub fn palette(&self) -> Palette {
+        let bg = self.bg.unwrap_or(Color32::BLACK);
+        let fg = self.fg.unwrap_or(Color32::WHITE);
+        let bar = self.bar.unwrap_or(fg);
+        let dim = self
+            .dim
+            .or(self.menu_fg)
+            .unwrap_or(fg.gamma_multiply(0.6_f32));
+        Palette {
+            bg,
+            fg,
+            dim,
+            border: self.border.unwrap_or(fg),
+            bar,
+            peak: self.peak.unwrap_or(fg),
+            level_low: self.level_low.unwrap_or(bar),
+            level_mid: self.level_mid.unwrap_or(fg),
+            level_high: self.level_high.unwrap_or(fg),
+            // 频段三桶色缺省回落柱体色（再缺省正文色），与 fx 同口径。
+            band_low: self.band_low.unwrap_or(bar),
+            band_mid: self.band_mid.unwrap_or(bar),
+            band_high: self.band_high.unwrap_or(bar),
+            // 基线 / 空位弱色缺省回落次要文字色。
+            grid: self.grid.unwrap_or(dim),
+            bar_style: self.bar_style,
+            block_spectrum: self.block_spectrum,
+            sel_bg: fg,
+            sel_fg: bg,
+        }
+    }
 }
 
-/// 以给定字体数据构建字体定义（主字体 = data，内置面退居回退）。
-pub fn build_fonts_with(data: &[u8]) -> egui::FontDefinitions {
-    let mut defs = egui::FontDefinitions::default();
-    defs.font_data.insert(
-        "app-cjk".to_owned(),
-        std::sync::Arc::new(egui::FontData::from_owned(data.to_vec())),
-    );
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        let list = defs.families.entry(family).or_default();
-        // app-cjk = 当前主字体槽位名；wqy-cjk 为旧内置名的遗留防御性过滤
-        list.retain(|n| n != "app-cjk" && n != "wqy-cjk");
-        list.insert(0, "app-cjk".to_owned());
-    }
-    defs
+/// 当前主题的取色令牌。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Palette {
+    /// 面板底色。
+    pub bg: Color32,
+    /// 正文/边框主色。
+    pub fg: Color32,
+    /// 次要文字。
+    pub dim: Color32,
+    /// 面板边框色。
+    pub border: Color32,
+    /// 频谱柱体色。
+    pub bar: Color32,
+    /// 频谱峰值帽色。
+    pub peak: Color32,
+    /// 电平低档色。
+    pub level_low: Color32,
+    /// 电平中档色。
+    pub level_mid: Color32,
+    /// 电平高档色。
+    pub level_high: Color32,
+    /// 频段低频桶色。
+    pub band_low: Color32,
+    /// 频段中频桶色。
+    pub band_mid: Color32,
+    /// 频段高频桶色。
+    pub band_high: Color32,
+    /// 频谱基线 / 空位弱色。
+    pub grid: Color32,
+    /// 频谱柱字符风格。
+    pub bar_style: BarStyle,
+    /// 频谱实心色块模式。
+    pub block_spectrum: bool,
+    /// 选中行底色（反白：等于主色）。
+    pub sel_bg: Color32,
+    /// 选中行文字色（反白：等于底色）。
+    pub sel_fg: Color32,
 }
 
-/// 构建字体定义：Sarasa Mono SC 为两族**主字体**，系统面退居回退。
-///
-/// 主副次序是列对齐的关键：全部字形（拉丁 + CJK）统一出自更纱等宽面，
-/// 其 CJK 字宽 = 2×拉丁字宽严格成立，按显示宽度补空格的列才能像素级对齐
-/// （真 TUI 规整感）。若拉丁走 Hack、CJK 走回退，两面字宽比不是精确 2:1，
-/// 混排行必然错位——早期实测踩坑，勿回退主副次序。
-pub fn build_fonts() -> egui::FontDefinitions {
-    build_fonts_with(EMBEDDED_CJK_FONT)
+impl Palette {
+    /// 从一组 `Visuals` 推导令牌（终端原生主题）。
+    pub fn from_visuals(visuals: &Visuals) -> Self {
+        let fg = visuals.widgets.noninteractive.fg_stroke.color;
+        Self {
+            bg: visuals.panel_fill,
+            fg,
+            dim: fg.gamma_multiply(0.6_f32),
+            border: fg,
+            bar: fg,
+            peak: fg,
+            level_low: fg,
+            level_mid: fg,
+            level_high: fg,
+            band_low: fg,
+            band_mid: fg,
+            band_high: fg,
+            grid: fg.gamma_multiply(0.6_f32),
+            bar_style: BarStyle::default(),
+            block_spectrum: false,
+            sel_bg: fg,
+            sel_fg: visuals.panel_fill,
+        }
+    }
+
+    /// 当前上下文的取色令牌（皮肤优先，其次终端原生）。
+    pub fn current(ctx: &egui::Context) -> Self {
+        match active_skin() {
+            Some(skin) => skin.palette(),
+            None => Self::from_visuals(&ctx.style().visuals),
+        }
+    }
+}
+
+/// 当前生效皮肤（克隆快照）。
+pub fn active_skin() -> Option<Skin> {
+    SKIN.lock().ok().and_then(|guard| guard.clone())
+}
+
+/// 构造指定深浅档位的终端原生 `Visuals`（纯函数，可单测）。
+pub fn terminal_visuals(mode: Theme) -> Visuals {
+    let mut visuals = match mode {
+        Theme::Dark => Visuals::dark(),
+        Theme::Light => Visuals::light(),
+    };
+    let text = visuals.widgets.noninteractive.fg_stroke.color;
+    // 选中反白：底色取前景色、描边取面板底色（与终端反白同义）。
+    visuals.selection.bg_fill = text;
+    visuals.selection.stroke = Stroke::new(1.0_f32, visuals.panel_fill);
+    visuals
+}
+
+/// 应用终端原生主题：两槽位写入 + 跟随系统深浅色。
+pub fn apply(ctx: &egui::Context) {
+    if let Ok(mut guard) = SKIN.lock() {
+        *guard = None;
+    }
+    ctx.set_visuals_of(Theme::Dark, terminal_visuals(Theme::Dark));
+    ctx.set_visuals_of(Theme::Light, terminal_visuals(Theme::Light));
+    ctx.set_theme(ThemePreference::System);
+}
+
+/// 应用皮肤：两槽位写入同一套显式配色，并登记为当前皮肤。
+pub fn apply_skin(ctx: &egui::Context, skin: &Skin) {
+    // 「终端原生」皮肤插件只写 none（跟随终端默认）：不铺显式底色，
+    // 回落到跟随系统深浅色的终端原生视觉，而不是黑色。
+    if skin.bg.is_none() && skin.fg.is_none() {
+        apply(ctx);
+        return;
+    }
+    if let Ok(mut guard) = SKIN.lock() {
+        *guard = Some(skin.clone());
+    }
+    let visuals = skin_visuals(skin);
+    ctx.set_visuals_of(Theme::Dark, visuals.clone());
+    ctx.set_visuals_of(Theme::Light, visuals);
+    ctx.set_theme(ThemePreference::Dark);
+}
+
+/// 由皮肤构造 `Visuals`（纯函数，可单测）。
+pub fn skin_visuals(skin: &Skin) -> Visuals {
+    let bg = skin.bg.unwrap_or(Color32::BLACK);
+    let light = luminance(bg) > 0.5;
+    let mut visuals = if light {
+        Visuals::light()
+    } else {
+        Visuals::dark()
+    };
+    let fg = skin
+        .fg
+        .unwrap_or(visuals.widgets.noninteractive.fg_stroke.color);
+    visuals.panel_fill = bg;
+    visuals.window_fill = skin.menu_bg.unwrap_or(bg);
+    visuals.extreme_bg_color = shade(bg, if light { -18 } else { 18 });
+    visuals.faint_bg_color = skin.dim.unwrap_or(fg.gamma_multiply(0.12_f32));
+    visuals.override_text_color = Some(fg);
+    visuals.widgets.noninteractive.fg_stroke.color = fg;
+    visuals.widgets.inactive.fg_stroke.color = fg;
+    visuals.widgets.hovered.fg_stroke.color = fg;
+    visuals.widgets.active.fg_stroke.color = fg;
+    if let Some(border) = skin.border {
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, border);
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, border);
+        visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, border);
+    }
+    visuals.selection.bg_fill = fg;
+    visuals.selection.stroke = Stroke::new(1.0_f32, bg);
+    if let Some(link) = skin.bar.or(skin.key) {
+        visuals.hyperlink_color = link;
+    }
+    visuals
+}
+
+/// 解析布尔键值（皮肤文本口径：true/1/yes/on 为真，其余为假）。
+fn parse_bool(value: &str) -> bool {
+    matches!(value.trim(), "true" | "1" | "yes" | "on")
+}
+
+/// 解析颜色值：`none` → `None`；`#rrggbb` → RGB；其余 `None`。
+fn parse_color(value: &str) -> Option<Color32> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let hex = value.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.is_ascii() {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(Color32::from_rgb(r, g, b))
+}
+
+/// 颜色亮度（0.0–1.0，用于判定深/浅底）。
+fn luminance(color: Color32) -> f32 {
+    (0.299 * color.r() as f32 + 0.587 * color.g() as f32 + 0.114 * color.b() as f32) / 255.0
+}
+
+/// 明暗微调（用于输入框等最深层底色）。
+fn shade(color: Color32, delta: i32) -> Color32 {
+    let adjust = |value: u8| (value as i32 + delta).clamp(0, 255) as u8;
+    Color32::from_rgb(adjust(color.r()), adjust(color.g()), adjust(color.b()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 内置主题全部可解析。
     #[test]
-    fn from_skin_parses_and_overlays() {
-        let text = "name=测试皮肤\nbg=#0d1321\nfkey_num=#ffb000\nborder_type=double\n";
-        let pal = from_skin(text).expect("应解析出调色板");
-        assert_eq!(pal.bg, Color32::from_rgb(0x0d, 0x13, 0x21));
-        assert_eq!(pal.accent, Color32::from_rgb(0xff, 0xb0, 0x00));
-        assert_eq!(skin_name(text).as_deref(), Some("测试皮肤"));
-        // 无任何有效键 → None
-        assert!(from_skin("# 只有注释\n").is_none());
-    }
-
-    #[test]
-    fn all_builtin_ids_resolve() {
-        for id in ["dos", "term", "classic-dark", "classic-light", "tech-dark"] {
-            assert!(builtin(id).is_some(), "内置主题 {id} 应可解析");
-        }
-        // 亮色皮肤亮度走 light 分支（apply_visuals 前置条件自检）
-        let pal = builtin("classic-light").unwrap();
-        let lum =
-            (pal.bg.r() as u32 * 299 + pal.bg.g() as u32 * 587 + pal.bg.b() as u32 * 114) / 1000;
-        assert!(lum > 140, "classic-light 底色应为亮色基底");
-    }
-
-    /// 未知 id 返回 None（调用方回退默认）。
-    #[test]
-    fn unknown_id_none() {
-        assert!(builtin("no-such-theme").is_none());
-    }
-
-    /// 字体链：内置 Sarasa Mono SC（槽位名 app-cjk）必须是两族主字体
-    ///（列对齐的根基——半角/全角 2:1）。
-    #[test]
-    fn font_chain_builtin_is_primary() {
-        let defs = build_fonts();
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            let list = &defs.families[&family];
+    fn selection_is_inverted_in_both_modes() {
+        for mode in [Theme::Dark, Theme::Light] {
+            let visuals = terminal_visuals(mode);
+            let text = visuals.widgets.noninteractive.fg_stroke.color;
+            assert_eq!(visuals.selection.bg_fill, text, "选中底应取前景色");
             assert_eq!(
-                list[0], "app-cjk",
-                "{family:?} 主字体必须居首（列对齐根基）"
+                visuals.selection.stroke.color, visuals.panel_fill,
+                "选中描边应取底色"
             );
         }
+    }
+
+    #[test]
+    fn palette_maps_inverted_selection() {
+        let visuals = terminal_visuals(Theme::Dark);
+        let palette = Palette::from_visuals(&visuals);
+        assert_eq!(
+            palette.sel_bg,
+            visuals.widgets.noninteractive.fg_stroke.color
+        );
+        assert_eq!(palette.sel_fg, visuals.panel_fill);
+        assert_eq!(palette.bg, visuals.panel_fill);
+    }
+
+    #[test]
+    fn parse_skin_reads_name_and_colors() {
+        let skin = Skin::parse(
+            "name=磷光绿\nbg=#000000\nfg=#55ff55\nborder=#55ff55\nbar_fg=#55ff55\nlevel_mid=#ffff00\nblock_spectrum=true",
+            "fallback",
+        )
+        .expect("应解析成功");
+        assert_eq!(skin.name, "磷光绿");
+        assert_eq!(skin.bg, Some(Color32::BLACK));
+        assert_eq!(skin.fg, Some(Color32::from_rgb(0x55, 0xff, 0x55)));
+        assert_eq!(skin.level_mid, Some(Color32::YELLOW));
+        let palette = skin.palette();
+        assert_eq!(palette.bg, Color32::BLACK);
+        assert_eq!(palette.sel_bg, palette.fg, "皮肤同样选中反白");
+    }
+
+    #[test]
+    fn parse_skin_reads_band_colors_and_falls_back_to_bar() {
+        let skin = Skin::parse(
+            "name=x\nbar_fg=#55ff55\nband_low=#00aa00\nband_high=#ffff55",
+            "x",
+        )
+        .expect("应解析成功");
+        let palette = skin.palette();
+        assert_eq!(palette.band_low, Color32::from_rgb(0x00, 0xaa, 0x00));
+        assert_eq!(palette.band_mid, palette.bar, "缺省桶回落柱体色");
+        assert_eq!(palette.band_high, Color32::from_rgb(0xff, 0xff, 0x55));
+        // 无 bar_fg 时再回落正文色。
+        let bare = Skin::parse("name=x\nfg=#112233", "x").expect("应解析成功");
+        let palette = bare.palette();
+        assert_eq!(palette.band_low, palette.fg);
+        assert_eq!(palette.band_mid, palette.fg);
+        assert_eq!(palette.band_high, palette.fg);
+    }
+
+    #[test]
+    fn parse_skin_rejects_empty_or_unknown() {
+        assert!(Skin::parse("", "x").is_none());
+        assert!(Skin::parse("# 只有注释\nunknown_key=true", "x").is_none());
+    }
+
+    #[test]
+    fn parse_skin_reads_bar_style_block_and_grid() {
+        let skin = Skin::parse(
+            "name=x\nbar_style=blocks\nblock_spectrum=true\ngrid_fg=#808080",
+            "x",
+        )
+        .expect("应解析成功");
+        assert_eq!(skin.bar_style, BarStyle::Blocks);
+        assert!(skin.block_spectrum);
+        let palette = skin.palette();
+        assert_eq!(palette.bar_style, BarStyle::Blocks);
+        assert!(palette.block_spectrum);
+        assert_eq!(palette.grid, Color32::from_rgb(0x80, 0x80, 0x80));
+        // 非法风格名回落 Matrix；布尔假值 / 缺省键保持默认。
+        let bogus = Skin::parse("name=x\nbar_style=bogus", "x").expect("应解析成功");
+        assert_eq!(bogus.bar_style, BarStyle::Matrix);
+        let bare = Skin::parse("name=x\nfg=#112233", "x").expect("应解析成功");
+        assert!(!bare.block_spectrum);
+        assert_eq!(
+            bare.palette().grid,
+            bare.palette().dim,
+            "grid 缺省回落次要色"
+        );
+        assert!(
+            Skin::parse("name=x\nblock_spectrum=yes", "x")
+                .expect("应解析成功")
+                .block_spectrum
+        );
+    }
+
+    #[test]
+    fn non_ascii_color_is_ignored_without_panic() {
+        let skin = Skin::parse("name=x\nbg=#😀é", "x").expect("非法颜色应被忽略");
+        assert_eq!(skin.bg, None);
+    }
+
+    #[test]
+    fn skin_visuals_use_explicit_colors() {
+        let skin = Skin {
+            name: "test".to_string(),
+            bg: Some(Color32::from_rgb(10, 20, 30)),
+            fg: Some(Color32::from_rgb(200, 210, 220)),
+            border: Some(Color32::from_rgb(100, 110, 120)),
+            ..Skin::parse("name=x", "x").unwrap()
+        };
+        let visuals = skin_visuals(&skin);
+        assert_eq!(visuals.panel_fill, Color32::from_rgb(10, 20, 30));
+        assert_eq!(
+            visuals.override_text_color,
+            Some(Color32::from_rgb(200, 210, 220))
+        );
+        assert_eq!(visuals.selection.bg_fill, Color32::from_rgb(200, 210, 220));
     }
 }

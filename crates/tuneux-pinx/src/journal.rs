@@ -57,10 +57,16 @@ impl LoadRecord {
             .map(|c| c.name())
             .collect::<Vec<_>>()
             .join(",");
+        // plugin_id 可能来自文件名派生：转义换行/制表符，保证一行一条的格式。
+        let plugin_id = self
+            .plugin_id
+            .replace('\\', "\\\\")
+            .replace('\n', "\\n")
+            .replace('\t', "\\t");
         format!(
             "ts={} plugin={} trust={} caps={} first_seen={}",
             self.unix_ts,
-            self.plugin_id,
+            plugin_id,
             self.tristate.name(),
             caps,
             self.first_seen

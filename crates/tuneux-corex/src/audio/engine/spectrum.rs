@@ -13,7 +13,8 @@
 //! - **对数频段**：256 个频段按对数分布，30Hz - Nyquist（上限 20kHz）。
 //!   低频区 bin 密集（分辨率高），高频区 bin 稀疏——符合人耳听感。
 //!   1kHz 处 bin 宽 ≈ 12Hz，配合 log 分布 1kHz 段中心约 75Hz 宽，
-//!   1kHz 段横跨约 6 个 bin——单频正弦波能量集中，不会泄漏到邻近段。
+//!   1kHz 段横跨约 6 个 bin——单频正弦波能量集中，但 Hann 窗仍有约 4 bin
+//!   的主瓣宽度，邻近段出现有限泄漏属于正常现象。
 //! - **复用 peak amplitude 窗口的样本**：电平累计已有窗口采样，频谱复用
 //!   同一组样本，避免重复读 ringbuf。
 //! - **dB 归一化**：用 **peak-relative** 方式——每帧最大功率 → 1.0，
@@ -201,11 +202,12 @@ pub fn compute_spectrum_bands(
     if max_power < SILENCE_FLOOR {
         return [0.0f32; N_BANDS];
     }
-    let max_db = 20.0 * max_power.log10();
+    let max_db = 10.0 * max_power.log10();
 
     let mut result = [0.0f32; N_BANDS];
     for (i, &p) in bands.iter().enumerate() {
-        let db = if p > 0.0 { 20.0 * p.log10() } else { -120.0 };
+        // bands 存储的是功率而非振幅，因此功率分贝使用 10·log10。
+        let db = if p > 0.0 { 10.0 * p.log10() } else { -120.0 };
         // 相对峰值：0dB → 1.0，-DYNAMIC_RANGE_DB → 0.0
         let rel = db - max_db + DYNAMIC_RANGE_DB;
         result[i] = (rel / DYNAMIC_RANGE_DB).clamp(0.0, 1.0);

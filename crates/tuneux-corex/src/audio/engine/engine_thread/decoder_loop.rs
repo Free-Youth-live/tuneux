@@ -17,14 +17,20 @@ use ringbuf::{traits::*, HeapProd};
 use super::super::resample::Resample;
 use super::super::{DecoderCmd, SharedState};
 use super::sample_utils::{adapt_channels, push_all};
+use super::CurrentTrack;
 use crate::audio::codec::{open_backend, DecoderBackend};
 
 /// ReplayGain 目标响度（LUFS）：-14 为流媒体兼容标准（Spotify 等）。
 const RG_TARGET_LUFS: f64 = -14.0;
 
-/// Gapless 预载槽位元素：解码后端 + 可选区间（start_secs, end_secs；
-/// 整文件预载为 None）。
-type PreloadedSlot = (Box<dyn DecoderBackend>, Option<(f64, Option<f64>)>);
+/// Gapless 预载槽位元素：路径 + 解码后端 + 可选区间（start_secs, end_secs；
+/// 整文件预载为 None）。路径随槽位保留：无缝切换后经「当前曲目」通知
+/// 同步给音频线程（其设备热切换 reload 需要新曲路径/区间）。
+type PreloadedSlot = (
+    std::path::PathBuf,
+    Box<dyn DecoderBackend>,
+    Option<(f64, Option<f64>)>,
+);
 
 /// ReplayGain 分析器用的有效采样率：优先取流的真实采样率（原生采样率直通
 /// 会在重建流时改变它），未设置（0）时回退 spawn 捕获值。与 try_load 的
@@ -152,6 +158,7 @@ pub(super) fn decoder_loop(
     finished_tx: Sender<()>,
     failed_tx: Sender<()>,
     track_switched_tx: Sender<()>,
+    cur_track_tx: Sender<Option<CurrentTrack>>,
     close: Arc<AtomicBool>,
     device_sample_rate: u32,
     device_channels: usize,
@@ -220,7 +227,7 @@ pub(super) fn decoder_loop(
                                         None => true,
                                     };
                                     if seeked {
-                                        Some((b, range))
+                                        Some((t.path.clone(), b, range))
                                     } else {
                                         None
                                     }
@@ -253,6 +260,10 @@ pub(super) fn decoder_loop(
                 // 解码恢复：清除末尾态（加载失败路径已在 try_load 内置位）。
                 if decoding {
                     state.clear_at_eof();
+                    // 当前曲目同步（整文件）：推给音频线程，
+                    // 其设备热切换 reload 据此取当前曲目。通道 FIFO 保证
+                    // 本条覆盖此前残留的无缝切换通知。
+                    let _ = cur_track_tx.send(Some((path, None)));
                 }
                 current_rate = current.as_ref().and_then(|b| b.params().sample_rate);
                 // ReplayGain：新曲目重置流式分析器（按流采样率分析重采样后样本）。
@@ -282,6 +293,8 @@ pub(super) fn decoder_loop(
                     preloaded = None;
                     range_end = None;
                     state.clear_at_eof();
+                    // 当前曲目同步（整文件）。
+                    let _ = cur_track_tx.send(Some((path, None)));
                     current_rate = current.as_ref().and_then(|b| b.params().sample_rate);
                     analyzer = if state.replay_gain_enabled() {
                         Some(super::super::rg::LoudnessAnalyzer::new(
@@ -291,10 +304,16 @@ pub(super) fn decoder_loop(
                     } else {
                         None
                     };
-                    // 立刻 seek——此时文件已加载、current 已就绪，seek 不会丢失
+                    // 立刻 seek——此时文件已加载、current 已就绪，seek 不会丢失。
+                    // 时钟使用后端实际落点；续播定位失败回退从头播，进度同步归零。
                     if let Some(dec) = current.as_mut() {
-                        // 续播 seek 失败则从头播（低频；无需打扰 UI）。
-                        let _ = dec.seek(secs);
+                        match dec.seek(secs) {
+                            Ok(actual) => state.reset_position(actual),
+                            Err(e) => {
+                                state.reset_position(0.0);
+                                state.set_last_error(format!("断点定位失败，改从头播放：{e}"));
+                            }
+                        }
                     }
                 } else {
                     decoding = false;
@@ -331,9 +350,16 @@ pub(super) fn decoder_loop(
                     };
                     // seek 到区间起点；失败按「无法播放」上报（区间起点定位
                     // 不到却从头播是放错曲，与续播 seek 的宽容口径不同）。
+                    let mut actual_start = start_secs;
                     let seek_ok = current
                         .as_mut()
-                        .is_some_and(|dec| dec.seek(start_secs).is_ok());
+                        .is_some_and(|dec| match dec.seek(start_secs) {
+                            Ok(actual) => {
+                                actual_start = actual;
+                                true
+                            }
+                            Err(_) => false,
+                        });
                     if !seek_ok {
                         state.set_last_error(format!(
                             "无法定位区间起点 {start_secs:.1}s：{}",
@@ -348,7 +374,8 @@ pub(super) fn decoder_loop(
                         state.clear_at_eof();
                         // 区间状态：文件轴起点 / 终点 / 计数清零；时长按区间长度
                         //（end_secs 缺省 = 播到文件末尾，时长 = 文件时长 - 起点）。
-                        range_base = start_secs;
+                        range_base = actual_start;
+                        state.reset_position(actual_start);
                         range_decoded_frames = 0;
                         range_pushed_frames = 0;
                         range_end = end_secs;
@@ -359,6 +386,10 @@ pub(super) fn decoder_loop(
                             (None, None) => 0.0,
                         };
                         state.set_duration(len);
+                        // 当前曲目同步（区间）：热切换按
+                        // 此区间 reload；起点用实际 seek 落点（与播放进度
+                        // 同源），与音频线程 PlayRange 的乐观值一致。
+                        let _ = cur_track_tx.send(Some((path, Some((actual_start, end_secs)))));
                     }
                 } else {
                     decoding = false;
@@ -366,49 +397,42 @@ pub(super) fn decoder_loop(
                 }
             }
             Ok(DecoderCmd::Seek(secs)) => {
-                if current.is_some() {
-                    // seek 是否成功决定了后续"状态是否要跟随新位置"——失败时解码器
-                    // 仍在旧位置，任何按新位置重置的基准都会错位（见下）。
-                    let seek_ok = if let Some(dec) = current.as_mut() {
-                        dec.seek(secs).is_ok()
-                        // seek 后旧缓冲由回调侧 flush 处理（音频线程已 bump_flush）
-                    } else {
-                        false
-                    };
-                    // 重采样器状态重置：内部缓冲残留 pre-seek 样本（≤1023 帧）
-                    // 与 FFT 滤波器历史会把 seek 点前约 20-30ms 旧位置音频混入
-                    // 新位置输出（仅文件率 ≠ 设备率时存在重采样器）。
-                    // 同参数重建，失败不可达，防御性忽略。无论 seek 成败都清：
-                    // 清了只是丢一小段缓冲，残留反而会在下一曲混入旧样本。
-                    if let Some(rs) = resampler.as_mut() {
-                        let _ = rs.reset();
+                if let Some(dec) = current.as_mut() {
+                    match dec.seek(secs) {
+                        Ok(actual) => {
+                            // 只有定位成功才改变时钟、清空旧缓冲并恢复解码；
+                            // 失败时保留原位置、EOF 与分析器状态。
+                            if let Some(rs) = resampler.as_mut() {
+                                if let Err(e) = rs.reset() {
+                                    state.set_last_error(format!("Seek 后重采样器重置失败：{e}"));
+                                }
+                            }
+                            state.reset_position(actual);
+                            state.bump_flush();
+                            // seek 后重建流式响度分析器：置 None 会让本曲剩余部分
+                            // 不参与测量、曲终不写 measured_gain_db，App 会把上一曲
+                            // 的陈旧增益错配给本曲（下次播放增益错配）。
+                            analyzer = if state.replay_gain_enabled() {
+                                Some(super::super::rg::LoudnessAnalyzer::new(
+                                    analyzer_rate(&state, device_sample_rate),
+                                    current_channels(&state, device_channels),
+                                ))
+                            } else {
+                                None
+                            };
+                            if range_end.is_some() {
+                                range_base = actual;
+                                range_decoded_frames = 0;
+                                range_pushed_frames = 0;
+                            }
+                            decoding = true;
+                            draining = false;
+                            state.clear_at_eof();
+                        }
+                        Err(e) => {
+                            state.set_last_error(format!("Seek 到 {secs:.1}s 失败：{e}"));
+                        }
                     }
-                    // ReplayGain 分析器作废：seek 跳过的中段不参与响度统计，
-                    // 保留旧 analyzer 会让「曲首段 + seek 后段」的加权平均值被
-                    // 缓存并跨曲次回灌。**作废之后本曲不再重建**（解码循环里没有
-                    // 惰性重建，feed 处是 `if let Some(a)`），即 seek 过的这次播放
-                    // 不再产出测量值，曲终 `analyzer.take()` 为 None 也就不写缓存
-                    // ——这是刻意的保守取舍：宁可没有测量值，也不写入残缺值。
-                    // seek 失败则位置未变，旧 analyzer 仍然有效，不作废。
-                    if seek_ok {
-                        analyzer = None;
-                    }
-                    // 区间内 seek：终点累计基准跟随新位置（否则倒退 seek 会让
-                    // 区间提前结束 / 前进 seek 越界）。**仅在 seek 成功时**重置：
-                    // 失败时解码器仍在旧位置，提前重置基准会让区间终点按错误的
-                    // 起点累计，表现为 cue 分轨的切歌点漂移。
-                    if seek_ok && range_end.is_some() {
-                        range_base = secs;
-                        range_decoded_frames = 0;
-                        range_pushed_frames = 0;
-                    }
-                    // EOF 后排空状态下 seek：解码器 seek 到新位置后能继续
-                    // 产出样本，恢复解码并取消排空等待——修"播完后进度条
-                    // 拖不动、Resume 只出静音"的问题。
-                    decoding = true;
-                    draining = false;
-                    // 解码恢复：EOF 后 seek 回来应能继续出声（清除末尾态）。
-                    state.clear_at_eof();
                 }
             }
             Ok(DecoderCmd::Stop) => {
@@ -417,6 +441,9 @@ pub(super) fn decoder_loop(
                 current = None;
                 range_end = None;
                 // 旧缓冲由回调侧 flush 处理
+                // 当前曲目同步清除：停止后无「在播曲目」，
+                // 音频线程设备热切换不再 reload。
+                let _ = cur_track_tx.send(None);
             }
             Ok(DecoderCmd::NewProducer(new_prod)) => {
                 // 原生采样率直通：音频线程重建了 ringbuf，换上新 producer。
@@ -432,7 +459,11 @@ pub(super) fn decoder_loop(
                 draining = false;
             }
             Ok(DecoderCmd::Exit) => break,
-            Err(_) => {} // 无命令，继续
+            Err(crossbeam_channel::TryRecvError::Empty) => {} // 无命令，继续
+            // 通道断开 = 音频线程已退出：解码线程必须同步退出。
+            // 旧缺陷把 Disconnected 当 Empty 处理，音频线程异常
+            // 退出后解码线程永不结束。
+            Err(crossbeam_channel::TryRecvError::Disconnected) => break,
         }
 
         // —— 2. 解码一批数据 ——
@@ -470,9 +501,20 @@ pub(super) fn decoder_loop(
                             range_decoded_frames += (samples.len() / file_channels.max(1)) as u64;
                         }
                         let adapted = adapt_channels(&samples, file_channels, cur_ch);
-                        // 重采样（若需要）
+                        // 重采样失败不能静默丢包后继续到 EOF；与打开/解码失败
+                        // 一样进入错误通道，让上层停止或切换当前曲目。
                         let final_samples = if let Some(rs) = resampler.as_mut() {
-                            rs.process(&adapted).unwrap_or_default()
+                            match rs.process(&adapted) {
+                                Ok(samples) => samples,
+                                Err(e) => {
+                                    decoding = false;
+                                    draining = false;
+                                    state.set_last_error(format!("重采样错误：{e}"));
+                                    state.signal_playback_finished();
+                                    let _ = failed_tx.send(());
+                                    continue;
+                                }
+                            }
                         } else {
                             adapted
                         };
@@ -508,9 +550,11 @@ pub(super) fn decoder_loop(
                     // 音频回调无空拍）；通知前端"曲目已无缝切换"（只更新 UI，
                     // 不重发 Play）。否则回退 draining 流程。
                     let can_switch = preloaded.is_some()
-                        && preloaded.as_ref().and_then(|(b, _)| b.params().sample_rate)
+                        && preloaded
+                            .as_ref()
+                            .and_then(|(_, b, _)| b.params().sample_rate)
                             == current_rate
-                        && preloaded.as_ref().and_then(|(b, _)| b.params().channels)
+                        && preloaded.as_ref().and_then(|(_, b, _)| b.params().channels)
                             == current.as_ref().and_then(|c| c.params().channels);
                     if let Some(rs) = resampler.as_mut() {
                         // flush 失败：20-30ms 尾部静默丢失，不打断结束流程。
@@ -536,7 +580,7 @@ pub(super) fn decoder_loop(
                         }
                     }
                     if can_switch {
-                        if let Some((next, next_range)) = preloaded.take() {
+                        if let Some((next_path, next, next_range)) = preloaded.take() {
                             // ReplayGain：无缝切换不触发 draining/finished，
                             // 这里显式保存旧曲分析结果并重置新曲分析器
                             //（App 在 track_switched 时读取缓存）。
@@ -564,6 +608,10 @@ pub(super) fn decoder_loop(
                                     }
                                 }
                             }
+                            // 无缝切换后，源参数快照也必须属于新曲，否则不同编码
+                            // 但同采样率/声道的相邻曲目会继续显示上一曲的参数。
+                            state.set_src_params(Some(next.params().clone()));
+                            current_rate = next.params().sample_rate;
                             current = Some(next);
                             analyzer = if state.replay_gain_enabled() {
                                 Some(super::super::rg::LoudnessAnalyzer::new(
@@ -594,7 +642,7 @@ pub(super) fn decoder_loop(
                             // 实现真正无缝（重采样器滤波尾巴已在上方 flush 推入）。
                             // 进度基准设为负的尾巴时长——旧曲尾巴播完前
                             // position ≤ 0（UI 侧钳制显示为 0），播完后新曲从 0 起。
-                            let tail_frames = producer.occupied_len() / device_channels.max(1);
+                            let tail_frames = producer.occupied_len() / cur_ch.max(1);
                             // 尾巴样本按流的真实采样率换算：原生直通会重建流、改变采样率，
                             // 不能用 spawn 捕获的 device_sample_rate，否则时长会偏约 8%。
                             let tail_secs = tail_frames as f64
@@ -607,6 +655,9 @@ pub(super) fn decoder_loop(
                             };
                             state.reset_position(base);
                             let _ = track_switched_tx.send(());
+                            // 当前曲目同步：无缝切换仅发生在解码线程，音频线程
+                            // 必须据此更新热切换的 reload 目标。
+                            let _ = cur_track_tx.send(Some((next_path, next_range)));
                         } else {
                             decoding = false;
                             draining = true;
@@ -1007,8 +1058,9 @@ mod range_tests {
     }
 
     /// 真驱动 decoder_loop：发命令、全程消费，直到 finished 上报。
-    /// 返回（全部消费到的样本, 是否发生无缝切换, 结束时的 duration）。
-    fn drive(cmds: Vec<DecoderCmd>) -> (Vec<f32>, bool, f64, bool) {
+    /// 返回（全部消费到的样本, 是否发生无缝切换, 结束时的 duration,
+    /// 末尾态, 解码线程推送的全部「当前曲目」通知）。
+    fn drive(cmds: Vec<DecoderCmd>) -> (Vec<f32>, bool, f64, bool, Vec<Option<CurrentTrack>>) {
         let state = Arc::new(SharedState::default());
         state.set_playing(true);
         let state_in = state.clone();
@@ -1017,11 +1069,12 @@ mod range_tests {
         let (fin_tx, fin_rx) = crossbeam_channel::unbounded();
         let (fail_tx, _fail_rx) = crossbeam_channel::unbounded::<()>();
         let (sw_tx, sw_rx) = crossbeam_channel::unbounded();
+        let (cur_tx, cur_rx) = crossbeam_channel::unbounded::<Option<CurrentTrack>>();
         let close = Arc::new(AtomicBool::new(false));
         let close_in = close.clone();
         let handle = std::thread::spawn(move || {
             decoder_loop(
-                prod, cmd_rx, state_in, fin_tx, fail_tx, sw_tx, close_in, 44100, 2,
+                prod, cmd_rx, state_in, fin_tx, fail_tx, sw_tx, cur_tx, close_in, 44100, 2,
             );
         });
         for c in cmds {
@@ -1045,7 +1098,8 @@ mod range_tests {
         let _ = cmd_tx.send(DecoderCmd::Exit);
         let _ = handle.join();
         let switched = sw_rx.try_recv().is_ok();
-        (out, switched, state.duration(), state.at_eof())
+        let tracks: Vec<Option<CurrentTrack>> = cur_rx.try_iter().collect();
+        (out, switched, state.duration(), state.at_eof(), tracks)
     }
 
     /// 帧号 → WAV 内 i16 样本的归一化值（与 make_ramp_wav 同口径）。
@@ -1058,7 +1112,7 @@ mod range_tests {
     #[test]
     fn play_range_finished_exact_bounds() {
         let path = make_ramp_wav(132300); // 3 秒
-        let (out, switched, dur, at_eof) = drive(vec![DecoderCmd::LoadRange {
+        let (out, switched, dur, at_eof, _tracks) = drive(vec![DecoderCmd::LoadRange {
             path: path.clone(),
             start_secs: 1.0,
             end_secs: Some(2.0),
@@ -1086,7 +1140,7 @@ mod range_tests {
     #[test]
     fn play_range_gapless_adjacent_ranges() {
         let path = make_ramp_wav(132300);
-        let (out, switched, _dur, at_eof) = drive(vec![
+        let (out, switched, _dur, at_eof, tracks) = drive(vec![
             DecoderCmd::LoadRange {
                 path: path.clone(),
                 start_secs: 1.0,
@@ -1096,6 +1150,13 @@ mod range_tests {
         ]);
         assert!(switched, "相邻区间应发生无缝切换");
         assert!(at_eof, "末段播完后应处于末尾态");
+        // 当前曲目通知：末条应是无缝切换后的
+        // 新曲路径/区间——音频线程据此 reload 新曲而非上一曲。
+        assert_eq!(
+            tracks.last(),
+            Some(&Some((path.clone(), Some((2.0, Some(3.0)))))),
+            "无缝切换后应推送新曲路径/区间通知"
+        );
         assert_eq!(out.len(), 176400, "两段区间合计应恰为 2 秒");
         assert_eq!(out[0], frame_value(44100), "第一段起点帧错位");
         assert_eq!(
@@ -1108,6 +1169,65 @@ mod range_tests {
             frame_value(88200 + 44100 - 1),
             "第二段终点帧错位"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 「当前曲目」通知与通道断开退出：
+    /// Load 成功应推送 (路径, None)；Stop 应推送清除（None）；发送端掉线后
+    /// 解码线程必须在有限时间内退出（旧缺陷：Disconnected 当 Empty，
+    /// 线程永不结束）。
+    #[test]
+    fn track_notifications_and_exit_on_disconnect() {
+        let state = Arc::new(SharedState::default());
+        let state_in = state.clone();
+        state.set_playing(true);
+        let (prod, _cons) = HeapRb::<f32>::new(1 << 16).split();
+        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        let (fin_tx, _fin_rx) = crossbeam_channel::unbounded();
+        let (fail_tx, _fail_rx) = crossbeam_channel::unbounded::<()>();
+        let (sw_tx, _sw_rx) = crossbeam_channel::unbounded();
+        let (cur_tx, cur_rx) = crossbeam_channel::unbounded::<Option<CurrentTrack>>();
+        let close = Arc::new(AtomicBool::new(false));
+        let close_in = close.clone();
+        let path = make_ramp_wav(44100); // 1 秒
+        let handle = std::thread::spawn(move || {
+            decoder_loop(
+                prod, cmd_rx, state_in, fin_tx, fail_tx, sw_tx, cur_tx, close_in, 44100, 2,
+            );
+        });
+        cmd_tx
+            .send(DecoderCmd::Load(path.clone()))
+            .expect("发 Load");
+        // Load 通知：路径 + 整文件区间 None。
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let load_notify = loop {
+            if let Some(n) = cur_rx.try_recv().ok().flatten() {
+                break n;
+            }
+            assert!(std::time::Instant::now() < deadline, "Load 通知超时");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(load_notify.0, path, "Load 应推送当前曲目路径");
+        assert_eq!(load_notify.1, None, "整文件曲目区间为 None");
+        // Stop 通知：清除（None）。
+        cmd_tx.send(DecoderCmd::Stop).expect("发 Stop");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let stop_notify = loop {
+            if let Ok(n) = cur_rx.try_recv() {
+                break n;
+            }
+            assert!(std::time::Instant::now() < deadline, "Stop 通知超时");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert!(stop_notify.is_none(), "Stop 应推送清除当前曲目");
+        // 发送端掉线：解码线程必须退出。
+        drop(cmd_tx);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !handle.is_finished() {
+            assert!(std::time::Instant::now() < deadline, "断开后解码线程未退出");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        handle.join().expect("解码线程 join");
         let _ = std::fs::remove_file(&path);
     }
 }

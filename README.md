@@ -12,11 +12,12 @@
 - **无缝播放**：同格式曲目间无间隙衔接（Gapless，下一曲预载）
 - **设备热切换**：播放中拔插耳机 / 切换输出设备自动重连，无需重启程序
 - **系统媒体键**：Linux 经 MPRIS（桌面媒体键自动路由）；Windows 用低层键盘钩子捕获媒体键——终端在后台也能控制；macOS 因需 app bundle 暂不支持；可用 `media_keys_enabled = false` 关闭
-- **ReplayGain 响度归一**：按 −14 LUFS 目标统一各专辑音量（**默认关闭**；fx 可在「设置 › ReplayGain 响度归一」开关，或在配置文件设 `replay_gain = true`——基础版为 `tuneux.toml`、fx 为 `tuneux-fx.toml`——开启后下次播放生效）
+- **ReplayGain 响度归一**：按 −14 LUFS 目标统一各专辑音量（**默认关闭**；fx 可在「音效 › ReplayGain 响度归一」开关，max 同名菜单在「音效」栏；也可在配置文件设 `replay_gain = true`——基础版为 `tuneux.toml`、fx 为 `tuneux-fx.toml`、max 为 `tuneux-max.toml`——开启后下次播放生效）
 - **自定义键位**：`tuneux.toml` 的 `keymap` 可重映射播放控制键
-- **插件化（tuneux-fx）**：WASM 插件系统——均衡器 / 压缩器 DSP 插件（e 键均衡器面板、动态多槽位叠加）与皮肤插件（界面配色只来自皮肤：随包「Norton 蓝」「午夜蓝」两款验签自动生效，删插件回落终端原生配色）。插件开发见仓库根《插件开发指南.txt》（host ABI v2）
+- **配色主题（tuneux 基础版）**：8 套内置配色——`terminal` 终端原生（默认）/ `phosphor` 磷光绿 / `classic` 经典青 / `deepblue` 深蓝 / `navy` 藏青 / `blackwhite` 黑白 / `graywhite` 灰白 / `dimcolor` 暗彩；`t` 键运行中循环切换，即时生效并写回配置（退出 / 定时保存持久化），未知配置值回落终端原生
+- **插件化（tuneux-fx）**：WASM 插件系统——均衡器 / 压缩器 DSP 插件（e 键均衡器面板、动态多槽位叠加）与皮肤插件（界面配色只来自皮肤：随包「磷光绿」「经典青」「深蓝」「终端原生」「黑白」「灰白」「暗彩」7 款第一方皮肤，均官方验签；默认使用「终端原生」，缺件时回落内置「藏青」，可在设置中改选）。插件开发见仓库根《插件开发指南.txt》，host ABI v1（含 v2 增补）
 - **菜单栏与命令模式（tuneux-fx）**：数字 1-8 菜单栏；`:` 命令模式（m3u、书签、歌词偏移等）
-- **图形界面（tuneux-max）**：fx TUI 观感的 egui 图形界面——字符网格渲染、鼠标键盘双操控；模块自由组合（dock 分割树）；皮肤 / 字体 / 语言可换、命令模式；音频内核与 tuneux / tuneux-fx 完全同源（无损解码、Gapless 无缝切曲、断点续播、CUE 分轨、ReplayGain、介质风格 DSP 同口径）
+- **图形界面（tuneux-max）**：0.6.2 重制的 egui 图形界面，布局对齐 tuneux-fx——菜单栏、顶部三栏条（曲目 / 三桶频段 / 电平）、浏览器 / 封面 + 播放列表 + 歌词、频谱面板；音频内核与 tuneux / tuneux-fx 完全同源（无损解码、Gapless 无缝切曲、断点续播、CUE 分轨、ReplayGain、介质风格 DSP）；默认使用「终端原生」皮肤，支持第一方签名皮肤、均衡器 / 压缩器 / 可视化插件、命令模式、自定义键位、系统媒体键、递归搜索与播放列表过滤；浏览器支持鼠标和键盘选择及返回上一级。0.6.2 仅提供 max 源码，不发布 max 二进制发行包
 - **CUE 分轨**：整轨 + 同名 `.cue` 自动分轨播放
 - **歌词**：优先同目录 `.lrc`，无则读取歌曲内嵌歌词标签
 - 直接运行 `tuneux` 进入交互式 TUI，无子命令
@@ -57,7 +58,7 @@ tuneux 的解码采用「纯 Rust 为主 + FFmpeg 进程外补位」的双层架
 
 ### 单个文件大小限制
 
-- **软件层面无硬性大小上限**：tuneux 采用流式解码，同一时刻仅缓冲数秒音频数据在内存中，不会将整个文件读入内存。因此可播放大小仅受**可用内存**和**文件系统**限制。
+- **流式为主，WavPack 例外**：多数后端逐包或逐块解码，FFmpeg 通过进程管道输出，内存中只保留有限播放缓冲。自研 WavPack 后端会读入整个文件并预解码，因此其可用大小还受解码预算和可用内存限制；其他文件也没有脱离文件系统与运行环境的无限大小承诺。
 - **WAV 格式**：受 RIFF 容器规范约束，标准 WAV 单文件上限约 **4 GB**（RF64 扩展格式可更大）。
 - **FLAC / ALAC / MP3 / OGG / AAC**：格式本身无 4 GB 限制，实际可播放数 GB 乃至更大的高清无损文件。
 - **64 位系统**下实测可正常播放数 GB 的 24-bit/192 kHz 无损文件；32 位进程受地址空间限制，建议单文件不超过约 2 GB。
@@ -128,6 +129,7 @@ tuneux 在**符合 FFmpeg 开源协议**的前提下使用 FFmpeg：
 | `g`                    | 切换播放列表视图（平铺 ↔ 按专辑分组，分组可折叠/展开）           |
 | `v`                    | 切换频谱（关 → 半屏 → 全屏 → 示波器）                 |
 | `m`                    | 切换介质风格（无 → 4 磁带 → 4 黑胶，只修饰声音，界面不变）      |
+| `t`                    | 切换配色主题（终端原生 → 磷光绿 → 经典青 → 深蓝 → 藏青 → 黑白 → 灰白 → 暗彩；仅 tuneux 基础版，fx 换肤走「设置 › 皮肤配色」） |
 | `l`                    | 显示/隐藏歌词（播放列表右侧面板，同目录同名 .lrc 自动加载）       |
 | `?`                    | 显示"关于"（版本号、简介、开源声明、版权），任意键关闭            |
 | `q`                    | 退出（自动保存配置）                              |
@@ -139,7 +141,7 @@ tuneux 在**符合 FFmpeg 开源协议**的前提下使用 FFmpeg：
 
 - **介质风格（playback_medium）**：`m` 键切换的介质风格（只修饰声音）会写入 `tuneux.toml` 的 `playback_medium`，下次启动自动恢复。默认 `none`（无修饰）；旧配置短名 `tape` / `vinyl` 兼容解析为对应中档。tuneux-fx 另有「介质」菜单可逐档选择。
 
-- **自定义键位（keymap）**：在 `tuneux.toml` 中可重映射播放控制键。动作名：`toggle_play`（播放/暂停）、`next`（下一曲）、`prev`（上一曲）、`volume_up`（音量+）、`volume_down`（音量−）、`cycle_repeat`（循环模式）、`toggle_shuffle`（随机）、`cycle_medium`（介质）、`cycle_visual`（频谱）、`toggle_group_view`（分组视图）、`toggle_lyrics`（歌词）、`cycle_cover`（封面）、`toggle_browser`（浏览器）。键描述语法：`[shift+][ctrl+][alt+]<键名>`，键名为单字符或 `space` / `tab` / `enter` / `esc` / `backspace` / `up` / `down` / `left` / `right` / `home` / `end`。示例：
+- **自定义键位（keymap）**：在 `tuneux.toml` 中可重映射播放控制键。动作名：`toggle_play`（播放/暂停）、`next`（下一曲）、`prev`（上一曲）、`volume_up`（音量+）、`volume_down`（音量−）、`cycle_repeat`（循环模式）、`toggle_shuffle`（随机）、`cycle_medium`（介质）、`cycle_visual`（频谱）、`cycle_theme`（配色主题）、`toggle_group_view`（分组视图）、`toggle_lyrics`（歌词）、`cycle_cover`（封面）、`toggle_browser`（浏览器）。键描述语法：`[shift+][ctrl+][alt+]<键名>`，键名为单字符或 `space` / `tab` / `enter` / `esc` / `backspace` / `up` / `down` / `left` / `right` / `home` / `end`。示例：
 
   ```toml
   [keymap]
@@ -161,6 +163,8 @@ tuneux 在**符合 FFmpeg 开源协议**的前提下使用 FFmpeg：
   - macOS：`~/Library/Application Support/tuneux/tuneux.toml`
   - Linux：`~/.config/tuneux/tuneux.toml`
 
+- **播放状态单独存放**：播放列表、断点续播位置与 ReplayGain 缓存存于同目录的 `tuneux-playlist.toml`（与 `tuneux-fx-playlist.toml` / `tuneux-max-playlist.toml` 命名一致）。旧版 `playlist.toml` 不再读取；若需沿用，请在首次启动前手工改名为 `tuneux-playlist.toml`。
+
 ## 系统要求
 
 | 平台      | 最低系统版本                      | CPU 架构                              | 系统依赖                                                                          |
@@ -169,9 +173,9 @@ tuneux 在**符合 FFmpeg 开源协议**的前提下使用 FFmpeg：
 | macOS   | macOS 10.13（High Sierra）及以上 | x86_64（Intel）、aarch64（M 系列）         | 无                                                                             |
 | Linux   | 主流发行版（内核自带 ALSA 即可）         | x86_64、aarch64（另支持 armv7、riscv64 等） | libasound2（多数发行版预装）；随包 ffmpeg（播放 APE/WMA 等扩展格式）；桌面环境（媒体键经 MPRIS，GNOME/KDE 均可） |
 
-> 上表为 tuneux / tuneux-fx（TUI 双产品）的平台面。**tuneux-max 的 Linux 版本后续支持**——
-> 本版 max 提供 macOS 与 Windows 应用包，**Linux 应用包暂未提供**；但 max 在 Linux 上
-> 可自行构建运行：`cargo build --release -p tuneux-max`（GUI 依赖见「构建」节）。
+> 上表为 tuneux / tuneux-fx（TUI 双产品）的平台面。0.6.2 不发布 tuneux-max
+> 二进制发行包；可在支持的平台自行构建：`cargo build --release -p tuneux-max`
+> （GUI 依赖见「构建」节）。
 
 最低 Rust 工具链版本：**1.88+**（ratatui 0.30 要求）
 
@@ -205,7 +209,7 @@ cargo build --release -p tuneux-max
 cargo run --release -p tuneux-max
 ```
 
-编译产物为 `target/release/tuneux-max`（Windows 下 `tuneux-max.exe`）。max 的发布应用包形态见「下载与首次运行」节（macOS 为 `.app` bundle，Windows 为 GUI 子系统 `.exe`）。
+编译产物为 `target/release/tuneux-max`（Windows 下 `tuneux-max.exe`）。0.6.2 不提供 max 预编译发行包；历史或后续应用包的形态与首次运行说明见「下载与首次运行」节。
 
 > **Linux 上自行构建运行 max**：**Linux 应用包暂未提供，后续支持 tuneux-max 的 Linux 版本**；
 > 但 max 在 Linux 上可正常构建运行，方式即上面的 `cargo build --release -p tuneux-max`。
@@ -215,39 +219,29 @@ cargo run --release -p tuneux-max
 
 ## 下载与首次运行
 
-| 系统      | CPU 架构              | 文件（以 v0.6.0 为例）                    |
+| 系统      | CPU 架构              | 文件（以 v0.6.2 为例）                    |
 | ------- | ------------------- | ---------------------------------- |
-| Windows | x86_64（多数 PC）       | `tuneux-0.6.0-windows-x86_64.zip`  |
-| Windows | arm64               | `tuneux-0.6.0-windows-arm64.zip`   |
-| macOS   | Apple Silicon（M 系列） | `tuneux-0.6.0-macos-arm64.tar.gz`  |
-| macOS   | Intel               | `tuneux-0.6.0-macos-x86_64.tar.gz` |
-| Linux   | x86_64              | `tuneux-0.6.0-linux-x86_64.tar.gz` |
-| Linux   | arm64               | `tuneux-0.6.0-linux-arm64.tar.gz`  |
+| Windows | x86_64（多数 PC）       | `tuneux-0.6.2-windows-x86_64.zip`  |
+| Windows | arm64               | `tuneux-0.6.2-windows-arm64.zip`   |
+| macOS   | Apple Silicon（M 系列） | `tuneux-0.6.2-macos-arm64.tar.gz`  |
+| macOS   | Intel               | `tuneux-0.6.2-macos-x86_64.tar.gz` |
+| Linux   | x86_64              | `tuneux-0.6.2-linux-x86_64.tar.gz` |
+| Linux   | arm64               | `tuneux-0.6.2-linux-arm64.tar.gz`  |
 
-插件版 **tuneux-fx** 另有一套下载包（以 v0.6.0 为例），压缩包内额外含 `plugins/` 插件目录（均衡器 / 压缩器 / 皮肤「Norton 蓝」「午夜蓝」）与《插件开发指南.txt》：
+插件版 **tuneux-fx** 另有一套下载包（以 v0.6.2 为例），压缩包内额外含 `plugins/` 插件目录（均衡器 / 压缩器 / 可视化 ×2（能量条、频谱瀑布）/ 皮肤「磷光绿」「经典青」「深蓝」「终端原生」「黑白」「灰白」「暗彩」7 款，共 11 组签名三件套）与《插件开发指南.txt》：
 
 | 系统      | CPU 架构              | 文件                                    |
 | ------- | ------------------- | ------------------------------------- |
-| Windows | x86_64（多数 PC）       | `tuneux-fx-0.6.0-windows-x86_64.zip`  |
-| Windows | arm64               | `tuneux-fx-0.6.0-windows-arm64.zip`   |
-| macOS   | Apple Silicon（M 系列） | `tuneux-fx-0.6.0-macos-arm64.tar.gz`  |
-| macOS   | Intel               | `tuneux-fx-0.6.0-macos-x86_64.tar.gz` |
-| Linux   | x86_64              | `tuneux-fx-0.6.0-linux-x86_64.tar.gz` |
-| Linux   | arm64               | `tuneux-fx-0.6.0-linux-arm64.tar.gz`  |
+| Windows | x86_64（多数 PC）       | `tuneux-fx-0.6.2-windows-x86_64.zip`  |
+| Windows | arm64               | `tuneux-fx-0.6.2-windows-arm64.zip`   |
+| macOS   | Apple Silicon（M 系列） | `tuneux-fx-0.6.2-macos-arm64.tar.gz`  |
+| macOS   | Intel               | `tuneux-fx-0.6.2-macos-x86_64.tar.gz` |
+| Linux   | x86_64              | `tuneux-fx-0.6.2-linux-x86_64.tar.gz` |
+| Linux   | arm64               | `tuneux-fx-0.6.2-linux-arm64.tar.gz`  |
 
-GUI 版 **tuneux-max** 以平台原生应用包交付：
-
-| 系统      | CPU 架构              | 文件（以 v0.6.0 为例）                                          |
-| ------- | ------------------- | -------------------------------------------------------- |
-| macOS   | Apple Silicon（M 系列） | `tuneux-max-0.6.0-macos-arm64.zip`（内含 `tuneux-max.app`）  |
-| macOS   | Intel               | `tuneux-max-0.6.0-macos-x86_64.zip`（内含 `tuneux-max.app`） |
-| Windows | x86_64              | `tuneux-max-0.6.0-windows-x86_64.zip`                    |
-
-> macOS 包解压后外层还有一层版本文件夹，里面是 `tuneux-max.app` 与《使用手册-tuneux-max.txt》（同级）；
-> 首次打开见下面的「macOS 首次运行（tuneux-max）」。
->
-> **tuneux-max 的 Linux 版本后续支持**——Linux 应用包暂未提供；Linux 上可自行构建运行
-> （`cargo build --release -p tuneux-max`，见「构建」节）。
+**0.6.2 不提供 tuneux-max 预编译发行包**，只公开源码；可自行构建运行
+（`cargo build --release -p tuneux-max`，见「构建」节）。下方 max 首次运行说明
+适用于提供 max 应用包的历史或后续版本。
 
 > 预编译二进制未做代码签名，首次运行会被系统拦截，按下面步骤放行即可。
 > 若不想处理提示，用源码自行编译（`cargo build --release`）则不会有任何拦截。
@@ -267,7 +261,7 @@ GUI 版 **tuneux-max** 以平台原生应用包交付：
 cd ~/Downloads
 
 # 2. 解压
-tar xzf tuneux-0.6.0-macos-arm64.tar.gz
+tar xzf tuneux-0.6.2-macos-arm64.tar.gz
 
 # 3. 清除隔离属性（关键一步）
 xattr -cr tuneux
@@ -286,7 +280,7 @@ max 的交付物与 TUI 不同：归档是 `.zip`（不是 `.tar.gz`），解压
 
 **方式一：右键打开（推荐，不用终端）**
 
-1. 双击 `tuneux-max-0.6.0-macos-arm64.zip` 解压，进入含 `tuneux-max.app` 的那层版本文件夹
+1. 双击 `tuneux-max-0.6.1-macos-arm64.zip` 解压，进入含 `tuneux-max.app` 的那层版本文件夹
 2. 右键点 `tuneux-max.app` → 选「打开」
 3. 弹窗里再点「打开」；之后双击即可正常启动
 
@@ -296,13 +290,13 @@ max 的交付物与 TUI 不同：归档是 `.zip`（不是 `.tar.gz`），解压
 cd ~/Downloads
 
 # 1. 解压（文件名按架构替换：arm64 = Apple Silicon，x86_64 = Intel）
-ditto -x -k tuneux-max-0.6.0-macos-arm64.zip .
+ditto -x -k tuneux-max-0.6.1-macos-arm64.zip .
 
 # 2. 清除隔离属性：目标是 .app 这个 bundle，不是裸二进制
-xattr -cr tuneux-max-0.6.0-macos-arm64/tuneux-max.app
+xattr -cr tuneux-max-0.6.1-macos-arm64/tuneux-max.app
 
 # 3. 启动（双击 .app 亦可）
-open tuneux-max-0.6.0-macos-arm64/tuneux-max.app
+open tuneux-max-0.6.1-macos-arm64/tuneux-max.app
 ```
 
 若仍被拦：系统设置 › 隐私与安全性 › 拉到底部点「仍要打开」。若提示「已损坏，无法打开」，
@@ -315,7 +309,7 @@ open tuneux-max-0.6.0-macos-arm64/tuneux-max.app
 ### Linux 首次运行
 
 ```bash
-tar xzf tuneux-0.6.0-linux-x86_64.tar.gz
+tar xzf tuneux-0.6.2-linux-x86_64.tar.gz
 chmod +x tuneux
 ./tuneux
 ```

@@ -64,6 +64,8 @@ const MAX_LOG_LEN: u32 = 64 * 1024;
 /// 宿主日志累计字节上限：单次限长之外再设总量防线——插件循环调用 log
 /// 可持续膨胀宿主内存；超限后 log 返回 3（与单次超限同口径，ABI 不变）。
 const MAX_LOG_TOTAL_BYTES: usize = 1024 * 1024;
+/// 日志条目数上限：空日志不占正文字节，但也必须受宿主内存配额约束。
+const MAX_LOG_ENTRIES: usize = 16 * 1024;
 /// 单个插件表的元素上限：wasmi 默认不限表元素，巨型初始表可在实例化期
 /// 绕过内存页配额让宿主分配数 GB（DoS）；4096 元素对控制面插件绰绰有余。
 const MAX_TABLE_ELEMENTS: usize = 4096;
@@ -196,10 +198,9 @@ impl WasmHost {
 
     /// 编译并装载插件，且要求信任三态至少达到 `min_policy`（API 级强制点）。
     ///
-    /// 与 [`WasmHost::load`] 的差别只在最后一步：装载成功后检查
-    /// `plugin.tristate.load_policy() <= min_policy`，不达标返回
-    /// [`HostError::PolicyDenied`]——让「未签名 / 未信任插件不得静默加载」
-    /// 成为运行时事实，而非依赖发行版自觉。
+    /// 与 [`WasmHost::load`] 的差别是：先检查 `tristate.load_policy() <= min_policy`，
+    /// 不达标直接返回 [`HostError::PolicyDenied`]，不会编译、实例化或执行插件的
+    /// `start` 函数。
     #[allow(clippy::too_many_arguments)]
     pub fn load_enforced(
         &self,
@@ -212,7 +213,16 @@ impl WasmHost {
         allowed: &[Capability],
         min_policy: LoadPolicy,
     ) -> Result<LoadedPlugin, HostError> {
-        let plugin = self.load(
+        let tristate = classify(plugin_id, manifest_bytes, wasm_bytes, signature, trust);
+        if tristate.load_policy() > min_policy {
+            return Err(HostError::PolicyDenied(format!(
+                "插件 {plugin_id} 信任三态 {}（策略 {:?}）未达要求 {:?}",
+                tristate.name(),
+                tristate.load_policy(),
+                min_policy,
+            )));
+        }
+        self.load(
             wasm_bytes,
             plugin_id,
             manifest_bytes,
@@ -220,16 +230,7 @@ impl WasmHost {
             trust,
             requested,
             allowed,
-        )?;
-        if plugin.tristate.load_policy() > min_policy {
-            return Err(HostError::PolicyDenied(format!(
-                "插件 {plugin_id} 信任三态 {}（策略 {:?}）未达要求 {:?}",
-                plugin.tristate.name(),
-                plugin.tristate.load_policy(),
-                min_policy,
-            )));
-        }
-        Ok(plugin)
+        )
     }
 
     /// 编译并装载插件：能力求交 → 按授予面注入宿主函数 → 实例化。
@@ -290,6 +291,7 @@ impl WasmHost {
             instance,
             fuel_per_call: self.fuel_per_call,
             tristate,
+            initialized: false,
         })
     }
 
@@ -312,8 +314,11 @@ impl WasmHost {
                     Some(Ok(())) => match String::from_utf8(buf) {
                         Ok(text) => {
                             let data = caller.data_mut();
-                            // 总量配额：累计超限拒绝（防循环调用膨胀宿主内存）。
-                            if data.log_bytes.saturating_add(text.len()) > MAX_LOG_TOTAL_BYTES {
+                            // 正文字节与条目数都设上限；否则空日志可无限增加
+                            // Vec<String> 的堆占用而不触发字节配额。
+                            if data.logs.len() >= MAX_LOG_ENTRIES
+                                || data.log_bytes.saturating_add(text.len()) > MAX_LOG_TOTAL_BYTES
+                            {
                                 return ERR_MEM;
                             }
                             data.log_bytes += text.len();
@@ -464,12 +469,29 @@ pub struct LoadedPlugin {
     fuel_per_call: u64,
     /// 验签得到的信任三态（身份标签，供发行版呈现徽章 / 标注 / 询问）。
     pub tristate: Tristate,
+    /// init 一次性守卫：重复调用换槽违背「init 之前为 None」契约。
+    initialized: bool,
 }
 
 impl LoadedPlugin {
     /// 调用插件导出的 init 函数（签名 (i32) -> i32）：传入插件被分配的槽位号，
     /// 返回插件返回值。每次调用前重置燃料预算。
     pub fn call_init(&mut self, slot: u32) -> Result<i32, HostError> {
+        if self.initialized {
+            return Err(HostError::Export("init 只能调用一次".to_string()));
+        }
+        let max_slots = self
+            .store
+            .data()
+            .eq_slots
+            .len()
+            .max(self.store.data().comp_slots.len()) as u32;
+        if slot >= max_slots {
+            return Err(HostError::Export(format!(
+                "槽位号 {slot} 超出范围（0..{max_slots}）"
+            )));
+        }
+        self.initialized = true;
         // 先绑定槽位再执行 init：init 期间的宿主函数调用据此校验，
         // 插件只能写自己分配的槽（防跨槽覆盖）。
         self.store.data_mut().assigned_slot = Some(slot);
@@ -519,12 +541,15 @@ impl LoadedPlugin {
 
     /// 调用插件的 `tick` 导出（周期调用机制：可视化插件在每帧 tick 里
     /// meter_read 取最新频谱）。插件未导出 tick 时跳过（返回 Ok(0)）；
-    /// 导出但执行 trap 返回 Err。每次调用前重置燃料预算。
+    /// 导出存在但类型不符返回 Export 错误，执行 trap 返回 Trap。每次调用前重置燃料预算。
     pub fn call_tick(&mut self) -> Result<i32, HostError> {
-        let Ok(func) = self.instance.get_typed_func::<(), i32>(&self.store, "tick") else {
-            // tick 是可选导出：未导出的插件不周期调用。
+        if self.instance.get_export(&self.store, "tick").is_none() {
             return Ok(0);
-        };
+        }
+        let func = self
+            .instance
+            .get_typed_func::<(), i32>(&self.store, "tick")
+            .map_err(|e| HostError::Export(format!("tick 导出签名应为 () -> i32：{e}")))?;
         self.store
             .set_fuel(self.fuel_per_call)
             .map_err(|e| HostError::Trap(e.to_string()))?;
@@ -560,6 +585,34 @@ mod tests {
     (i32.const 0))
 )
 "#;
+
+    #[test]
+    fn enforced_policy_rejects_before_start_execution() {
+        // start 若执行会立即 trap。策略前置时应得到 PolicyDenied，而不是
+        // 编译/实例化阶段的 trap 错误。
+        let wasm = wat::parse_str(r#"(module (func $start (unreachable)) (start $start))"#)
+            .expect("WAT 应编译成功");
+        let host = WasmHost::new(
+            100_000,
+            4,
+            std::array::from_fn(|_| Arc::new(EqParams::new())),
+            std::array::from_fn(|_| Arc::new(CompressorParams::new())),
+        );
+        let result = host.load_enforced(
+            &wasm,
+            "untrusted-start",
+            b"",
+            None,
+            &TrustList::default(),
+            &[],
+            &[],
+            LoadPolicy::Silent,
+        );
+        assert!(
+            matches!(result, Err(HostError::PolicyDenied(_))),
+            "不受信任插件必须在 start 执行前被拒绝"
+        );
+    }
 
     #[test]
     fn loads_and_runs_eq_plugin() {
@@ -820,6 +873,44 @@ mod tests {
     }
 
     #[test]
+    fn empty_logs_are_capped_by_entry_count() {
+        let wasm = wat::parse_str(
+            r#"(module
+  (import "host" "log" (func $log (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "init") (param i32) (result i32)
+    (local $n i32) (local $ok i32)
+    (loop $lp
+      (local.set $ok (i32.add (local.get $ok)
+        (i32.eqz (call $log (i32.const 0) (i32.const 0)))))
+      (local.set $n (i32.add (local.get $n) (i32.const 1)))
+      (br_if $lp (i32.lt_u (local.get $n) (i32.const 17000))))
+    (local.get $ok))
+)"#,
+        )
+        .expect("WAT 应编译成功");
+        let host = WasmHost::new(
+            20_000_000,
+            4,
+            std::array::from_fn(|_| Arc::new(EqParams::new())),
+            std::array::from_fn(|_| Arc::new(CompressorParams::new())),
+        );
+        let mut plugin = host
+            .load(
+                &wasm,
+                "empty-log-quota",
+                b"",
+                None,
+                &TrustList::default(),
+                &[],
+                &[],
+            )
+            .expect("应加载");
+        assert_eq!(plugin.call_init(0).expect("init"), 16_384);
+        assert_eq!(plugin.state().logs.len(), MAX_LOG_ENTRIES);
+    }
+
+    #[test]
     fn rejects_plugin_importing_ungranted_fn() {
         let wat = r#"
 (module
@@ -1053,6 +1144,32 @@ mod tests {
             )
             .expect("应加载");
         assert_eq!(plugin.call_tick().expect("无 tick 导出应跳过"), 0);
+    }
+
+    #[test]
+    fn call_tick_rejects_wrong_signature() {
+        let wasm = wat::parse_str(r#"(module (func (export "tick")))"#).expect("WAT 应编译成功");
+        let host = WasmHost::new(
+            100_000,
+            4,
+            std::array::from_fn(|_| Arc::new(EqParams::new())),
+            std::array::from_fn(|_| Arc::new(CompressorParams::new())),
+        );
+        let mut plugin = host
+            .load(
+                &wasm,
+                "bad-tick",
+                b"",
+                None,
+                &TrustList::default(),
+                &[],
+                &[],
+            )
+            .expect("应加载");
+        assert!(
+            matches!(plugin.call_tick(), Err(HostError::Export(_))),
+            "tick 存在但签名错误时应报告 Export，不能当成未导出"
+        );
     }
 
     /// 可视化画面约定：tick 里写 [0,4)=长度 + [1024..)=文本，宿主

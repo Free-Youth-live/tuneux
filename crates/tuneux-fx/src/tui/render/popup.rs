@@ -28,10 +28,10 @@ const LOGO: [&str; 6] = [
     "   ╚═╝     ╚═════╝  ╚═╝  ╚══╝ ╚══════╝  ╚═════╝  ╚═╝  ╚═╝",
 ];
 
-/// 皮肤选择器弹窗：清单 =「默认（DOS 风）+ 终端原生」+ 已加载皮肤；高亮项即时预览，
-/// 当前生效项标 √；Enter 确认并持久化、Esc 取消恢复原样。
+/// 皮肤选择器弹窗：按共享主题顺序排列，内置藏青位于第五位；
+/// 高亮项即时预览，当前生效项标 √；Enter 确认并持久化、Esc 取消恢复原样。
 pub(super) fn draw_skin_picker(frame: &mut ratatui::Frame, area: Rect, app: &App, pal: &Palette) {
-    let rows = app.skins.len() + 2; // +2 = 内置默认 / 终端原生
+    let rows = app.skins.len() + 1; // +1 = 内置藏青
     let box_w = area.width.min(44);
     let box_h = area.height.min(rows as u16 + 6);
     let box_area = Rect {
@@ -61,10 +61,12 @@ pub(super) fn draw_skin_picker(frame: &mut ratatui::Frame, area: Rect, app: &App
         } else {
             "  "
         };
-        let name = match i {
-            0 => app.i18n.t("skin.default_dos").into_owned().to_string(),
-            1 => app.i18n.t("skin.terminal_native").into_owned().to_string(),
-            _ => app.skins[i - 2].name.clone(),
+        let name = if i == crate::tui::app::BUILTIN_SKIN_INDEX {
+            app.i18n.t("skin.default_navy").into_owned().to_string()
+        } else {
+            crate::tui::app::skin_by_index(&app.skins, i)
+                .map(|skin| skin.name.clone())
+                .unwrap_or_default()
         };
         let cur = if app.skin_sel == i { " √" } else { "" };
         let mut style = fg;

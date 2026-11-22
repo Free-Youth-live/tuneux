@@ -46,18 +46,26 @@ pub fn portable_path(filename: &str, app_dir_name: &str) -> PathBuf {
 /// 返回 true 表示可写。任何 IO 错误（权限不足、只读文件系统、路径不存在）
 /// 均视为不可写，返回 false。
 pub fn is_writable(dir: &Path) -> bool {
-    let probe = dir.join(".tuneux_write_probe");
-    let writable = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&probe)
-        .is_ok();
-    // 探测成功后清理临时文件；失败也无妨，下次启动会覆盖
-    if writable {
-        let _ = std::fs::remove_file(&probe);
+    static NEXT_PROBE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    // 独占创建，避免多进程探测或已有同名文件时截断、误删他人文件。
+    for _ in 0..32 {
+        let id = NEXT_PROBE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let probe = dir.join(format!(".tuneux_write_probe_{}_{}", std::process::id(), id));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+        {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe);
+                return true;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return false,
+        }
     }
-    writable
+    false
 }
 
 #[cfg(test)]
@@ -68,6 +76,21 @@ mod tests {
     fn is_writable_on_temp_dir() {
         let dir = std::env::temp_dir();
         assert!(is_writable(&dir), "临时目录应可写");
+    }
+
+    #[test]
+    fn is_writable_preserves_existing_probe_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "tuneux_commonx_writable_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let existing = dir.join(".tuneux_write_probe");
+        std::fs::write(&existing, b"do not touch").unwrap();
+        assert!(is_writable(&dir));
+        assert_eq!(std::fs::read(&existing).unwrap(), b"do not touch");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

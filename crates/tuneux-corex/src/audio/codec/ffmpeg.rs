@@ -49,8 +49,8 @@
 //!
 //! ## 一次探测多字段（ffprobe）
 //!
-//! `probe_sample_rate` 钩子与 `open` 共用同一发 ffprobe（flat
-//! key=value 输出），顺带取时长 / 码率 / 编码名：时长回填
+//! `probe_sample_rate` 钩子与 `open` 分别调用同一个探测函数（flat
+//! key=value 输出），但每次都会独立执行 ffprobe；后者同时取时长 / 码率 / 编码名：时长回填
 //! `AudioParams.duration`（收口长尾格式时长为空的缺口），编码名用于
 //! 技术参数显示。**ffprobe 缺席或失败单独容错**：回退旧口径 48k 出口
 //! （命令行钉 `-ar 48000`，行为同改造前），不影响解码主路。探测值与
@@ -97,7 +97,7 @@ const FFMPEG_EXTENSIONS: &[&str] = &[
     "mkv", "avi", "ts", "m2ts", "wmv", "mpg", "mpeg", "vob", "mp4", "mov", "rmvb",
 ];
 
-/// ffmpeg / ffprobe 解析结果缓存（含负结果），进程内只解析一次。
+/// ffmpeg / ffprobe 的可执行文件查找结果（含负结果），进程内只查找一次。
 static FFMPEG_BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
 static FFPROBE_BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
 
@@ -107,7 +107,7 @@ const WAV_HEADER_SCAN_LIMIT: usize = 64 * 1024;
 /// 采样率合理性上限（Hz）：768 kHz 覆盖 768k PCM 与 DSD128 转换率
 /// （705.6 kHz）。恶意构造的容器可声明荒谬采样率（u32 上限），若照单
 /// 全收会触发巨额缓冲分配（4 GHz × 8 B/10 ≈ 3.4 GB）——本地 DoS 面，
-/// 两处入口（ffprobe 探测值 / WAV 头实测值）都必须过未钩。
+/// 两处入口（ffprobe 探测值 / WAV 头实测值）都必须经过滤。
 const MAX_SANE_SAMPLE_RATE: u32 = 768_000;
 /// 声道数合理性上限：8 = 7.1 布局上限（输出侧另有 -ac 2 归一，
 /// 此处仅防畸形头把 u16 上限当声道数参与缓冲尺寸计算）。
@@ -321,7 +321,11 @@ fn probe_media(ffprobe: &Path, path: &Path) -> Option<ProbeInfo> {
 /// （`open` 侧同步回退 48k 出口，行为同改造前）。
 pub(crate) fn probe_sample_rate(path: &Path) -> Option<u32> {
     let ffprobe = ffprobe_bin()?;
-    probe_media(&ffprobe, path).and_then(|i| i.sample_rate)
+    // 探测出口与 open_impl 同口径过合理性钳制：恶意容器声明的荒谬采样率
+    // 不得原样流出到直通/重建路径。
+    probe_media(&ffprobe, path)
+        .and_then(|i| i.sample_rate)
+        .filter(|rate| sane_rate(*rate))
 }
 
 // ---------------------------------------------------------------------------
@@ -407,6 +411,9 @@ fn decode_args(input: &Path, seek_secs: Option<f64>, pin_48k: bool) -> Vec<OsStr
     }
     args.push("-i".into());
     args.push(input.as_os_str().to_os_string());
+    // 与探测（-select_streams a:0）钉同一音轨，多音轨文件不会因 ffmpeg
+    // 自选「最佳」轨导致采样率/声道与探测不一致（变速变调）。
+    args.extend(["-map", "0:a:0"].iter().map(OsString::from));
     args.extend(["-vn", "-sn"].iter().map(OsString::from));
     if pin_48k {
         args.extend(["-ar", "48000"].iter().map(OsString::from));
@@ -417,6 +424,18 @@ fn decode_args(input: &Path, seek_secs: Option<f64>, pin_48k: bool) -> Vec<OsStr
             .map(OsString::from),
     );
     args
+}
+
+/// PCM 读取缓冲长度（字节）：100ms 的 f32le 交错流，下限 4096，
+/// 并**对齐到 4 字节的倍数**。
+///
+/// 对齐是硬契约：f32le 样本 4 字节，非 4 倍数的缓冲尾会被
+/// `as_chunks::<4>` 丢弃，造成永久字节错位（样本流整体错拍）。
+/// 构造期（探测采样率）与头解析后的重算（WAV 头实测值）两条路径
+/// 必须共用本函数，防止口径漂移——只对齐一处、另一处漏改时，
+/// 探测值与实测值不一致的流仍会错拍。
+fn pcm_buf_len(sample_rate: u32, channels: u16) -> usize {
+    (sample_rate as usize * usize::from(channels) * 4 / 10).max(4096) & !3
 }
 
 /// FFmpeg 进程外解码后端。
@@ -502,12 +521,12 @@ impl FfmpegBackend {
             duration,
         );
 
-        let rate = sample_rate.unwrap_or(48_000) as usize;
         let backend = Self {
             child: None,
             ffmpeg_bin: ffmpeg,
             params,
-            pcm_buf: vec![0u8; ((rate * 2 * 4 / 10).max(4096)) & !3], // 100ms 立体声 f32le（对齐到 4 的倍数：f32le 样本 4 字节，非对齐的缓冲尾数会被 as_chunks 丢弃导致永久字节错位）
+            // 100ms 立体声 f32le；对齐契约见 pcm_buf_len（两处共用一源）。
+            pcm_buf: vec![0u8; pcm_buf_len(sample_rate.unwrap_or(48_000), 2)],
             pending: Vec::new(),
             pending_pos: 0,
             header_done: false,
@@ -634,10 +653,9 @@ impl DecoderBackend for FfmpegBackend {
                         } else {
                             // 以头部实际率/声道校准缓冲（正常与探测一致；
                             // 不一致时按头部适配，参数仍以探测口径上报）。
-                            let buf_len =
-                                (header.sample_rate as usize * usize::from(header.channels) * 4
-                                    / 10)
-                                    .max(4096);
+                            // 对齐契约见 pcm_buf_len——此前此处漏对齐，
+                            // 探测率与实测率不一致的流会永久错拍。
+                            let buf_len = pcm_buf_len(header.sample_rate, header.channels);
                             if self.pcm_buf.len() != buf_len {
                                 self.pcm_buf = vec![0u8; buf_len];
                             }
@@ -1241,5 +1259,28 @@ mod tests {
             other => panic!("回退路径首解码应成功，实际：{other:?}"),
         }
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// PCM 缓冲长度对齐契约：任意采样率/声道组合下长度必须是 4 的倍数。
+    ///
+    /// 回归：47952 Hz × 2ch 的裸式 `rate*ch*4/10 = 38361` 非 4 倍数，
+    /// 尾部字节被 `as_chunks::<4>` 丢弃 → 此后每块样本流永久错拍；
+    /// 且构造期与 WAV 头重算两条路径必须同一结果（防口径漂移）。
+    #[test]
+    fn pcm_buf_len_is_four_byte_aligned() {
+        for (rate, ch) in [
+            (48_000u32, 2u16),
+            (44_100, 2),
+            (47_952, 2),
+            (8_000, 1),
+            (705_600, 2),
+        ] {
+            let len = pcm_buf_len(rate, ch);
+            assert_eq!(len % 4, 0, "{rate} Hz × {ch}ch 的缓冲长度须 4 字节对齐");
+            assert!(len >= 4096, "下限 4096 应生效");
+        }
+        // 47952×2 的裸式 = 38361（%4 = 1）——对齐后应为 38360；
+        // 本断言在「未对齐」实现下必红（能抓住原缺陷）。
+        assert_eq!(pcm_buf_len(47_952, 2), 38_360);
     }
 }

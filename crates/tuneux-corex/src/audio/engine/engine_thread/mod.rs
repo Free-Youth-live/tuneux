@@ -19,6 +19,8 @@
 //! - 音频线程 → decoder_cmd → 解码线程
 //! - 解码线程 → 主线程：finished（EOF）/ failed（打开解码失败）/
 //!   track_switched（无缝切换）
+//! - 解码线程 → 音频线程：当前曲目通知（Load / LoadAndSeek / LoadRange /
+//!   无缝切换 / Stop）——音频线程据此同步设备热切换的 reload 目标
 //!
 //! ## 子模块（文件过大拆分）
 //!
@@ -49,6 +51,13 @@ use self::decoder_loop::decoder_loop;
 
 use self::stream_builder::RING_CAPACITY;
 
+/// 「当前曲目」引用：路径 + 可选区间（None = 整文件）。
+///
+/// 解码线程 → 音频线程 的通知载荷；`Option` 外层为 None 表示「无当前曲目」
+/// （Stop 清除）。无缝切曲只在解码线程内发生，音频线程据此类通知同步
+/// 设备热切换的 reload 目标，避免切曲后 reload 旧曲。
+type CurrentTrack = (std::path::PathBuf, Option<(f64, Option<f64>)>);
+
 /// 启动音频线程与解码线程。返回设备采样率（用于进度计算）。
 ///
 /// 在调用线程内完成 cpal 设备初始化（可能失败需传播错误），
@@ -78,6 +87,13 @@ pub(super) fn spawn_threads(
     // —— decoder 命令通道（音频线程 → 解码线程）——
     let (dec_cmd_tx, dec_cmd_rx) = crossbeam_channel::unbounded::<DecoderCmd>();
 
+    // —— 解码线程 → 音频线程 的「当前曲目」通知通道 ——
+    // 无缝切曲只发生在解码线程内：Load/Stop 等命令均由音频线程转发，
+    // 音频线程无从得知切换后的新曲目。解码线程在每次曲目变化（Load /
+    // LoadAndSeek / LoadRange / 无缝切换 / Stop）时推送权威路径/区间，
+    // 音频线程主循环逐条消费，设备热切换的 reload 恒指向当前曲目。
+    let (cur_track_tx, cur_track_rx) = crossbeam_channel::unbounded::<Option<CurrentTrack>>();
+
     // —— 初始化同步通道：音频线程把"流创建结果"同步回 spawn_threads ——
     // 必须同步等：cpal 流可能因设备独占等原因失败，Engine::new 必须知道
     // 才能向用户报错。音频线程建流后通过该通道发送 Ok/Err，然后继续主循环。
@@ -89,6 +105,7 @@ pub(super) fn spawn_threads(
         let finished_tx = finished_tx.clone();
         let failed_tx = failed_tx.clone();
         let track_switched_tx = track_switched_tx.clone();
+        let cur_track_tx = cur_track_tx.clone();
         let close = Arc::clone(&close);
         std::thread::Builder::new()
             .name("tuneux-decoder".into())
@@ -100,6 +117,7 @@ pub(super) fn spawn_threads(
                     finished_tx,
                     failed_tx,
                     track_switched_tx,
+                    cur_track_tx,
                     close,
                     device_sample_rate,
                     device_channels,
@@ -107,14 +125,17 @@ pub(super) fn spawn_threads(
             })?;
     }
 
-    // 超时/断连路径需要置 close，但原 close 会被 move 进下方音频线程闭包。
+    // 超时/断连/音频 spawn 失败路径需要置 close，但原 close 会被 move 进
+    // 下方音频线程闭包。
     let close_err = Arc::clone(&close);
+    // 音频 spawn 失败时补发 Exit 用：dec_cmd_tx 将被 move 进音频闭包。
+    let dec_cmd_tx_err = dec_cmd_tx.clone();
 
     // —— spawn 音频线程（持 consumer 与 cpal Stream）——
     // 栈余量 4MB：build_stream 帧含回调管线的栈上定长缓冲（FFT 环形缓冲等），
     // 默认 2MB 栈在管线结构体化后实测溢出（RUST 默认 spawned 线程栈偏小）；
     // 内存按页懒提交，余量不占常驻。
-    std::thread::Builder::new()
+    let audio_spawn = std::thread::Builder::new()
         .name("tuneux-audio".into())
         .stack_size(4 * 1024 * 1024)
         .spawn(move || {
@@ -127,13 +148,23 @@ pub(super) fn spawn_threads(
                 device_channels,
                 cmd_rx,
                 dec_cmd_tx,
+                cur_track_rx,
                 state,
                 finished_tx,
                 failed_tx,
                 close,
                 init_tx,
             );
-        })?;
+        });
+    if let Err(e) = audio_spawn {
+        // 音频线程 spawn 失败：解码线程已先行启动且仍在等待命令——置 close
+        // 并发 Exit 让它退出（与下方 init 超时/断连路径同口径），否则解码
+        // 线程空转永不回收。dec_cmd_tx 已 move 进音频
+        // 闭包（失败即随闭包 drop），这里用预先 clone 的发送端补发 Exit。
+        close_err.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = dec_cmd_tx_err.send(DecoderCmd::Exit);
+        return Err(e.into());
+    }
 
     // 等待音频线程初始化结果。带超时避免极端情况下死等（cpal 本身初始化一般 <100ms）。
     match init_rx.recv_timeout(Duration::from_secs(2)) {

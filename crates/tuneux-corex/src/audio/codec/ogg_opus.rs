@@ -28,6 +28,11 @@ const PAGE_HEADER_LEN: usize = 27;
 /// 下一段仍属于同一个逻辑包。
 const LACING_CONTINUE: u8 = 255;
 
+/// 跨页重组包的字节上限：合法 Opus 包不超过 1275 字节（RFC 6716 上限）。
+/// Ogg 通用层按最严的合法上限设防——全 255 续段表的畸形流会把整文件
+/// 累积进内存，超限视为畸形流报解码错误。
+const MAX_REASSEMBLED_PACKET_LEN: usize = 1275;
+
 /// Ogg 页头类型 bit0：续页标记——该页以"前一页未完包"的续段开头。
 /// 续页不能作为 seek 起点（直接落到它会把未完包解成被截断的首包）。
 const PAGE_CONTINUED: u8 = 0x01;
@@ -41,6 +46,8 @@ pub(crate) struct OggPage {
     pub header_type: u8,
     /// 逻辑流绝对位置（granule position），单位为编码器定义（Opus 为 48kHz 样本，
     /// 且含 pre-skip）。页级 seek 用它二分定位目标页。
+    /// 续页该字段恒为 `u64::MAX`（RFC 7845 §4.1 规定 -1），不是有效位置，
+    /// 不得当作样本计数使用。
     pub granule_position: u64,
     /// 逻辑比特流序列号，用于区分多路复用 / 链式流。
     /// 首版只跟踪首条逻辑流，serial 已用于流筛选，无需额外读取。
@@ -85,6 +92,9 @@ pub(crate) struct OggOpusReader {
     pending: Vec<u8>,
     /// 已重组完成、待消费的包队列（一页可能含多个包）。
     packet_buf: VecDeque<Vec<u8>>,
+    /// 目标流最近一个非续页的 granule position（续页 granule 恒为 -1，
+    /// 不记录）。回退 seek 越界钳位时用它换算流末位置（48 kHz 计数）。
+    last_granule: u64,
 }
 
 impl OggOpusReader {
@@ -96,7 +106,14 @@ impl OggOpusReader {
             serial: None,
             pending: Vec::new(),
             packet_buf: VecDeque::new(),
+            last_granule: 0,
         })
+    }
+
+    /// 返回目标流最近一个非续页的 granule position（流末位置，48 kHz 计数；
+    /// 尚未读到任何页时为 0）。
+    pub(crate) fn last_granule(&self) -> u64 {
+        self.last_granule
     }
 
     /// 重置到文件开头（用于 seek 的"从头重扫"），并清空所有流状态。
@@ -105,6 +122,7 @@ impl OggOpusReader {
         self.serial = None;
         self.pending.clear();
         self.packet_buf.clear();
+        self.last_granule = 0;
         Ok(())
     }
 
@@ -115,6 +133,7 @@ impl OggOpusReader {
         self.serial = None;
         self.pending.clear();
         self.packet_buf.clear();
+        self.last_granule = 0;
         Ok(())
     }
 
@@ -143,15 +162,18 @@ impl OggOpusReader {
                 Some(_) => {}
             }
             // 续页（bit0=1）从未完包开始，不是安全 seek 起点，跳过；
-            // 但它的 granule 仍是后续非续页首个完整包的起始位置。
+            // 续页 granule 恒为 -1（RFC 7845 §4.1，存储为 u64::MAX），
+            // 不参与 prev_granule 更新——写入会把后续非续页的
+            // prev_granule 污染成 u64::MAX，页级 seek 的 skip 换算
+            // 随之归零、落点错乱。仅非续页的 granule 是有效位置。
             if page.header_type & PAGE_CONTINUED == 0 {
                 points.push(OggSeekPoint {
                     granule_position: page.granule_position,
                     file_offset: offset,
                     prev_granule,
                 });
+                prev_granule = page.granule_position;
             }
-            prev_granule = page.granule_position;
         }
         Ok(points)
     }
@@ -239,6 +261,10 @@ impl OggOpusReader {
                 Some(s) if s != page.serial => continue, // 其它逻辑流，跳过
                 Some(_) => {}
             }
+            // 记录目标流非续页的 granule（续页为 -1，不记录）。
+            if page.header_type & PAGE_CONTINUED == 0 {
+                self.last_granule = page.granule_position;
+            }
 
             // 按段表把负载切回包：255 续段追加到 pending，<255 收尾成包。
             let mut offset = 0usize;
@@ -248,6 +274,12 @@ impl OggOpusReader {
                     return Err(DecodeError::Decode("Ogg 段表长度越界".to_string()));
                 }
                 self.pending.extend_from_slice(&page.payload[offset..end]);
+                // 防畸形流无界累积：跨页包超过合法 Opus 包上限即报错。
+                if self.pending.len() > MAX_REASSEMBLED_PACKET_LEN {
+                    return Err(DecodeError::Decode(
+                        "Ogg 跨页包超过 Opus 包上限（1275 字节）".to_string(),
+                    ));
+                }
                 offset = end;
                 if len < LACING_CONTINUE {
                     let done = std::mem::take(&mut self.pending);
@@ -589,6 +621,95 @@ mod tests {
         // 生产代码以底层 IO 错误（failed to fill whole buffer）上报越界——
         // 属合法错误路径；断言错误非空即可，不绑定具体文案。
         assert!(!format!("{err}").is_empty(), "段表越界应产生错误");
+        let _ = fs::remove_file(&path);
+    }
+
+    // ----------------------------------------------------------------
+    // 页级 seek 索引（granule / prev_granule）
+    // ----------------------------------------------------------------
+    /// 含跨页包（255 续段表）的流：续页 granule 恒为 u64::MAX（规范 -1），
+    /// 不得参与 prev_granule 更新——修复前它会把后续非续页的
+    /// prev_granule 污染成 u64::MAX，页级 seek 的 skip 换算归零。
+    /// 流布局：头页(granule 0) + 音频页(granule 960) + 续页(granule -1)
+    /// + 音频页(granule 2880)；期望第三个索引点 prev_granule=960。
+    #[test]
+    fn scan_seek_index_ignores_continued_page_granule() {
+        let head = page(0x02, 0, 0x0000_ABCD, 0, &[8], b"OpusHead");
+        let audio1 = page(0x00, 960, 0x0000_ABCD, 1, &[4], &[0x00, 0x00, 0x00, 0x00]);
+        let cont = page(0x01, u64::MAX, 0x0000_ABCD, 2, &[255, 5], &[0xAA; 255 + 5]);
+        let audio2 = page(0x00, 2880, 0x0000_ABCD, 3, &[4], &[0x11, 0x11, 0x11, 0x11]);
+        let mut stream = head;
+        stream.extend_from_slice(&audio1);
+        stream.extend_from_slice(&cont);
+        stream.extend_from_slice(&audio2);
+        let path = write_temp_ogg("seek_index", &stream);
+
+        let mut reader = OggOpusReader::open(&path).expect("open ok");
+        let idx = reader.scan_seek_index().expect("索引扫描应成功");
+        assert_eq!(idx.len(), 3, "续页不应进入索引");
+        assert_eq!(idx[0].granule_position, 0);
+        assert_eq!(idx[0].prev_granule, 0, "首点 prev_granule 应为 0");
+        assert_eq!(idx[1].granule_position, 960);
+        assert_eq!(
+            idx[1].prev_granule, 0,
+            "第二点 prev_granule 应为头页 granule"
+        );
+        assert_eq!(idx[2].granule_position, 2880);
+        assert_eq!(
+            idx[2].prev_granule, 960,
+            "续页 granule(-1) 不得污染其后索引点的 prev_granule"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    // ----------------------------------------------------------------
+    // 跨页重组上限（畸形流防线）
+    // ----------------------------------------------------------------
+    /// 恰好 1275 字节的跨页包（5×255 续段 + 0 段收尾）应正常重组。
+    #[test]
+    fn reassembly_accepts_packet_at_exact_size_limit() {
+        let payload: Vec<u8> = (0..1275).map(|i| (i & 0xFF) as u8).collect();
+        let p1 = page(
+            0x00,
+            0,
+            0x0000_DEF0,
+            0,
+            &[255, 255, 255, 255, 255],
+            &payload,
+        );
+        let p2 = page(0x00, 1275, 0x0000_DEF0, 1, &[0], &[]);
+        let mut stream = p1;
+        stream.extend_from_slice(&p2);
+        let path = write_temp_ogg("cap_ok", &stream);
+        let mut r = OggOpusReader::open(&path).expect("open ok");
+        let pkt = r.next_packet().expect("packet ok").expect("some");
+        assert_eq!(pkt.len(), 1275, "恰在上限的包应正常重组");
+        assert!(r.next_packet().expect("eof").is_none());
+        let _ = fs::remove_file(&path);
+    }
+
+    /// 超过上限（1276 字节：5×255 + 1）的跨页包应报 DecodeError::Decode。
+    #[test]
+    fn reassembly_rejects_packet_over_size_limit() {
+        let payload: Vec<u8> = (0..1276).map(|i| (i & 0xFF) as u8).collect();
+        let p1 = page(
+            0x00,
+            0,
+            0x0000_DEF1,
+            0,
+            &[255, 255, 255, 255, 255],
+            &payload[..1275],
+        );
+        let p2 = page(0x01, u64::MAX, 0x0000_DEF1, 1, &[1], &payload[1275..]);
+        let mut stream = p1;
+        stream.extend_from_slice(&p2);
+        let path = write_temp_ogg("cap_over", &stream);
+        let mut r = OggOpusReader::open(&path).expect("open ok");
+        let err = r.next_packet().expect_err("超限跨页包应报错");
+        assert!(
+            matches!(err, DecodeError::Decode(_)),
+            "应为 DecodeError::Decode，实际：{err}"
+        );
         let _ = fs::remove_file(&path);
     }
 }

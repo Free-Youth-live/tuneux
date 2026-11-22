@@ -55,6 +55,22 @@ impl App {
         md
     }
 
+    /// 排空恢复期元数据回填事件（每帧上限 limit 条）：只补缺失项，
+    /// 不覆盖热路径已提取的缓存。返回本帧合入条数。
+    pub(crate) fn drain_restore_metadata(&mut self, limit: usize) -> usize {
+        let mut drained = 0;
+        while drained < limit {
+            match self.restore_meta_rx.try_recv() {
+                Ok((path, md)) => {
+                    drained += 1;
+                    self.metadata_cache.entry(path).or_insert(md);
+                }
+                Err(_) => break,
+            }
+        }
+        drained
+    }
+
     /// 按路径 + 目标尺寸取封面网格缩略图（带缓存）。
     ///
     /// 封面浏览网格专用：命中缓存直接返回 RGBA；未命中则提取封面字节→解码→缩放，

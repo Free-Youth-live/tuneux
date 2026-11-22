@@ -17,8 +17,12 @@ pub struct Bookmark {
     #[serde(default)]
     pub cue_start_ms: Option<u64>,
     /// 播放位置（秒；整轨书签相对文件头，分轨书签相对分轨头）。
+    /// 缺字段时回落 0（旧版本/手工编辑的文件不会因缺字段整表失败）。
+    #[serde(default)]
     pub position_secs: f64,
     /// 展示标签（一般取曲目标题；缺失时用文件名兜底）。
+    /// 缺字段时回落空串（旧版本/手工编辑的文件不会因缺字段整表失败）。
+    #[serde(default)]
     pub label: String,
 }
 
@@ -69,7 +73,6 @@ impl BookmarkList {
     ///
     /// `cue_start_ms` 为 `None` 时匹配整轨书签；否则匹配同起点的分轨书签。
     /// 与 `remove(path)` 的区别：不会误删同路径下的其他分轨书签。
-    #[cfg(test)]
     pub fn remove_exact(&mut self, path: &Path, cue_start_ms: Option<u64>) -> bool {
         let before = self.items.len();
         self.items
@@ -85,7 +88,6 @@ impl BookmarkList {
     ///
     /// `cue_start_ms` 为 `None` 时匹配整轨书签；否则匹配同起点的分轨书签。
     /// 与 `get(path)` 的区别：不会在存在多条同路径书签时误取首条。
-    #[cfg(test)]
     pub fn get_exact(&self, path: &Path, cue_start_ms: Option<u64>) -> Option<&Bookmark> {
         self.items
             .iter()
@@ -167,6 +169,34 @@ mod tests {
             .get_exact(Path::new("/album.flac"), Some(999_000))
             .is_none());
         assert!(list.get_exact(Path::new("/other.mp3"), None).is_none());
+    }
+
+    /// serde 契约快照：全字段 toml 往返不丢失不重命名；缺
+    /// label/position_secs 的旧文件按 serde(default) 回落，不整表失败
+    ///（修复前缺任一字段即整个书签表反序列化失败）。
+    #[test]
+    fn serde_missing_fields_fall_back_to_defaults() {
+        let text = r#"
+[[items]]
+path = "/album.flac"
+cue_start_ms = 60000
+"#;
+        let list: BookmarkList = toml::from_str(text).expect("缺字段应回落默认而非整表失败");
+        assert_eq!(list.items.len(), 1);
+        assert_eq!(list.items[0].position_secs, 0.0);
+        assert_eq!(list.items[0].label, "");
+        assert_eq!(list.items[0].cue_start_ms, Some(60_000));
+
+        // 全字段往返不丢失。
+        let mut full = BookmarkList::default();
+        full.add(Path::new("/a.mp3"), None, 12.5, "标题");
+        let text = toml::to_string_pretty(&full).expect("序列化");
+        let back: BookmarkList = toml::from_str(&text).expect("反序列化");
+        assert_eq!(back.items.len(), 1);
+        assert_eq!(back.items[0].path, PathBuf::from("/a.mp3"));
+        assert_eq!(back.items[0].position_secs, 12.5);
+        assert_eq!(back.items[0].label, "标题");
+        assert!(back.items[0].cue_start_ms.is_none());
     }
 
     /// `remove_exact` 只删目标键，不误删同路径的其他分轨书签

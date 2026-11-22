@@ -34,7 +34,12 @@ pub struct CueTrack {
 }
 
 impl CueTrack {
-    /// 起始扇区号（CD-DA 规格：75 扇区/秒，向下取整）。
+    /// 起始扇区号（CD-DA 规格：75 扇区/秒）。
+    ///
+    /// 换算按四舍五入到最近扇区：`start_secs` 由 MM:SS:FF 帧解析而来，
+    /// 帧值（1/75 秒）在 f64 下有表示误差（如 37 帧 ≈ 0.4933 秒，
+    /// ×75 得 36.9999…），直接截断会系统性少 1 帧；+0.5 再截断即
+    /// 四舍五入，保证帧级往返无损。
     pub fn start_sector(&self) -> u64 {
         let whole = self.start_secs.trunc() as u64;
         let frac = self.start_secs - self.start_secs.trunc();
@@ -118,7 +123,15 @@ pub fn decode_cue_bytes(bytes: &[u8]) -> String {
 pub fn parse_cue_sheet(content: &str) -> Result<CueSheet, CueParseError> {
     let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let mut tracks: Vec<CueTrack> = Vec::new();
+    // 与 tracks 一一对应：各曲目 TRACK 起始行号、是否出现过 INDEX 01。
+    // 缺 INDEX 01 报错时给出真实行号（修复前恒报第 1 行）；has_index01
+    // 用于区分「缺 INDEX 01」与「显式 INDEX 01 00:00:00」（两者
+    // start_secs 都是 0，不能按值判定）。
+    let mut track_lines: Vec<u32> = Vec::new();
+    let mut track_has_index01: Vec<bool> = Vec::new();
     let mut current: Option<CueTrack> = None;
+    let mut current_line_no: u32 = 0;
+    let mut has_index01: bool = false;
     let mut file_count = 0u32;
     let mut audio_file: Option<String> = None;
     let mut album_title: Option<String> = None;
@@ -155,6 +168,8 @@ pub fn parse_cue_sheet(content: &str) -> Result<CueSheet, CueParseError> {
         if upper.starts_with("TRACK ") {
             if let Some(t) = current.take() {
                 tracks.push(t);
+                track_lines.push(current_line_no);
+                track_has_index01.push(has_index01);
             }
             let idx = line["TRACK ".len()..]
                 .split_whitespace()
@@ -178,6 +193,8 @@ pub fn parse_cue_sheet(content: &str) -> Result<CueSheet, CueParseError> {
                 end_secs: None,
                 is_audio: mode == "AUDIO",
             });
+            current_line_no = line_no;
+            has_index01 = false;
             continue;
         }
 
@@ -192,7 +209,15 @@ pub fn parse_cue_sheet(content: &str) -> Result<CueSheet, CueParseError> {
                         Some(parse_quoted(raw).unwrap_or_else(|| raw.trim().to_string()));
                 } else if upper.starts_with("INDEX ") {
                     let mut parts = line["INDEX ".len()..].split_whitespace();
-                    let num: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    // INDEX 编号解析失败必须报错（修复前静默当 0，可能把
+                    // 畸形行误解读为 pregap）。
+                    let num: u32 = parts.next().and_then(|s| s.parse().ok()).ok_or_else(|| {
+                        CueParseError::Syntax {
+                            line: line_no,
+                            message: "INDEX 后缺少合法的十进制编号（如 INDEX 01 MM:SS:FF）"
+                                .to_string(),
+                        }
+                    })?;
                     let time_str = parts.next();
                     match num {
                         0 => {
@@ -214,6 +239,7 @@ pub fn parse_cue_sheet(content: &str) -> Result<CueSheet, CueParseError> {
                                 }
                             })?;
                             track.start_secs = secs;
+                            has_index01 = true;
                         }
                         _ => {}
                     }
@@ -234,6 +260,8 @@ pub fn parse_cue_sheet(content: &str) -> Result<CueSheet, CueParseError> {
 
     if let Some(t) = current.take() {
         tracks.push(t);
+        track_lines.push(current_line_no);
+        track_has_index01.push(has_index01);
     }
     if tracks.is_empty() {
         return Err(CueParseError::Syntax {
@@ -242,9 +270,16 @@ pub fn parse_cue_sheet(content: &str) -> Result<CueSheet, CueParseError> {
         });
     }
     for (pos, t) in tracks.iter().enumerate() {
-        if pos > 0 && t.start_secs == 0.0 {
+        if !track_has_index01[pos] {
+            if pos == 0 {
+                // 首轨缺 INDEX 01：按 CD 惯例补 0（首轨起点几乎总是
+                // 00:00:00，CueTrack 构造初值即 0.0）。选择补 0 而非报错
+                // 是破坏性最小的处理——此前静默接受的文件继续可用；后续
+                // 曲目缺 INDEX 01 仍是硬错误（无法确定区间，见下）。
+                continue;
+            }
             return Err(CueParseError::Syntax {
-                line: 1,
+                line: track_lines[pos],
                 message: format!(
                     "曲目 {} 缺少 INDEX 01 起点（仅 INDEX 00 pregap 不被支持）",
                     t.index
@@ -254,6 +289,20 @@ pub fn parse_cue_sheet(content: &str) -> Result<CueSheet, CueParseError> {
     }
     for i in 0..tracks.len().saturating_sub(1) {
         let next_start = tracks[i + 1].start_secs;
+        // 起点必须不递减：递减会产出 end < start 的负区间分轨；
+        // 显式 00:00:00 起点（后轨退化情形）沿用既有接受口径。
+        if next_start < tracks[i].start_secs {
+            return Err(CueParseError::Syntax {
+                line: track_lines[i],
+                message: format!(
+                    "曲目 {} 起点 {} 不晚于曲目 {} 起点 {}",
+                    tracks[i + 1].index,
+                    fmt_time(next_start),
+                    tracks[i].index,
+                    fmt_time(tracks[i].start_secs)
+                ),
+            });
+        }
         tracks[i].end_secs = Some(next_start);
     }
     Ok(CueSheet {
@@ -262,6 +311,12 @@ pub fn parse_cue_sheet(content: &str) -> Result<CueSheet, CueParseError> {
         audio_file,
         tracks,
     })
+}
+
+/// 秒数格式化为 m:ss，仅用于错误消息。
+fn fmt_time(seconds: f64) -> String {
+    let seconds = seconds.max(0.0) as u64;
+    format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
 /// 解析 CUE 文本，返回按文件顺序排列的曲目列表（向后兼容签名；
@@ -509,6 +564,72 @@ FILE "album.flac" WAVE
     fn missing_index01_errors() {
         let cue = "TRACK 01 AUDIO\n  INDEX 01 00:00:00\nTRACK 02 AUDIO\n  INDEX 00 01:00:00\n";
         assert!(parse_cue(cue).is_err());
+    }
+
+    /// 缺 INDEX 01 的报错行号应为该曲目 TRACK 起始行（修复前恒报第 1 行）。
+    #[test]
+    fn missing_index01_error_reports_track_line() {
+        let cue = "REM x\nFILE \"a.bin\" BINARY\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 00 00:05:00\n";
+        let err = parse_cue_sheet(cue).unwrap_err();
+        match err {
+            CueParseError::Syntax { line, message } => {
+                assert_eq!(line, 5, "应指向曲目 2 的 TRACK 行");
+                assert!(message.contains("曲目 2"), "{message}");
+            }
+        }
+    }
+
+    /// INDEX 编号解析失败（如 INDEX xx）必须报错并带真实行号，不能静默
+    /// 当 0 处理（修复前静默按 INDEX 00 解读）。
+    #[test]
+    fn index_number_parse_error_reports_real_line() {
+        let cue = "FILE \"a.bin\" BINARY\n  TRACK 01 AUDIO\n    INDEX xx 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 01:00:00\n";
+        let err = parse_cue_sheet(cue).unwrap_err();
+        match err {
+            CueParseError::Syntax { line, .. } => {
+                assert_eq!(line, 3, "报错应指向 INDEX 行")
+            }
+        }
+    }
+
+    /// 首轨缺 INDEX 01：按 CD 惯例补 0（显式取 start_secs = 0.0），
+    /// 其余曲目缺 INDEX 01 仍报错。
+    #[test]
+    fn first_track_missing_index01_defaults_to_zero() {
+        let cue = "TRACK 01 AUDIO\n  TITLE 无起点\nTRACK 02 AUDIO\n  INDEX 01 01:00:00\n";
+        let sheet = parse_cue_sheet(cue).expect("首轨缺 INDEX 01 应补 0 而非报错");
+        assert_eq!(sheet.tracks.len(), 2);
+        assert_eq!(sheet.tracks[0].start_secs, 0.0);
+        assert_eq!(sheet.tracks[1].start_secs, 60.0);
+    }
+
+    /// 后续曲目显式写 INDEX 01 00:00:00 应被接受——区分「缺 INDEX 01」与
+    /// 「显式 0 起点」（修复前按 start_secs == 0 判定会误拒）。
+    #[test]
+    fn explicit_zero_index01_on_later_track_accepted() {
+        let cue = "TRACK 01 AUDIO\n  INDEX 01 00:00:00\nTRACK 02 AUDIO\n  INDEX 01 00:00:00\n";
+        let sheet = parse_cue_sheet(cue).expect("显式 0 起点不是缺 INDEX 01");
+        assert_eq!(sheet.tracks.len(), 2);
+    }
+
+    /// start_sector 换算契约钉：四舍五入到最近扇区（文档与实现对齐）。
+    #[test]
+    fn start_sector_rounds_to_nearest_frame() {
+        let track = |secs: f64| CueTrack {
+            index: 1,
+            title: "t".into(),
+            performer: None,
+            start_secs: secs,
+            pregap_start_secs: None,
+            end_secs: None,
+            is_audio: true,
+        };
+        // 1 秒 + 37 帧：37/75 在 f64 下 ×75 得 36.9999…，四舍五入回 37。
+        assert_eq!(track(1.0 + 37.0 / 75.0).start_sector(), 75 + 37);
+        // 半帧边界（0.5/75 秒）四舍五入到 1 帧。
+        assert_eq!(track(0.5 / 75.0).start_sector(), 1);
+        // 整秒直通。
+        assert_eq!(track(2.0).start_sector(), 150);
     }
 
     #[test]

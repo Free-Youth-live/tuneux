@@ -3,8 +3,8 @@
 //! 四段布局：菜单栏 → 工作区 → 状态栏 → 功能键栏。
 //! 工作区为多面板拼合：左侧面板（文件浏览器/专辑封面，互斥）+ 播放列表/频谱
 //!（纵向）+ 歌词（横向），承 tuneux 的面板模型。配色完全由【调色板】驱动
-//!（见 [`super::theme`]）：渲染只认调色板里的颜色，不写死任何色值——将来插件
-//! 换皮肤就是换一份调色板，零返工。
+//!（见 [`super::theme`]）：渲染只认调色板里的颜色，不写死任何色值——皮肤插件
+//! 换肤即换一份调色板，零返工。
 
 mod gauge;
 mod layout;
@@ -20,11 +20,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tuneux_corex as audio;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 use super::app::menu::menus;
 use super::app::App;
-use super::theme::Palette;
+use super::theme::{cover_pixel, Palette};
 use crate::config::{Config, LeftPanel, LyricsMode, SpectrumMode};
 use crate::fs_browser::Entry;
 use crate::playlist::{Panel, PlaylistRow, Selection};
@@ -108,41 +108,12 @@ fn fmt_time(secs: f64) -> String {
     }
 }
 
-/// 按显示宽度截断到 max_w（CJK 全角字符按 2 计）。
+/// 按显示宽度截断到 max_w（CJK 全角字符按 2 计）。收口 displayx。
+use tuneux_displayx::{pad_left_to_width, pad_to_width};
+
+/// 按显示宽度截断到 max_w（CJK 全角字符按 2 计）。收口 displayx。
 fn truncate_to_width(s: &str, max_w: usize) -> String {
-    let mut out = String::new();
-    let mut w = 0;
-    for ch in s.chars() {
-        let cw = ch.width().unwrap_or(0);
-        if w + cw > max_w {
-            break;
-        }
-        out.push(ch);
-        w += cw;
-    }
-    out
-}
-
-/// 截断并用空格补齐到 max_w 显示宽度（左对齐，列表列用）。
-fn pad_to_width(s: &str, max_w: usize) -> String {
-    let t = truncate_to_width(s, max_w);
-    let w = UnicodeWidthStr::width(t.as_str());
-    if w >= max_w {
-        t
-    } else {
-        format!("{}{}", t, " ".repeat(max_w - w))
-    }
-}
-
-/// 截断并右对齐到 max_w 显示宽度（时长列用）。
-fn pad_left_to_width(s: &str, max_w: usize) -> String {
-    let t = truncate_to_width(s, max_w);
-    let w = UnicodeWidthStr::width(t.as_str());
-    if w >= max_w {
-        t
-    } else {
-        format!("{}{}", " ".repeat(max_w - w), t)
-    }
+    tuneux_displayx::truncate_to_width(s, max_w)
 }
 
 /// 取路径文件干名（去扩展名），缺标题时兜底显示。
@@ -157,6 +128,12 @@ fn file_stem(path: &Path) -> String {
 /// 分轨内进度（CUE 分轨按分轨区间换算）：返回（位置秒, 时长秒）。
 ///
 /// 无时长时返回（位置, 0.0）。供状态条与进度相关显示共用同一口径。
+///
+/// **契约：`duration` 为文件总时长口径，不得传区间长度**——CUE 末轨
+/// （end_ms=None）分支按「文件总时长 − 起点」计算；区间播放
+/// （`PlayRange`）下 `engine.duration()` 已被覆盖为区间长度，直接传入
+/// 会把时长算成 0（当前被“end_ms=None ⟺ 文件时长未知”的上游约束
+/// 掩盖，但契约必须显式冻结，防时长来源变化后静默回归）。
 pub(super) fn track_progress(
     engine: &audio::Engine,
     duration: Option<f64>,
@@ -185,11 +162,15 @@ pub fn draw(
     rows: &[PlaylistRow],
     dt: std::time::Duration,
 ) {
-    let pal = app.skin.unwrap_or_default();
+    let pal = app
+        .skin
+        .unwrap_or_default()
+        .for_terminal(tuneux_displayx::env_truecolor());
     let area = frame.area();
     // 鼠标命中矩形每帧重置（本帧未画的面板 = 不命中）
     app.browser_list_rect.set(ratatui::layout::Rect::default());
     app.menu_dropdown_rect.set(ratatui::layout::Rect::default());
+    app.menu_sub_rect.set(ratatui::layout::Rect::default());
     app.playlist_list_rect.set(ratatui::layout::Rect::default());
     let m = layout_metrics(
         (area.width, area.height),
@@ -302,37 +283,36 @@ pub fn draw(
             .borders(ratatui::widgets::Borders::ALL)
             .border_type(pal.border_type)
             .title(format!(" {} ", app.i18n.t("panel.filter")));
-        let engine = app.engine.as_ref();
         let mut lines: Vec<ratatui::text::Line> = Vec::new();
-        if let Some(e) = engine {
-            if let Some((slot, _)) = e.alloc_filter_slot() {
-                let params = &e.filter_slots()[slot as usize];
-                let l1 = format!(
-                    "  {}  {}  ",
-                    app.i18n.t("filter.cutoff"),
-                    if params.cutoff_hz() >= 1000.0 {
-                        format!("{:.1} kHz", params.cutoff_hz() / 1000.0)
-                    } else {
-                        format!("{:.0} Hz", params.cutoff_hz())
-                    }
-                );
-                let l2 = format!(
-                    "  {}  Q {:.2}  ",
-                    app.i18n.t("filter.resonance"),
-                    params.resonance_q()
-                );
-                let l3 = format!(
-                    "  {}  ",
-                    if params.enabled() {
-                        app.i18n.t("filter.on").into_owned()
-                    } else {
-                        app.i18n.t("filter.off").into_owned()
-                    }
-                );
-                lines.push(ratatui::text::Line::from(l1));
-                lines.push(ratatui::text::Line::from(l2));
-                lines.push(ratatui::text::Line::from(l3));
-            }
+        // 走记账式取参：渲染不再每帧 alloc——旧代码每帧向
+        // alloc_filter_slot 要第一个空闲槽，启用滤波后下一帧漂到别的槽、
+        // 面板数值跳变；未记账时才由 filter_params 分配一次。
+        if let Some(params) = app.filter_params() {
+            let l1 = format!(
+                "  {}  {}  ",
+                app.i18n.t("filter.cutoff"),
+                if params.cutoff_hz() >= 1000.0 {
+                    format!("{:.1} kHz", params.cutoff_hz() / 1000.0)
+                } else {
+                    format!("{:.0} Hz", params.cutoff_hz())
+                }
+            );
+            let l2 = format!(
+                "  {}  Q {:.2}  ",
+                app.i18n.t("filter.resonance"),
+                params.resonance_q()
+            );
+            let l3 = format!(
+                "  {}  ",
+                if params.enabled() {
+                    app.i18n.t("filter.on").into_owned()
+                } else {
+                    app.i18n.t("filter.off").into_owned()
+                }
+            );
+            lines.push(ratatui::text::Line::from(l1));
+            lines.push(ratatui::text::Line::from(l2));
+            lines.push(ratatui::text::Line::from(l3));
         }
         lines.push(ratatui::text::Line::from(""));
         lines.push(ratatui::text::Line::from(
@@ -450,7 +430,7 @@ fn draw_menu_dropdown(
     let (want_w, _) = menu_list_dim(&menu.items, app);
     let x = area.x + menu_x_offset_translated(app.menu_top, app);
     let x = x.min(right.saturating_sub(want_w as u16).max(area.x));
-    let Some(main_box) = draw_menu_list(
+    let Some((main_box, main_inner)) = draw_menu_list(
         frame,
         area,
         app,
@@ -463,6 +443,9 @@ fn draw_menu_dropdown(
     ) else {
         return;
     };
+    // 主下拉命中矩形：鼠标层按此解析顶级项；子菜单另记 menu_sub_rect，
+    // 互不覆盖——此前子菜单后写覆盖主矩形，点击按顶级索引误解析。
+    app.menu_dropdown_rect.set(main_inner);
     // 子菜单：贴在主下拉右缘、与父项同行（父项行 = 框体首行 + 边框 1 + 下标）；
     // 右缘放不下时同样左移（极端窄终端下允许叠在主下拉上，不裁字）。
     if let Some(sub_idx) = app.menu_sub {
@@ -477,7 +460,7 @@ fn draw_menu_dropdown(
                 .saturating_add(main_box.width)
                 .min(right.saturating_sub(sub_w as u16).max(area.x));
             let sub_y = main_box.y + 1 + sub_idx as u16;
-            draw_menu_list(
+            if let Some((_, sub_inner)) = draw_menu_list(
                 frame,
                 area,
                 app,
@@ -487,12 +470,16 @@ fn draw_menu_dropdown(
                 app.menu_sub_item,
                 sub_x,
                 sub_y,
-            );
+            ) {
+                app.menu_sub_rect.set(sub_inner);
+            }
         }
     }
 }
 
-/// 绘制一层菜单下拉（主下拉与子菜单共用），返回实际框体矩形（过小不画返回 None）。
+/// 绘制一层菜单下拉（主下拉与子菜单共用），返回 (框体矩形, 内区矩形)
+/// （过小不画返回 None）。命中矩形由调用方按层写入：主下拉记
+/// `menu_dropdown_rect`、子菜单记 `menu_sub_rect`，互不覆盖。
 #[allow(clippy::too_many_arguments)]
 fn draw_menu_list(
     frame: &mut ratatui::Frame,
@@ -504,7 +491,7 @@ fn draw_menu_list(
     sel: usize,
     x: u16,
     y: u16,
-) -> Option<Rect> {
+) -> Option<(Rect, Rect)> {
     let (want_w, want_h) = menu_list_dim(items, app);
     let avail_w = (area.x + area.width).saturating_sub(x) as usize;
     let avail_h = (area.y + area.height).saturating_sub(y) as usize;
@@ -529,10 +516,6 @@ fn draw_menu_list(
         .style(pal_style(None, pal.menu_bg));
     let inner = block.inner(box_area);
     frame.render_widget(block, box_area);
-
-    // 命中矩形写入（鼠标层据此判定点击是否在下拉内；主下拉与子菜单均写，
-    // 后写覆盖先写——只有最新渲染的下拉可被点击）。
-    app.menu_dropdown_rect.set(inner);
 
     let inner_w = inner.width as usize;
     let lines: Vec<Line> = items
@@ -569,7 +552,7 @@ fn draw_menu_list(
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
-    Some(box_area)
+    Some((box_area, inner))
 }
 
 /// 播放列表区（或频谱/歌词）渲染分发器。
@@ -649,13 +632,16 @@ fn draw_playlist_or_spectrum(
                     // 此处仅为 match 穷尽性，不会执行到。
                     _ => {}
                 }
+                let cue = app.current_cue();
+                let pos = app.engine.as_ref().map(|e| e.position()).unwrap_or(0.0);
+                let position =
+                    tuneux_mediax::cue_relative_position(pos, cue.as_ref()) - lyrics_offset;
                 draw_lyrics_panel(
                     frame,
                     split[1],
-                    &app.engine,
+                    position,
                     app.current_lyrics.as_ref(),
                     pal,
-                    lyrics_offset,
                     &app.i18n,
                 );
             }
@@ -1038,10 +1024,9 @@ fn draw_playlist(
 fn draw_lyrics_panel(
     frame: &mut ratatui::Frame,
     area: Rect,
-    engine: &Option<audio::Engine>,
+    position: f64,
     lyrics_opt: Option<&lyrics::Lyrics>,
     pal: &Palette,
-    lyrics_offset: f64,
     i18n: &tuneux_commonx::I18n,
 ) {
     let block = Block::default()
@@ -1061,9 +1046,7 @@ fn draw_lyrics_panel(
         return;
     };
 
-    // 当前行：按播放位置定位，始终居中显示。
-    let pos = engine.as_ref().map(|e| e.position()).unwrap_or(0.0);
-    let current = lyrics.current_line(pos - lyrics_offset);
+    let current = lyrics.current_line(position);
     let visible = inner.height as usize;
     let start = current.saturating_sub(visible / 2);
     let lines: Vec<Line> = lyrics
@@ -1091,6 +1074,43 @@ fn draw_lyrics_panel(
 /// 专辑封面面板：halfblock 半块字符渲染（1 字符 = 2 垂直像素，近似正方形）。
 ///
 /// 占据左侧面板位置，`c` 键切换。无图时居中提示。
+fn cover_px(pal: &Palette, rgba: &image::RgbaImage, px: u32, py: u32, w: u32, h: u32) -> Color {
+    if py >= h || px >= w {
+        return cover_pixel(pal, 0, 0, 0, 0);
+    }
+    let [r, g, b, a] = rgba.get_pixel(px, py).0;
+    if a <= 128 {
+        return cover_pixel(pal, 0, 0, 0, 0);
+    }
+    if pal.dim_screen {
+        let (mut sr, mut sg, mut sb, mut n) = (0u32, 0u32, 0u32, 0u32);
+        for (dx, dy) in [(0i32, 0i32), (1, 0), (-1, 0), (0, 1), (0, -1)] {
+            let x = px as i32 + dx;
+            let y = py as i32 + dy;
+            if x >= 0 && x < w as i32 && y >= 0 && y < h as i32 {
+                let [r, g, b, a] = rgba.get_pixel(x as u32, y as u32).0;
+                if a > 128 {
+                    sr += r as u32;
+                    sg += g as u32;
+                    sb += b as u32;
+                    n += 1;
+                }
+            }
+        }
+        if n > 0 {
+            return cover_pixel(
+                pal,
+                sr.checked_div(n).unwrap_or_default() as u8,
+                sg.checked_div(n).unwrap_or_default() as u8,
+                sb.checked_div(n).unwrap_or_default() as u8,
+                255,
+            );
+        }
+        return cover_pixel(pal, 0, 0, 0, 0);
+    }
+    cover_pixel(pal, r, g, b, a)
+}
+
 fn draw_cover_panel(frame: &mut ratatui::Frame, area: Rect, app: &mut App, pal: &Palette) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1134,22 +1154,8 @@ fn draw_cover_panel(frame: &mut ratatui::Frame, area: Rect, app: &mut App, pal: 
             let py_bot = py_top + 1;
             if py_top < dst_h {
                 for px in 0..dst_w {
-                    let [r1, g1, b1, a1] = rgba.get_pixel(px, py_top).0;
-                    let top_color = if a1 > 128 {
-                        Color::Rgb(r1, g1, b1)
-                    } else {
-                        Color::Black
-                    };
-                    let bot_color = if py_bot < dst_h {
-                        let [r2, g2, b2, a2] = rgba.get_pixel(px, py_bot).0;
-                        if a2 > 128 {
-                            Color::Rgb(r2, g2, b2)
-                        } else {
-                            Color::Black
-                        }
-                    } else {
-                        Color::Black
-                    };
+                    let top_color = cover_px(pal, rgba, px, py_top, dst_w, dst_h);
+                    let bot_color = cover_px(pal, rgba, px, py_bot, dst_w, dst_h);
                     // 恒用 ▀：图像奇数高时末行下半越界，仍画 ▀、下半取背景色。
                     let ch = "▀";
                     spans.push(Span::styled(
@@ -1250,40 +1256,12 @@ fn draw_cover_browser(frame: &mut ratatui::Frame, area: Rect, app: &mut App, pal
                     let py_top = rel * 2;
                     let py_bot = py_top + 1;
                     for px in 0..dw {
-                        let top = if py_top < dh {
-                            let [r, g, b, a] = rgba.get_pixel(px, py_top).0;
-                            if a > 128 {
-                                Some(Color::Rgb(r, g, b))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-                        let bot = if py_bot < dh {
-                            let [r, g, b, a] = rgba.get_pixel(px, py_bot).0;
-                            if a > 128 {
-                                Some(Color::Rgb(r, g, b))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-                        // 恒用 ▀（上半=顶像素，下半=底像素或背景）；奇数高封面末行
-                        // 底像素缺失时下半画背景色，不再丢失顶像素。
-                        let mut st = Style::default();
-                        if let Some(c) = top {
-                            st = st.fg(c);
-                        } else {
-                            st = st.fg(Color::Black);
-                        }
-                        if let Some(c) = bot {
-                            st = st.bg(c);
-                        } else {
-                            st = st.bg(Color::Black);
-                        }
-                        spans.push(Span::styled("▀".to_string(), st));
+                        let top = cover_px(pal, rgba, px, py_top, dw, dh);
+                        let bot = cover_px(pal, rgba, px, py_bot, dw, dh);
+                        spans.push(Span::styled(
+                            "▀".to_string(),
+                            Style::default().fg(top).bg(bot),
+                        ));
                     }
                 }
                 let area = Rect {
@@ -1526,16 +1504,24 @@ fn draw_status_bar(
     } else {
         app.i18n.t("status.stopped")
     };
-    // 分轨内进度（CUE 分轨按区间换算）。
+    // 分轨内进度（CUE 分轨按区间换算）。duration 口径按场景取用：
+    // CUE 分轨必须传文件总时长（metadata）——区间播放下引擎时长已被
+    // 覆盖为区间长度，而末轨（end_ms=None）分支按「文件总时长 − 起点」
+    // 计算，传区间长度会把时长算成 0；普通曲目传引擎时长（探测缺失时
+    // 引擎仍可能从解码器拿到，与文件总时长同源等价）。
+    let cue = app
+        .playlist
+        .current_index()
+        .and_then(|i| app.playlist.items().get(i))
+        .and_then(|it| it.cue.as_ref());
     let (pos, dur) = match app.engine.as_ref() {
-        Some(engine) => track_progress(
-            engine,
-            Some(engine.duration()),
-            app.playlist
-                .current_index()
-                .and_then(|i| app.playlist.items().get(i))
-                .and_then(|it| it.cue.as_ref()),
-        ),
+        Some(engine) => {
+            let duration = match cue {
+                Some(_) => app.current_metadata.as_ref().and_then(|m| m.duration),
+                None => Some(engine.duration()),
+            };
+            track_progress(engine, duration, cue)
+        }
         None => (0.0, 0.0),
     };
     let vol = app
@@ -1702,5 +1688,52 @@ mod tests {
             text.contains("PLUGIN_CANARY"),
             "插件画面应整区渲染：{text:?}"
         );
+    }
+
+    /// 主下拉与子菜单的命中矩形分记互不覆盖——修复前子菜单
+    /// 渲染后覆盖 menu_dropdown_rect，鼠标按顶级菜单索引误解析子菜单点击。
+    #[test]
+    fn menu_dropdown_and_submenu_rects_written_separately() {
+        let config = Config::default();
+        let mut app = App::new(&config);
+        app.menu_active = true;
+        app.menu_dropdown = true;
+        app.menu_top = 4; // 视图
+        app.menu_item = 1;
+        app.menu_sub = Some(1); // 「频谱」子菜单父项
+        app.menu_sub_item = 0;
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("建终端");
+        terminal
+            .draw(|f| super::draw(f, &mut app, &config, &[], std::time::Duration::ZERO))
+            .expect("绘制");
+        let main = app.menu_dropdown_rect.get();
+        let sub = app.menu_sub_rect.get();
+        assert_ne!(main, ratatui::layout::Rect::default(), "主下拉矩形应写入");
+        assert_ne!(sub, ratatui::layout::Rect::default(), "子菜单矩形应写入");
+        assert_ne!(main, sub, "主/子矩形必须分记互不覆盖");
+        // 子菜单行对齐父项：父项下标 1 → 子内区起点 = 主内区起点 + 2。
+        assert_eq!(sub.y, main.y + 2, "子菜单应与父项同行");
+    }
+
+    /// 滤波面板渲染走记账式取参——连续两帧不重复分配槽位。
+    #[test]
+    fn filter_panel_render_books_slot_once() {
+        let config = Config::default();
+        let mut app = App::new(&config);
+        if app.engine.is_none() {
+            return; // 无音频设备环境跳过
+        }
+        app.filter_visible = true;
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("建终端");
+        terminal
+            .draw(|f| super::draw(f, &mut app, &config, &[], std::time::Duration::ZERO))
+            .expect("绘制");
+        let first = app.filter_slot;
+        terminal
+            .draw(|f| super::draw(f, &mut app, &config, &[], std::time::Duration::ZERO))
+            .expect("绘制");
+        assert_eq!(app.filter_slot, first, "渲染每帧不得重复分配槽位");
     }
 }

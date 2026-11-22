@@ -40,13 +40,34 @@ pub enum PlaybackDecision {
     Noop,
 }
 
+/// 连续播放失败上限：达到后停止自动跳曲（列表全损坏 / 设备持续故障时
+/// 不再逐首尝试刷屏）。计数**饱和**在上限，只有用户手动发起点播才清零恢复。
+pub const CONSECUTIVE_FAILURE_LIMIT: u32 = 10;
+
+/// 播放失败后推进连续失败计数：返回 `(新计数, 是否继续自动跳下一首)`。
+///
+/// 三端（tuneux / tuneux-fx / tuneux-max）共用同一份决议，杜绝
+/// 「修了一端、另外两端未同步」：
+///
+/// - 未达上限：计数 +1，继续自动跳曲；
+/// - 达到上限：计数**保持在上限**（饱和），停止自动跳曲——清零只在
+///   用户用户手动发起点播时发生，保证持续故障不会造成「每 10 次再循环一轮」。
+///
+/// 纯函数（无引擎 / 无 UI），便于单测 9 / 10 / 11 / 20 次等边界。
+pub fn advance_failure_count(current: u32) -> (u32, bool) {
+    let next = current.saturating_add(1).min(CONSECUTIVE_FAILURE_LIMIT);
+    (next, next < CONSECUTIVE_FAILURE_LIMIT)
+}
+
 /// 断点续播判定：距结尾 5 秒内视为已听完 → 从头播（None）；否则续播（Some）。
 ///
 /// 纯函数：`saved_secs` 为上次保存的进度、`duration` 为曲目总时长。
 pub fn resume_secs(saved_secs: Option<f64>, duration: Option<f64>) -> Option<f64> {
+    // 时长为 0（解码层对无时长曲目显式置 0）视为未知时长：不做「已听完」判定，
+    // 否则已存断点永远被误判为听完、曲目每次从头重播。
     let already_finished = matches!(
         (saved_secs, duration),
-        (Some(s), Some(d)) if s >= d - 5.0
+        (Some(s), Some(d)) if d > 0.0 && s >= d - 5.0
     );
     saved_secs.filter(|&s| s > 0.5 && !already_finished)
 }
@@ -97,6 +118,29 @@ mod tests {
             start_ms,
             end_ms,
         }
+    }
+
+    /// 连续失败计数：1..9 次继续自动跳曲；第 10 次停止；上限处饱和，
+    /// 第 11、20 次失败不再跳曲也不再增长（防「每 10 次再循环」假修复）。
+    #[test]
+    fn advance_failure_count_stops_at_limit() {
+        let mut count = 0u32;
+        for expected in 1..=9 {
+            let (next, keep_skipping) = advance_failure_count(count);
+            assert_eq!(next, expected, "前 9 次失败计数逐次 +1");
+            assert!(keep_skipping, "第 {expected} 次失败仍应自动跳曲");
+            count = next;
+        }
+        let (next, keep_skipping) = advance_failure_count(count);
+        assert_eq!(next, CONSECUTIVE_FAILURE_LIMIT);
+        assert!(!keep_skipping, "第 10 次失败应停止自动跳曲");
+        // 上限处继续失败：第 11、20 次都不再跳曲、计数饱和。
+        for _ in 0..10 {
+            let (c, keep) = advance_failure_count(next);
+            assert_eq!(c, CONSECUTIVE_FAILURE_LIMIT, "上限处计数应饱和");
+            assert!(!keep, "上限之后不得恢复自动跳曲");
+        }
+        assert_eq!(advance_failure_count(0), (1, true), "手动清零后可重新计数");
     }
 
     #[test]

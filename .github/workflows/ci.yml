@@ -2,8 +2,8 @@
 # tuneux · 日常检查（push / PR 触发）
 #
 # 批 0 首推后生效：日常提交的质量兜底（release.yml 只管发布标签触发）。
-# 与 release 的 checks job 同口径：fmt / clippy 零告警 / test / 内容自检 /
-# 依赖核查，任一不过红叉。
+# 与 release 的 checks job 同口径：fmt / clippy 零告警 / test / 依赖核查，
+# 任一不过红叉。
 # =============================================================================
 
 name: 日常检查
@@ -38,13 +38,22 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: 测试
         run: cargo test --workspace
-      # 仅 push 事件跑发布前检查；
-      # pull_request（fork）检出的内容不可信，不在其上执行；
-      # fork PR 由 fmt/clippy/test/deny 兜底，合入后的 push 事件补全量检查。
-      - name: 内容与结构自检
-        if: github.event_name == 'push'
-        run: "true"
       - name: 依赖核查（advisories / bans / licenses / sources）
         run: |
           cargo install cargo-deny --locked --version 0.20.2
           cargo deny --workspace check
+
+  # Windows 腿：跨平台编译面与「插件验签守卫」——第一方插件 .sig 覆盖
+  # manifest 文本字节，行尾随平台漂移会破坏验签，只有
+  # Windows 实测跑得出来；单 ubuntu 矩阵对 rdev 媒体键等 Windows 专属
+  # 路径零编译覆盖。
+  checks-windows:
+    name: 质量检查（Windows）
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      - name: 编译检查（全目标全特性）
+        run: cargo check --workspace --all-targets --all-features
+      - name: 测试（fx 插件验签守卫）
+        run: cargo test -p tuneux-fx

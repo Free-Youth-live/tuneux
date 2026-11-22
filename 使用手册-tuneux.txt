@@ -29,7 +29,11 @@ tuneux 是「不羁的青春（FreeYouth）」的纯离线命令行音乐播放�
   在「终端」里执行（把路径换成你的解压目录）：
     cd 解压目录
     xattr -cr tuneux
+    xattr -cr ffmpeg/bin/ffmpeg
+    xattr -cr ffmpeg/bin/ffprobe
     ./tuneux
+  后两条解除下载隔离标记：漏做时随包 FFmpeg 组件无法被调用，
+  APE / WMA / DSD 等扩展格式会提示不支持（核心格式不受影响）。
 
 【Linux】
     chmod +x tuneux
@@ -93,8 +97,14 @@ tuneux 是「不羁的青春（FreeYouth）」的纯离线命令行音乐播放�
   /                   搜索（浏览器按文件名递归搜索；播放列表按
                       曲名/歌手/专辑/路径）；Esc 退出搜索
 
+  已知限制：播放列表为空且焦点在播放列表时，Enter 暂无动作（这是本版的
+  既定交互口径，下一版会定义空列表 Enter 的行为）。此时先按 b 打开浏览器，
+  再按 Enter 播放或加入曲目。
+
 【介质与其它】
   m                   切换介质风格（无 → 4 档磁带 → 4 档黑胶，只修饰声音）
+  t                   切换配色主题（终端原生 → 磷光绿 → 经典青 → 深蓝 → 藏青 →
+                      黑白 → 灰白 → 暗彩，即时生效并写回配置）
   i（或 Alt+Enter）    当前曲目属性弹窗（标签 / 技术参数 / 文件路径），
                       再按关闭
   ?                   显示「关于」（版本号、简介、开源声明、版权），再按关闭
@@ -199,10 +209,12 @@ m 键在 9 档间循环，只修饰声音（DSP）、不占界面：
   toggle_play（播放/暂停）、next（下一曲）、prev（上一曲）、
   volume_up（音量+）、volume_down（音量−）、
   cycle_repeat（循环模式）、toggle_shuffle（随机）、cycle_medium（介质）、
-  cycle_visual（频谱）、toggle_group_view（分组视图）、toggle_lyrics（歌词）、
+  cycle_visual（频谱）、cycle_theme（配色主题）、
+  toggle_group_view（分组视图）、toggle_lyrics（歌词）、
   cycle_cover（封面）、toggle_browser（浏览器）
 
-自定义映射为「加绑」语义：内置默认键始终有效，自定义键叠加生效。
+自定义键优先于内置默认键：自定义键与某内置键同键时，该键执行自定义动作
+（覆盖该键的内置动作）；未与自定义键冲突的内置键照常有效。
 
 键描述语法：[shift+][ctrl+][alt+]<键名>，键名为单字符或
 space / tab / enter / esc / backspace / up / down / left / right / home / end。
@@ -251,7 +263,8 @@ space / tab / enter / esc / backspace / up / down / left / right / home / end。
 
 【配置文件 tuneux.toml】
   保存音量、循环、随机、列宽（browser_ratio）、上次浏览目录、界面状态
-  （频谱/歌词/浏览器/封面开关）、介质风格、ReplayGain、键位、媒体键开关等。
+  （频谱/歌词/浏览器/封面开关）、介质风格、ReplayGain、配色主题（t 键
+  切换即时写回）、键位、媒体键开关等。
 
 【界面语言 lang】
   lang = "zh"（默认，内置中文）或 lang = "en"（官方英文，随包
@@ -259,8 +272,28 @@ space / tab / enter / esc / backspace / up / down / left / right / home / end。
   语言表缺失/损坏自动回退中文，绝不崩溃。基础版无菜单，语言经配置文件
   设定、重启生效。
 
-【播放状态 playlist.toml】
+【配色主题 theme】
+  共 8 套，按 t 键顺序：terminal 终端原生（默认，跟随终端自身配色）、
+  phosphor 磷光绿（黑底亮绿字、亮绿框线、选中反白——早期绿屏终端观感）、
+  classic 经典青（经典青框，改造前观感）、deepblue 深蓝、navy 藏青
+  （fx 内置同款：#10163A 蓝黑底、灰字、青框、黄键号）、blackwhite 黑白、
+  graywhite 灰白、dimcolor 暗彩。播放中按 t 键循环切换，即时生效并写回
+  配置（退出 / 定时保存时持久化）；未知值回落 terminal，配置文件手改在
+  下次启动生效。直通（亮）/ 降级（暗）/ 错误提示 / 电平档位的语义不随
+  主题改变，具体颜色随主题与可读性调整：黑白 / 灰白 / 暗彩等浅色主题会
+  按底色覆写曲名、直通技术参数、峰值帽等颜色保证可读。黑白 / 灰白 / 暗彩
+  刻意保留单色或反射屏的低对比观感，并非高对比无障碍主题。
+
+  真彩探测：Windows 默认按真彩（Windows Terminal 不设 COLORTERM，程序会按
+  WT_SESSION / TERM_PROGRAM / ConEmuANSI / TERM 等信号判断）；macOS Terminal.app
+  等不支持真彩的终端自动降级 16 色。可用环境变量强制指定：
+  TUNEUX_COLOR_DEPTH=16（强制 16 色降级）或 =truecolor（强制真彩）。
+
+【播放状态 tuneux-playlist.toml】
   保存播放列表、每首曲目的断点续播进度、ReplayGain 缓存。
+  与配置文件分开存放（同一目录）。旧版 playlist.toml 不再读取；若要从
+  旧版本沿用播放列表与断点，请在首次启动前把它手工改名为
+  tuneux-playlist.toml。
 
 【存储位置】
   默认：可执行文件同目录（适合 U 盘随身带，单文件即完整播放器）。
@@ -279,6 +312,8 @@ space / tab / enter / esc / backspace / up / down / left / right / home / end。
                     vinyl_standard / vinyl_aged，旧短名 tape/vinyl 兼容）
   browser_ratio     浏览器与播放列表的列宽比例
   dedup_on_add      加入播放列表时去重
+  theme             配色主题（phosphor / classic / deepblue / terminal /
+                    blackwhite / graywhite / dimcolor，默认 phosphor）
   media_keys_enabled 系统媒体键开关
   bar_style         频谱字符风格（matrix 默认 / blocks 块字符 / ascii 复古 /
                     hanzi 汉字柱，汉字为 2 列宽、横向分辨率减半）

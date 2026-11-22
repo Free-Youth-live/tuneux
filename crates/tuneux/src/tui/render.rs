@@ -10,11 +10,14 @@
 //! - [`popup`]：弹窗（"关于"）。
 
 use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::Style;
+use ratatui::widgets::Block;
 
 use crate::config;
 use crate::config::{LeftPanel, LyricsMode, SpectrumMode};
 use crate::playlist;
 use crate::tui::app::App;
+use crate::tui::palette;
 use tuneux_corex as audio;
 
 mod layout;
@@ -68,6 +71,8 @@ pub(crate) fn fmt_time(secs: f64) -> String {
     }
 }
 
+// 列宽辅助已收口 displayx（双 TUI 共用，防重复回潮）。
+
 pub fn draw(
     frame: &mut ratatui::Frame,
     app: &mut App,
@@ -76,6 +81,21 @@ pub fn draw(
     dt: std::time::Duration,
 ) {
     let area = frame.area();
+
+    // 主题铺底：若主题指定底色/字色（磷光绿 = 黑底绿字），先整屏铺一层，
+    // 后续未显式着色的文字（正文、列表行等）继承这套底色字色；显式着色的
+    // 边框与语义色不受影响（ratatui 单元格样式按字段覆盖）。
+    let pal = palette::pal();
+    if pal.bg.is_some() || pal.fg.is_some() {
+        let mut base = Style::default();
+        if let Some(bg) = pal.bg {
+            base = base.bg(bg);
+        }
+        if let Some(fg) = pal.fg {
+            base = base.fg(fg);
+        }
+        frame.render_widget(Block::default().style(base), area);
+    }
 
     // 布局单一真相源：所有尺寸从 layout_metrics 取，禁止在 draw 里
     // 手写高度/宽度公式（main.rs 事件循环也调同一个函数）。
@@ -202,6 +222,11 @@ pub fn draw(
 /// 分轨内进度（CUE 分轨按分轨区间换算）：返回（位置秒, 时长秒）。
 ///
 /// 无时长时返回（位置, 0.0）。供状态条与进度相关显示共用同一口径。
+///
+/// 契约：`duration` 参数为**文件总时长**口径（非区间长度）——末轨
+/// 分支按「文件总时长 − 起点」算时长；`PlayRange` 下引擎时长已被
+/// 覆盖为区间长度，不能直接传（本端调用点传 metadata，正确；三端
+/// 同口径遵循）。
 pub(super) fn track_progress(
     engine: &audio::Engine,
     duration: Option<f64>,
@@ -316,11 +341,13 @@ fn draw_playlist_or_spectrum(
                     // Full / Oscilloscope 已在上方分支处理
                     SpectrumMode::Full | SpectrumMode::Oscilloscope => {}
                 }
+                let cue = app.current_cue();
                 draw_lyrics_panel(
                     frame,
                     split[1],
                     &app.engine,
                     app.current_lyrics.as_ref(),
+                    cue.as_ref(),
                     &app.i18n,
                 );
             }

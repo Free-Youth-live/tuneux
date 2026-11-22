@@ -24,7 +24,7 @@ pub(crate) fn preload_target_of(item: &playlist::PlaylistItem) -> audio::Preload
 
 impl App {
     /// 当前条目的 CUE 引用（克隆；普通曲目为 None）。
-    fn current_cue(&self) -> Option<playlist::CueRef> {
+    pub(crate) fn current_cue(&self) -> Option<playlist::CueRef> {
         self.playlist
             .current_index()
             .and_then(|i| self.playlist.items().get(i))
@@ -103,6 +103,13 @@ impl App {
         // 记住切换前的路径：同一整轨文件的 CUE 分轨切换走文件内 Seek（不重开）。
         let prev_path = self.current_path.clone();
         let same_file = prev_path.as_ref() == Some(&path);
+        let prev_cover = same_file
+            .then(|| {
+                self.current_metadata
+                    .as_ref()
+                    .and_then(|md| md.cover.clone())
+            })
+            .flatten();
         self.current_metadata = Some(self.get_or_extract_metadata(&path));
         // CUE 分轨：标题/表演者优先取 .cue 内的曲目信息——与列表口径一致，
         // 状态栏与系统媒体面板显示分轨名而非整轨专辑名。
@@ -117,9 +124,13 @@ impl App {
         // 元数据缓存不带封面字节（省内存）；命中缓存切回时封面缺失，
         // 为当前曲目补提取一次，保证封面面板正常显示。已确认无封面的
         // 文件记负标记，不再重复整文件标签探测。
-        if !same_file {
-            if let Some(md) = self.current_metadata.as_mut() {
-                if md.cover.is_none() && !self.coverless_files.contains(&path) {
+        if let Some(md) = self.current_metadata.as_mut() {
+            if md.cover.is_none() {
+                // 同文件分轨切换：缓存命中的元数据不带封面字节，整体覆盖
+                // 会把旧封面清成 None——从旧元数据搬移封面，封面面板不断片。
+                if let Some(prev) = prev_cover {
+                    md.cover = Some(prev);
+                } else if !same_file && !self.coverless_files.contains(&path) {
                     md.cover = tuneux_mediax::metadata::TrackMetadata::from_file(&path).cover;
                     if md.cover.is_none() {
                         self.coverless_files.insert(path.clone());
@@ -128,8 +139,9 @@ impl App {
             }
         }
         self.current_path = Some(path.clone());
-        // 切曲：清空频谱峰值白帽，避免上一曲高峰压在新曲前奏上
+        // 切曲：清空频谱白帽和波形包络，避免上一曲残留到新区间。
         self.spectrum_peaks.borrow_mut().reset();
+        self.track_envelope.fill(0.0);
         if same_file {
             // 同一整轨文件的分轨切换：path 未变，封面/歌词复用，
             // 避免每个分轨边界多一次封面解码 + 磁盘读。
@@ -186,16 +198,30 @@ impl App {
         }
     }
 
+    /// 用户主动点播时恢复失败计数，自动跳曲继续走原有播放流程。
+    pub fn play_manually_and_update_current(&mut self, index: usize, config: &Config) {
+        self.consecutive_failures = 0;
+        self.play_and_update_current(index, config);
+    }
+
+    /// 手动切曲恢复自动跳曲能力；曲终和失败驱动的推进不得调用此入口。
+    fn handle_manual_nav_outcome(&mut self, outcome: playlist::NavOutcome, config: &Config) {
+        if matches!(outcome, playlist::NavOutcome::Switch(_)) {
+            self.consecutive_failures = 0;
+        }
+        self.handle_nav_outcome(outcome, config);
+    }
+
     /// 切到下一首（按 repeat + shuffle 策略）。
     pub fn advance_to_next_track(&mut self, config: &Config) {
         let outcome = self.playlist.next(config.repeat);
-        self.handle_nav_outcome(outcome, config);
+        self.handle_manual_nav_outcome(outcome, config);
     }
 
     /// 切到上一首（按 repeat + shuffle 策略）。
     pub fn advance_to_prev_track(&mut self, config: &Config) {
         let outcome = self.playlist.prev(config.repeat);
-        self.handle_nav_outcome(outcome, config);
+        self.handle_manual_nav_outcome(outcome, config);
     }
 
     /// 把 [`playlist::NavOutcome`] 翻译成实际的播放操作。
@@ -205,6 +231,8 @@ impl App {
                 self.play_and_update_current(idx, config);
             }
             playlist::NavOutcome::Repeat => {
+                self.track_envelope.fill(0.0);
+                self.spectrum_peaks.borrow_mut().reset();
                 // 单曲循环：重新发 Play 让流再起（CUE 分轨从片段起点起播）。
                 // 决策在 mediax 纯函数 single_repeat_decision，副作用在此执行。
                 let path_cue = self.playlist.current_index().and_then(|curr| {
@@ -276,6 +304,8 @@ impl App {
             return;
         }
         self.playlist.set_selected(idx);
+        self.track_envelope.fill(0.0);
+        self.spectrum_peaks.borrow_mut().reset();
         if let Some(item) = self.playlist.items().get(idx) {
             let album_opt = item.album.clone();
             let path = item.path.clone();
@@ -410,21 +440,23 @@ impl App {
         }
     }
 
-    /// 相对当前位置 seek（秒）；钳制在 [0, 时长] 内，CUE 分轨再钳到本曲区间。
+    /// 相对当前位置 seek（秒）；CUE 分轨钳到本曲区间，其他曲目钳到 [0, 时长]。
     pub(crate) fn seek_by(&mut self, delta: f64) {
         let (cur_pos, dur) = match &self.engine {
             Some(e) => (e.position(), e.duration()),
             None => return,
         };
-        let mut new_pos = cur_pos + delta;
-        if new_pos < 0.0 {
-            new_pos = 0.0;
-        }
-        if dur > 0.0 && new_pos > dur {
-            new_pos = dur;
-        }
-        // CUE 分轨：钳制在本曲区间 [start, end] 内。
-        let new_pos = self.clamp_cue_seek(new_pos);
+        let new_pos = if self.current_item_is_cue() {
+            // CUE 的进度是整文件绝对秒数，不能用分轨时长钳制它。
+            self.clamp_cue_seek((cur_pos + delta).max(0.0))
+        } else {
+            let new_pos = (cur_pos + delta).max(0.0);
+            if dur > 0.0 {
+                new_pos.min(dur)
+            } else {
+                new_pos
+            }
+        };
         if let Some(engine) = &self.engine {
             engine.send(audio::AudioCmd::Seek(new_pos));
         }

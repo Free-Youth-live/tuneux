@@ -134,7 +134,7 @@ pub enum AudioCmd {
     ///
     /// 播放位置到达 `end_secs` 后自然结束（draining 播完尾巴再 finished）；
     /// `end_secs` 为 None 时播到文件末尾。时长与进度按区间长度上报
-    ///（进度从 0 起，终点判定按源文件时间轴、重采样前累计）。
+    ///（进度沿用源文件绝对时间轴，时长按区间长度上报；终点在重采样前判定）。
     PlayRange {
         /// 待播放的文件路径。
         path: PathBuf,
@@ -732,12 +732,6 @@ impl Engine {
     pub fn is_playing(&self) -> bool {
         self.state.is_playing()
     }
-    /// 播放是否已停在末尾（EOF 排空完成 / 解码错误后未恢复）。
-    ///
-    /// 与 `is_playing() == false` 联合区分「暂停在中途」与「播完停在末尾」：
-    /// 末尾态下 Resume 不出声（解码器已耗尽），调用方应重新起播
-    /// （Play / PlayRange）。无时长曲目（`duration()` 为 0）只能靠本标志
-    /// 判定末尾——进度比较对其永远不成立。
     /// 一次读齐全部播放状态（进度 / 时长 / 播放中 / 末尾 / 介质 / 直通）。
     ///
     /// 消除三端各自多次读原子量的竞态窗口（读 position 后 duration 已变），
@@ -793,6 +787,11 @@ impl Engine {
     }
 
     /// 播放是否已停在末尾（EOF 排空完成 / 解码错误后未恢复）。
+    ///
+    /// 与 `is_playing() == false` 联合区分「暂停在中途」与「播完停在末尾」：
+    /// 末尾态下 Resume 不出声（解码器已耗尽），调用方应重新起播
+    /// （Play / PlayRange）。无时长曲目（`duration()` 为 0）只能靠本标志
+    /// 判定末尾——进度比较对其永远不成立。
     pub fn at_eof(&self) -> bool {
         self.state.at_eof()
     }

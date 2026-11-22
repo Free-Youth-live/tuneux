@@ -4,7 +4,7 @@
 # 版权所有 © 2026 不羁的青春（FreeYouth）
 # 本项目采用木兰宽松许可证，第 2 版（MulanPSL-2.0）开源。
 #
-# 架构：mono repo + Cargo workspace 七 crate 同仓（corex / mediax / commonx / pinx / tuneux / tuneux-fx / tuneux-max）。
+# 架构：mono repo + Cargo workspace 八 crate 同仓（corex / mediax / commonx / pinx / displayx / tuneux / tuneux-fx / tuneux-max）。
 # 单一 Cargo.lock 保证跨 crate 依赖类型一致。
 # =============================================================================
 
@@ -27,12 +27,14 @@ crossbeam-channel = "0.5"
 # 重采样与频谱
 rubato = "0.15"
 rustfft = "6"
+# Opus 解码（corex，版本统一于此防漂移）
+opus-decoder = "0.1.1"
 # 插件运行时（pinx）：WASM 解释器（控制面沙箱，纯 safe Rust）
 wasmi = "2.0.0"
 # 插件验签（pinx）：Ed25519 数字签名（纯 safe，BSD-3-Clause）
 ed25519-dalek = "2"
-# 终端 UI
-ratatui = "0.30.2"
+# 终端 UI：默认不带终端后端，产品按需启用；displayx 只使用绘制能力
+ratatui = { version = "0.30.2", default-features = false }
 unicode-width = "0.1"
 crossterm = "0.28"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

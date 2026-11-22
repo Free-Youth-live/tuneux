@@ -1,0 +1,4 @@
+# tuneux 第一方皮肤插件 · 能力清单（MV3 式 manifest）
+# id 绑定皮肤文件名；每行一个能力短名；# 注释与空行忽略。
+id = tuneux-skin:经典青
+theme

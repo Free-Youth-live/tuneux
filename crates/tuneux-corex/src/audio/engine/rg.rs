@@ -28,10 +28,10 @@
 //!   Q = 0.5（BS.1770 规定）。标准 48 kHz 下系数为
 //!   `b ~= (1.0, -2.0, 1.0)` / `a ~= (1.0, -1.9900, 0.9901)`。
 //!
-//! **为什么只支持单声道 / 已混合为单声道?** BS.1770 的多声道响度还要按通道加权
-//! （环绕 +1.5 dB 等）。本模块的第一步就要求调用方传入"单声道样本"
-//! ——即: 立体声 PCM 应先做 `0.5 * (L + R)` 混缩。这是 BS.1770 在 "mono" 模式下的
-//! 合法输入。
+//! **通道处理**：[`LoudnessAnalyzer`] 接受交错单声道或立体声，每个通道
+//! 独立 K 加权后累加能量；不能先做 `0.5 * (L + R)`，否则反相内容会抵消。
+//! 环绕声的额外通道加权不在当前实现范围内。[`measure_lufs`] 则保留为
+//! 单声道整段参考实现，供单元测试对照。
 //!
 //! **任意采样率**: 标准系数锁定 48 kHz。换采样率时对 shelf 走 RBJ cookbook 的双
 //! 线性变换、对 HP 走同样 RBJ 公式——任意 sr 重新设计系数；在 48 kHz 时与标准
@@ -51,9 +51,9 @@
 //!   相对门 -10 LU；简化版只算单帧整体均值，对稳态音乐（流行/古典/爵士
 //!   这种"整体响度"较稳的素材）与标准差距 < 0.5 LU。**对纯瞬态或极弱信号
 //!   可能偏差更大**，此时建议回到分块实现——本模块预留升级空间。
-//! - **不使用通道加权 G**: 单声道下 G=1，公式退化为
-//!   `L = -0.691 + 10*log10(mean(z^2))`。这正是 [`measure_lufs`]
-//!   实现的公式。
+//! - **不做环绕通道加权 G**: 单声道与立体声的各通道均按 G=1 求能量和。
+//!   单声道参考函数 [`measure_lufs`] 退化为
+//!   `L = -0.691 + 10*log10(mean(z^2))`。
 //! - **绝对门**: 如果 K 加权后样本极弱（均方 `< SILENCE_FLOOR`），返回
 //!   `f64::NEG_INFINITY`（调用方按"哑音"处理或跳过）。
 //!
@@ -69,11 +69,11 @@
 //!
 //! | 项目       | 标准 ITU-R BS.1770-4          | 本模块                              |
 //! | ---------- | ----------------------------- | ----------------------------------- |
-//! | 通道加权 G | 立体声 L=R=1.0；环绕 +1.5    | 强制单声道，G=1                     |
-//! | Gating     | 75% 重叠滑动窗 + 绝对/相对门  | 单帧整体均值，不门控                |
+//! | 通道加权 G | 立体声 L=R=1.0；环绕 +1.5    | 单/立体声 G=1，不做环绕加权       |
+//! | Gating     | 75% 重叠滑动窗 + 绝对/相对门  | 整体均值，不门控                    |
 //! | 采样率     | 48 kHz 锁定系数               | **任意 sr**（RBJ 双线性重设计）     |
-//! | 输入       | 多通道                        | 单声道                              |
-//! | 异常       | 各通道分别能量                | 总均值                              |
+//! | 输入       | 多通道                        | 单/立体声交错 PCM                   |
+//! | 能量       | 各通道分别滤波后求加权和      | 各通道分别滤波后等权求和            |
 //! | 输出       | Integrated Loudness            | 整体 K 加权 LUFS 标量（实数 dB）   |
 //!
 //! 这些取舍让模块保持"纯函数、单文件、零依赖、易测"，对绝大多数音乐素材
@@ -440,13 +440,12 @@ pub(crate) fn apply_gain_db(sample: f32, gain_db: f64) -> f32 {
 /// 播放中逐块喂入解码样本，结束时取整曲响度（LUFS）与目标增益。
 /// 维护 K 加权滤波状态与块能量累计，避免缓存整曲样本。
 ///
-/// 块长对齐 400 ms（BS.1770 块语义的简化：块内先求 mean(z^2)，
-/// 整体再平均——与 [`measure_lufs`] 的整段单次均值一致）。
-/// 交错多声道输入按帧平均为单声道后分析。
+/// 块长对齐 400 ms。每个声道分别经过 K 加权并累计能量，再将各声道
+/// 能量相加；不能先平均成立体声 mono，否则反相内容会相互抵消。
 pub struct LoudnessAnalyzer {
-    /// K 加权滤波器（流式 IIR 状态）。
-    filter: KWeight,
-    /// 累计的块均方能量之和。
+    /// 每个输入声道独立的 K 加权滤波器（流式 IIR 状态）。
+    filters: Vec<KWeight>,
+    /// 累计的块能量之和（已包含全部声道）。
     energy_sum: f64,
     /// 已处理的块数。
     block_count: u64,
@@ -464,7 +463,9 @@ impl LoudnessAnalyzer {
         let ch = channels.max(1);
         let block_len = ((f64::from(sample_rate) * 0.4) as usize).max(1);
         Self {
-            filter: KWeight::new_for_sr(sample_rate.max(1)),
+            filters: (0..ch)
+                .map(|_| KWeight::new_for_sr(sample_rate.max(1)))
+                .collect(),
             energy_sum: 0.0,
             block_count: 0,
             block_buf: Vec::with_capacity(block_len * ch),
@@ -479,17 +480,15 @@ impl LoudnessAnalyzer {
         let frame = self.block_len * self.channels;
         while self.block_buf.len() >= frame {
             let block = self.block_buf.drain(..frame).collect::<Vec<_>>();
-            // 每帧平均为单声道（避免交错顺序打乱 K 加权滤波）
-            let mut mono = Vec::with_capacity(self.block_len);
-            for f in 0..self.block_len {
-                let mut acc = 0.0f64;
-                for c in 0..self.channels {
-                    acc += f64::from(block[f * self.channels + c]);
+            let mut mono = vec![0.0f32; self.block_len];
+            let mut block_energy = 0.0f64;
+            for (ch, filter) in self.filters.iter_mut().enumerate() {
+                for (f, sample) in mono.iter_mut().enumerate() {
+                    *sample = block[f * self.channels + ch];
                 }
-                mono.push((acc / self.channels as f64) as f32);
+                block_energy += filter.mean_square_filtered(&mono);
             }
-            let mean_sq = self.filter.mean_square_filtered(&mono);
-            self.energy_sum += mean_sq;
+            self.energy_sum += block_energy;
             self.block_count += 1;
         }
     }
@@ -596,7 +595,7 @@ mod tests {
         );
     }
 
-    /// 流式分析器：交错立体声输入（每帧 2 声道平均为单声道）。
+    /// 流式分析器：交错立体声逐声道测量并求和，不做 mono 平均。
     #[test]
     fn loudness_analyzer_stereo_interleaved() {
         let sr = 44_100u32;
@@ -622,6 +621,23 @@ mod tests {
             "0.5 振幅正弦应低于满幅：{lufs}"
         );
     }
+    #[test]
+    fn anti_phase_stereo_is_not_cancelled_before_measurement() {
+        let sr = 48_000;
+        let samples = full_sine(1.0, 440.0, sr);
+        let mut mono = LoudnessAnalyzer::new(sr, 1);
+        mono.feed(&samples);
+        let stereo_samples: Vec<f32> = samples.iter().flat_map(|&s| [s, -s]).collect();
+        let mut stereo = LoudnessAnalyzer::new(sr, 2);
+        stereo.feed(&stereo_samples);
+        let difference = stereo.lufs() - mono.lufs();
+        assert!(difference.is_finite(), "反相立体声不得被测成静音");
+        assert!(
+            (difference - 10.0 * 2.0f64.log10()).abs() < 1e-6,
+            "两个等能声道应比单声道高 3.01 LU，实际 {difference}"
+        );
+    }
+
     #[test]
     fn full_sine_1khz_is_close_to_minus3_lufs() {
         // 满幅 1 kHz 正弦，RMS^2 = 0.5；K 加权在 1 kHz 处 ~= +0.68 dB

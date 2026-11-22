@@ -162,3 +162,58 @@ impl App {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// 标题/歌手搜索走 metadata_cache——未播曲目（文件名不含关键字）
+    /// 只要缓存已回填（启动预填 / 扫描合入回填）就必须命中。
+    #[test]
+    fn filter_playlist_matches_cached_title_and_artist() {
+        let config = crate::config::Config::default();
+        let mut app = App::new(&config);
+        let path = PathBuf::from("/music/01.flac");
+        app.playlist.add(playlist::PlaylistItem {
+            path: path.clone(),
+            album: None,
+            track_number: None,
+            cue: None,
+        });
+        // 模拟回填后的缓存：标题/歌手与文件名无关。
+        let md = tuneux_mediax::metadata::TrackMetadata {
+            title: Some("月半小夜曲".to_string()),
+            artist: Some("李克勤".to_string()),
+            ..Default::default()
+        };
+        app.metadata_cache.insert(path, md);
+
+        app.search_query = "夜曲".to_string();
+        assert_eq!(app.filter_playlist(), vec![0], "按标题应命中");
+        app.search_query = "李克勤".to_string();
+        assert_eq!(app.filter_playlist(), vec![0], "按歌手应命中");
+        app.search_query = "不存在的字".to_string();
+        assert!(app.filter_playlist().is_empty(), "无关关键字零命中");
+    }
+
+    /// 缓存缺失时回退文件名/路径匹配——扫描回填前的曲目
+    /// 至少能按文件名搜到，且搜索结果与「曲名/歌手/专辑/路径」声明一致。
+    #[test]
+    fn filter_playlist_falls_back_to_path_match() {
+        let config = crate::config::Config::default();
+        let mut app = App::new(&config);
+        let path = PathBuf::from("/music/月半小夜曲.flac");
+        app.playlist.add(playlist::PlaylistItem {
+            path: path.clone(),
+            album: None,
+            track_number: None,
+            cue: None,
+        });
+        // 不填缓存：仅路径回退应命中。
+        app.search_query = "小夜曲".to_string();
+        assert_eq!(app.filter_playlist(), vec![0], "文件名/路径回退应命中");
+        app.search_query = "查无此曲".to_string();
+        assert!(app.filter_playlist().is_empty(), "无关关键字零命中");
+    }
+}

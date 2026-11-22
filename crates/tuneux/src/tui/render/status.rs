@@ -15,6 +15,7 @@ use ratatui::{
 
 use super::fmt_time;
 use crate::playlist;
+use crate::tui::palette;
 use tuneux_corex as audio;
 use tuneux_mediax::metadata;
 
@@ -44,7 +45,7 @@ pub(super) fn draw_now_playing(
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         format!(" {} ", i18n.t("panel.current_track")),
         Style::default()
-            .fg(Color::Cyan)
+            .fg(palette::pal().chrome)
             .add_modifier(Modifier::BOLD),
     ));
     let inner = block.inner(area);
@@ -55,7 +56,7 @@ pub(super) fn draw_now_playing(
         Some(m) => m,
         None => {
             let hint = Paragraph::new(i18n.t("msg.empty").into_owned())
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(palette::pal().dim))
                 .alignment(Alignment::Center);
             frame.render_widget(hint, inner);
             return;
@@ -95,16 +96,16 @@ pub(super) fn draw_now_playing(
     // engine.bitstream() 由音频线程换曲时设置（设备支持文件采样率→true）。
     let bitstream = engine.as_ref().is_some_and(|e| e.bitstream());
     let tech_color = if bitstream {
-        Color::White
+        palette::pal().pass_fg.unwrap_or(Color::White)
     } else {
-        Color::DarkGray
+        palette::pal().dim
     };
 
     let lines = vec![
         Line::from(Span::styled(
             title,
             Style::default()
-                .fg(Color::Yellow)
+                .fg(palette::pal().title_fg.unwrap_or(Color::Yellow))
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::raw(format!(
@@ -127,9 +128,9 @@ pub(super) fn draw_now_playing(
             format!("{} ", i18n.t("status.stopped"))
         };
         let color = if playing {
-            Color::Green
+            palette::pal().ok
         } else {
-            Color::DarkGray
+            palette::pal().dim
         };
         first
             .spans
@@ -170,7 +171,7 @@ pub(super) fn draw_status_bar(
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         format!(" {} ", i18n.t("panel.status")),
         Style::default()
-            .fg(Color::Cyan)
+            .fg(palette::pal().chrome)
             .add_modifier(Modifier::BOLD),
     ));
     let inner = block.inner(area);
@@ -187,7 +188,9 @@ pub(super) fn draw_status_bar(
         frame.render_widget(
             Paragraph::new(Span::styled(
                 format!("⚠ {err}"),
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(palette::error_fg())
+                    .add_modifier(Modifier::BOLD),
             )),
             row_chunks[0],
         );
@@ -199,7 +202,7 @@ pub(super) fn draw_status_bar(
         None => {
             frame.render_widget(
                 Paragraph::new(i18n.t("msg.engine_not_ready").into_owned())
-                    .style(Style::default().fg(Color::Red)),
+                    .style(Style::default().fg(palette::error_fg())),
                 row_chunks[1],
             );
             return;
@@ -214,9 +217,9 @@ pub(super) fn draw_status_bar(
         i18n.t("status.stopped")
     };
     let status_color = if playing {
-        Color::Green
+        palette::pal().ok
     } else {
-        Color::DarkGray
+        palette::pal().dim
     };
 
     // 分轨内进度（CUE 分轨按区间换算）。
@@ -296,7 +299,8 @@ fn draw_progress_chars(ratio: f64, width: usize) -> String {
     }
     // 游标位置 = 比例 × 宽度，clamp 防止越界
     let pos = (ratio.clamp(0.0, 1.0) * width as f64) as usize;
-    let pos = pos.min(width);
+    // 满进度时游标落在末位（pos == width 永远画不出 ●，两端不对称）。
+    let pos = pos.min(width.saturating_sub(1));
     let mut s = String::with_capacity(width);
     for i in 0..width {
         if i < pos {
@@ -310,6 +314,28 @@ fn draw_progress_chars(ratio: f64, width: usize) -> String {
     s
 }
 
+/// 把帮助栏文本切成带样式的行：每条 `键名 解释` 的键名用 `key_fg`，
+/// 解释与条目分隔符用 `dim`。条目以 ` · ` 分隔、键名到第一个空格为止
+/// （`↑↓ 选曲` / `Enter 播放/折叠` / `/ 搜索(Esc退)` 都按此切分）。
+///
+/// 纯函数（颜色显式传入），便于单测固定观感契约。
+fn help_spans(text: &str, key_fg: Color, dim: Color) -> Vec<Span<'static>> {
+    let mut out: Vec<Span<'static>> = Vec::new();
+    for (i, entry) in text.split(" · ").enumerate() {
+        if i > 0 {
+            out.push(Span::styled(" · ".to_string(), Style::default().fg(dim)));
+        }
+        match entry.split_once(' ') {
+            Some((key, rest)) => {
+                out.push(Span::styled(key.to_string(), Style::default().fg(key_fg)));
+                out.push(Span::styled(format!(" {rest}"), Style::default().fg(dim)));
+            }
+            None => out.push(Span::styled(entry.to_string(), Style::default().fg(key_fg))),
+        }
+    }
+    out
+}
+
 /// 帮助栏：按焦点动态显示快捷键。
 pub(super) fn draw_help_bar(
     frame: &mut ratatui::Frame,
@@ -320,7 +346,7 @@ pub(super) fn draw_help_bar(
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         format!(" {} ", i18n.t("panel.help")),
         Style::default()
-            .fg(Color::Cyan)
+            .fg(palette::pal().chrome)
             .add_modifier(Modifier::BOLD),
     ));
     let inner = block.inner(area);
@@ -330,8 +356,43 @@ pub(super) fn draw_help_bar(
         playlist::Panel::Browser => i18n.t("help.browser"),
         playlist::Panel::Playlist => i18n.t("help.playlist"),
     };
-    frame.render_widget(
-        Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
-        inner,
-    );
+    // 键名用主题的 key_fg（磷光绿 = 白，经典 = 与旧观感一致的次要灰），
+    // 解释文字沿用 dim；条目分隔符 " · " 同样用 dim。
+    let spans = help_spans(&help, palette::pal().key_fg, palette::pal().dim);
+    frame.render_widget(Paragraph::new(Line::from(spans)), inner);
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 帮助栏切分契约：键名在前、解释在后，条目分隔符保留。
+    #[test]
+    fn help_spans_split_key_and_desc() {
+        let spans = help_spans(
+            "↑↓ 选曲 · Enter 播放/折叠 · / 搜索(Esc退)",
+            Color::White,
+            Color::Green,
+        );
+        let texts: Vec<String> = spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(texts[0], "↑↓");
+        assert_eq!(texts[1], " 选曲");
+        assert_eq!(texts[2], " · ");
+        assert_eq!(texts[3], "Enter");
+        assert_eq!(texts[4], " 播放/折叠");
+        assert_eq!(texts[5], " · ");
+        assert_eq!(texts[6], "/");
+        assert_eq!(texts[7], " 搜索(Esc退)");
+        // 键名白、解释与分隔符 dim。
+        assert_eq!(spans[0].style.fg, Some(Color::White));
+        assert_eq!(spans[1].style.fg, Some(Color::Green));
+        assert_eq!(spans[3].style.fg, Some(Color::White));
+    }
+
+    /// 无空格条目原样作为键名（不缺段、不 panic）。
+    #[test]
+    fn help_spans_tolerates_entry_without_space() {
+        let spans = help_spans("Esc", Color::White, Color::Green);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content.to_string(), "Esc");
+    }
 }

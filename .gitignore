@@ -11,6 +11,8 @@
 .*
 # 例外：.gitignore 本身需要提交
 !.gitignore
+# 例外：.gitattributes 钉死行尾（插件 manifest 字节参与签名）需要提交
+!.gitattributes
 # 例外：.github 发布构建配置需要提交
 !.github/
 

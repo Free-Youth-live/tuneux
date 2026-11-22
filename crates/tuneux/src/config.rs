@@ -1,7 +1,8 @@
 //! # 配置模块
 //!
 //! 负责 tuneux 运行时配置的加载与持久化。配置以 TOML 格式存储，
-//! 文件名固定为 `tuneux.toml`。
+//! 文件名固定为 `tuneux.toml`；播放列表与断点续播状态独立存于
+//! `tuneux-playlist.toml`。
 //!
 //! ## 配置文件位置策略（便携优先）
 //!
@@ -43,7 +44,7 @@ pub use tuneux_commonx::config_status::LoadStatus;
 
 /// 配置损坏停写锁（tuneux.toml 维度）：置位后本会话一切保存入口跳过。
 static CONFIG_SAVE_LOCKED: AtomicBool = AtomicBool::new(false);
-/// 播放状态损坏停写锁（playlist.toml 维度）。
+/// 播放状态损坏停写锁（tuneux-playlist.toml 维度）。
 static PLAYLIST_SAVE_LOCKED: AtomicBool = AtomicBool::new(false);
 
 /// 循环播放模式的 i18n key（状态条显示）。
@@ -95,11 +96,11 @@ repeat.off = \"顺序\"\n\
 repeat.single = \"单曲\"\n\
 repeat.list = \"循环\"\n\
 # —— 帮助栏 ——\n\
-help.browser = \"↑↓ 浏览 · Enter 进入/播放 · a 加入列表 · / 搜索(Esc退) · b 关闭浏览器 · Backspace 上级 · ←→ ±5s · 空格 暂停 · +/- 音量 · v 频谱 · c 封面 · m 介质 · ? 关于 · q 退出\"\n\
-help.playlist = \"↑↓ 选曲 · Enter 播放/折叠 · g 分组 · a 加入 · d 删除 · x 清空 · r 循环 · s 随机 · n/p 上下首 · ←→ ±5s · / 搜索(Esc退) · b 浏览器 · 空格 暂停 · v 频谱 · l 歌词 · c 封面 · m 介质 · ? 关于 · q 退出\"\n\
+help.browser = \"↑↓ 浏览 · t 主题 · Enter 进入/播放 · a 加入列表 · / 搜索(Esc退) · b 关闭浏览器 · Backspace 上级 · ←→ ±5s · 空格 暂停 · +/- 音量 · v 频谱 · c 封面 · m 介质 · ? 关于 · q 退出\"\n\
+help.playlist = \"↑↓ 选曲 · t 主题 · Enter 播放/折叠 · g 分组 · a 加入 · d 删除 · x 清空 · r 循环 · s 随机 · n/p 上下首 · ←→ ±5s · / 搜索(Esc退) · b 浏览器 · 空格 暂停 · v 频谱 · l 歌词 · c 封面 · m 介质 · ? 关于 · q 退出\"\n\
 # —— 关于弹窗 ——\n\
 about.description = \"这是一个基于命令行的音乐播放器\"\n\
-about.formats = \"支持 MP3 · FLAC · WAV · OGG · OPUS · WV · M4A · AAC · ALAC\"\n\
+about.formats = \"支持 MP3 · FLAC · WAV · OGG · OPUS · WV · M4A · AAC · ALAC · DSF/DFF · 经随包 FFmpeg 支持更多格式（APE · WMA · TAK · 视频音轨）\"\n\
 about.offline = \"纯离线 · 不收集任何数据\"\n\
 about.license = \"本项目采用木兰宽松许可证 v2（MulanPSL-2.0）\"\n\
 about.deps = \"基于以下开源项目构建：\"\n\
@@ -125,6 +126,15 @@ msg.thread_fail = \"线程启动失败\"\n\
 msg.empty = \"（未播放）\"\n\
 msg.unknown_format = \"未知格式\"\n\
 msg.medium = \"介质\"\n\
+msg.theme = \"主题\"\n\
+theme.phosphor = \"磷光绿\"\n\
+theme.classic = \"经典青\"\n\
+theme.deepblue = \"深蓝\"\n\
+theme.navy = \"藏青\"\n\
+theme.terminal = \"终端原生\"\n\
+theme.blackwhite = \"黑白\"\n\
+theme.graywhite = \"灰白\"\n\
+theme.dimcolor = \"暗彩\"\n\
 msg.clear_confirm = \"再按一次 x 确认清空播放列表\"\n\
 msg.cleared = \"播放列表已清空\"\n\
 msg.bm_unknown_album = \"未知专辑\"\n\
@@ -331,14 +341,16 @@ pub struct Config {
 
     /// 自定义按键映射：动作名 → 键描述（如 `"toggle_play" = "space"`）。
     ///
-    /// **动作名**（map 的键，即"要做什么"）：`toggle_play`（播放/暂停）、
-    /// `next`（下一曲）、`prev`（上一曲）、`volume_up`（音量 +5%）、
-    /// `volume_down`（音量 −5%）。
+    /// **动作名**（map 的键，即"要做什么"）：合法集合见 [`KEYMAP_ACTIONS`]，
+    /// 例：`toggle_play`（播放/暂停）、`next`（下一曲）、`prev`（上一曲）、
+    /// `volume_up`（音量 +5%）、`volume_down`（音量 −5%）、`cycle_theme`（循环切换配色主题）。
     ///
     /// **键描述**（map 的值，即"按哪个键"）语法见 [`tuneux_commonx::parse_key_desc`]，
     /// 例：`"space"`、`"n"`、`"shift+n"`、`"+"`、`"-"`。
     ///
-    /// 默认空 map：全部沿用内置默认键（空格/n/p/+/-），旧配置无需迁移。
+    /// 默认空 map：全部沿用内置默认键（空格/n/p/+/- 等），旧配置无需迁移。
+    /// **覆盖语义**：已映射的键优先于内置默认键——把别的动作绑到某个内置键，
+    /// 该键就执行新动作（不再执行内置动作，不是叠加生效）。
     /// 未知动作名或无法解析的键描述会被忽略并回退默认键，绝不 panic。
     #[serde(default)]
     pub keymap: HashMap<String, String>,
@@ -353,6 +365,14 @@ pub struct Config {
     /// 自由字符串（非封闭枚举），空串回落 `"zh"`，重启生效。
     #[serde(default = "default_lang")]
     pub lang: String,
+
+    /// 配色主题：合法值见 `tui::palette` 的主题表——
+    /// `"terminal"`（默认，终端原生）、`"phosphor"`（磷光绿）、`"classic"`（经典青）、
+    /// `"deepblue"`（深蓝）、`"navy"`（藏青）、`"blackwhite"`（黑白）、`"graywhite"`（灰白）、
+    /// `"dimcolor"`（暗彩）；未知值回落 `"terminal"`。启动按配置初始化，运行时
+    /// `t` 键循环切换并写回（keymap 动作名 `cycle_theme`）。
+    #[serde(default = "default_theme")]
+    pub theme: String,
 }
 
 /// 默认音量：1.0（满音量）。
@@ -386,6 +406,11 @@ fn default_lang() -> String {
     "zh".to_string()
 }
 
+/// 配色主题默认值：终端原生（跟随终端自身配色）。
+fn default_theme() -> String {
+    "terminal".to_string()
+}
+
 /// 手动实现 Default：音量默认满音量 1.0（而非 f32 派生的 0.0 静音），
 /// 浏览器比例默认 0.4，其余字段用类型的自然默认。
 impl Default for Config {
@@ -408,6 +433,7 @@ impl Default for Config {
             keymap: HashMap::new(),
             media_keys_enabled: default_media_keys_enabled(),
             lang: default_lang(),
+            theme: default_theme(),
         }
     }
 }
@@ -428,7 +454,7 @@ impl Config {
     }
 }
 
-/// 播放状态（保存到独立文件 `playlist.toml`）。
+/// 播放状态（保存到独立文件 `tuneux-playlist.toml`）。
 ///
 /// 与 `tuneux.toml`（配置偏好）分离：这里存播放列表与每首曲目的
 /// 播放进度（断点续播），体积可能较大且频繁变化。
@@ -455,10 +481,10 @@ pub struct PlaylistState {
     pub positions: BTreeMap<PathBuf, f64>,
     /// ReplayGain 测量结果缓存（路径 → 增益 dB）。
     ///
-    /// 与断点续播进度一同持久化到 `playlist.toml`：同一首歌曲
+    /// 与断点续播进度一同持久化到 `tuneux-playlist.toml`：同一首歌曲
     /// 首次播放时流式分析测得整曲响度，之后每次播放直接套用缓存
     /// 的增益，免去重复分析（跨会话有效）。`#[serde(default)]`
-    /// 保证旧版 `playlist.toml`（无此字段）仍可正常加载。
+    /// 保证旧版播放状态文件（无此字段）仍可正常加载。
     #[serde(default)]
     pub replay_gain: BTreeMap<PathBuf, f64>,
 }
@@ -479,6 +505,15 @@ impl PlaylistState {
     pub fn get_position(&self, path: &Path) -> Option<f64> {
         self.positions.get(path).copied()
     }
+
+    /// 裁剪失效路径：断点表与 ReplayGain 表中文件已不存在的条目一并删除。
+    ///
+    /// 删除/移动文件后两张表按路径跨会话累积、永不清理；启动与退出
+    /// 各裁剪一次（退出兜底正常关闭场景，启动兜底强杀/崩溃场景）。
+    pub fn prune_missing_files(&mut self) {
+        self.positions.retain(|p, _| p.exists());
+        self.replay_gain.retain(|p, _| p.exists());
+    }
 }
 
 /// 配置文件 `tuneux.toml` 的存储路径。
@@ -486,9 +521,9 @@ pub fn config_path() -> PathBuf {
     tuneux_commonx::portable_path("tuneux.toml", "tuneux")
 }
 
-/// 播放状态文件 `playlist.toml` 的存储路径。
+/// 播放状态文件 `tuneux-playlist.toml` 的存储路径。
 pub fn playlist_state_path() -> PathBuf {
-    tuneux_commonx::portable_path("playlist.toml", "tuneux")
+    tuneux_commonx::portable_path("tuneux-playlist.toml", "tuneux")
 }
 
 /// keymap 合法动作名白名单（与 keys.rs 支持的动作一致）。
@@ -503,6 +538,7 @@ const KEYMAP_ACTIONS: &[&str] = &[
     "toggle_shuffle",
     "cycle_medium",
     "cycle_visual",
+    "cycle_theme",
     "toggle_group_view",
     "toggle_lyrics",
     "cycle_cover",
@@ -628,7 +664,7 @@ pub fn load_playlist_state_with_status() -> (PlaylistState, LoadStatus) {
     }
 }
 
-/// 保存播放状态到独立文件 `playlist.toml`。
+/// 保存播放状态到独立文件 `tuneux-playlist.toml`。
 ///
 /// 保存失败静默吞掉、不阻塞退出（理由同 [`save`]：运行期打印会弄脏屏幕）。
 /// 损坏停写锁置位时整体跳过，见 [`load_playlist_state_with_status`]。
@@ -728,6 +764,7 @@ mod tests {
             ]),
             media_keys_enabled: true,
             lang: default_lang(),
+            theme: "classic".to_string(),
         };
         save_to(&tmp, &original).expect("保存应成功");
         let loaded = load_from(&tmp).expect("加载应成功");
@@ -750,7 +787,20 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
-    /// 播放状态（playlist.toml）往返：保存后再加载，字段应完全一致。
+    /// 主题默认值为终端原生；显式 classic 可回切；未知值由渲染侧回落默认。
+    #[test]
+    fn theme_defaults_to_terminal_and_accepts_classic() {
+        assert_eq!(Config::default().theme, "terminal");
+        let cfg: Config = toml::from_str("theme = 'classic'\n").unwrap();
+        assert_eq!(cfg.theme, "classic");
+        let cfg: Config = toml::from_str("theme = 'nope'\n").unwrap();
+        assert_eq!(
+            crate::tui::palette::select(&cfg.theme),
+            crate::tui::palette::TERMINAL
+        );
+    }
+
+    /// 播放状态（tuneux-playlist.toml）往返：保存后再加载，字段应完全一致。
     #[test]
     fn playlist_state_roundtrip() {
         let tmp = std::env::temp_dir().join("tuneux_test_playlist_state.toml");
@@ -785,7 +835,7 @@ mod tests {
             loaded.positions.get(&PathBuf::from("/tmp/music/a.mp3")),
             Some(&42.5)
         );
-        // 旧版 playlist.toml（无 current_cue 字段）应照常解析（serde default）。
+        // 旧版播放状态文件（无 current_cue 字段）应照常解析（serde default）。
         let old: PlaylistState =
             toml::from_str("current = '/tmp/music/a.mp3'\nitems = []\npositions = {}\n")
                 .expect("旧格式应可解析");
@@ -1174,6 +1224,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn real_english_table_covers_every_chinese_key() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../locales/en.txt");
+        let en = LangTable::load(&path).expect("真实 en.txt 应可加载");
+        for key in zh_table().keys() {
+            assert!(en.get(key).is_some(), "en.txt 缺少 {key}");
+        }
+    }
+
     /// i18n 集成测试：en.txt 加载 + 三级回退链。
     #[test]
     fn en_file_load_and_three_level_fallback() {
@@ -1286,5 +1345,29 @@ mod tests {
         save_to_if_unlocked(&tmp, &Config::default(), &locked).expect("未锁定应保存成功");
         assert!(tmp.exists());
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// 失效路径裁剪：删除文件后 positions/replay_gain 中的残留条目被清掉，
+    /// 仍存在的文件保留（启动/退出各裁剪一次的口径）。
+    #[test]
+    fn prune_missing_files_removes_deleted_entries() {
+        let dir = std::env::temp_dir().join("tuneux_prune_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let alive = dir.join("alive.mp3");
+        let gone = dir.join("gone.mp3");
+        std::fs::write(&alive, b"x").unwrap();
+
+        let mut state = PlaylistState {
+            positions: BTreeMap::from([(alive.clone(), 10.0), (gone.clone(), 20.0)]),
+            replay_gain: BTreeMap::from([(alive.clone(), -3.0), (gone.clone(), -6.0)]),
+            ..Default::default()
+        };
+        state.prune_missing_files();
+        assert_eq!(state.positions.len(), 1, "已删除文件的断点应被裁剪");
+        assert!(state.positions.contains_key(&alive));
+        assert!(state.replay_gain.contains_key(&alive));
+        assert!(!state.replay_gain.contains_key(&gone));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -217,8 +217,11 @@ impl EqEffect {
         // 逐样本过 10 段 biquad（L/R 独立状态）。上游 push_all 只推整帧，
         // 立体声缓冲恒为偶数长度；断言把这一不变式显式化，余下的孤立样本
         // （正常路径不存在）按静默忽略处理，与单声道分支口径一致。
+        // 断言限定 channels==2：单声道缓冲无帧对齐要求、
+        // 长度可为奇数——旧断言未限定声道数，单声道奇数长度缓冲在 debug
+        // 构建直接 panic。
         debug_assert!(
-            data.len().is_multiple_of(2),
+            channels != 2 || data.len().is_multiple_of(2),
             "立体声缓冲必须帧对齐（上游 push_all 保证）"
         );
         if channels == 2 {
@@ -395,6 +398,16 @@ mod tests {
         let orig = data.clone();
         fx.process(&mut data, 2, 48_000, &params);
         assert_eq!(data, orig, "禁用时应完全直通");
+    }
+
+    /// 单声道奇数长度缓冲不得触发立体声帧对齐断言。
+    #[test]
+    fn mono_odd_length_buffer_processes() {
+        let mut fx = EqEffect::default();
+        let params = EqParams::new();
+        let mut data = vec![0.5f32; 5];
+        fx.process(&mut data, 1, 48_000, &params);
+        assert!(data.iter().all(|v| v.is_finite()), "单声道处理输出必须有限");
     }
 
     #[test]

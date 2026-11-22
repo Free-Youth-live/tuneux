@@ -21,12 +21,37 @@ pub(crate) fn preload_target_of(item: &playlist::PlaylistItem) -> audio::Preload
     }
 }
 
+/// ReplayGain 缓存条目上限：删除文件后（或长会话播放大量不同文件）
+/// 增益表不再无界累积并跨会话持久化；超限按 LRU 逐出最久未用条目。
+const REPLAY_GAIN_CACHE_MAX: usize = 512;
+
+/// 写入 ReplayGain 缓存并执行 LRU 上限：命中旧条目移到队尾（最近使用），
+/// 新条目入队尾，超上限逐出队头（最久未用）。缓存表与使用序同步维护。
+pub(crate) fn replay_gain_insert_lru(
+    cache: &mut std::collections::BTreeMap<std::path::PathBuf, f64>,
+    order: &mut std::collections::VecDeque<std::path::PathBuf>,
+    path: std::path::PathBuf,
+    db: f64,
+) {
+    if let Some(pos) = order.iter().position(|p| *p == path) {
+        order.remove(pos);
+    }
+    order.push_back(path.clone());
+    cache.insert(path.clone(), db);
+    if order.len() > REPLAY_GAIN_CACHE_MAX {
+        if let Some(old) = order.pop_front() {
+            cache.remove(&old);
+        }
+    }
+}
+
 /// 重播当前曲（到结尾后）：排空残留事件 + 取走滞留增益 + 发 Play/PlayRange + 归档增益。
 /// 自由函数（不持 `&mut self`）：避免与 `self.engine` 的借用冲突；只碰 disjoint 字段。
 fn replay_current(
     engine: &audio::Engine,
     current_path: Option<&std::path::Path>,
     replay_gain_cache: &mut std::collections::BTreeMap<std::path::PathBuf, f64>,
+    replay_gain_order: &mut std::collections::VecDeque<std::path::PathBuf>,
     decision: &tuneux_mediax::PlaybackDecision,
 ) {
     let stale_gain = engine.take_measured_gain_db();
@@ -52,13 +77,13 @@ fn replay_current(
         }
     }
     if let (Some(db), Some(path)) = (stale_gain, current_path) {
-        replay_gain_cache.insert(path.to_path_buf(), db);
+        replay_gain_insert_lru(replay_gain_cache, replay_gain_order, path.to_path_buf(), db);
     }
 }
 
 impl App {
     /// 当前条目的 CUE 引用（克隆；普通曲目为 None）。
-    fn current_cue(&self) -> Option<playlist::CueRef> {
+    pub(crate) fn current_cue(&self) -> Option<playlist::CueRef> {
         self.playlist
             .current_index()
             .and_then(|i| self.playlist.items().get(i))
@@ -89,7 +114,14 @@ impl App {
     }
 
     /// 切到列表指定项，触发播放 + 更新元数据。
-    pub fn play_and_update_current(&mut self, index: usize, config: &Config) {
+    ///
+    /// `manual` 为 true 表示用户手动点播：清零连续失败计数，恢复
+    /// 自动跳曲能力；自动跳曲（失败驱动 / 曲终推进）经 handle_nav_outcome
+    /// 传 false，不打断计数累积。
+    pub fn play_and_update_current(&mut self, index: usize, config: &Config, manual: bool) {
+        if manual {
+            self.consecutive_failures = 0;
+        }
         // 切曲前：存旧位置（供下次接着听）。CUE 分轨不写断点——断点表以文件
         // 路径为键，整轨位置会覆盖该文件作为普通曲目播放时的续播点。
         let old_is_cue = self.current_item_is_cue();
@@ -121,6 +153,13 @@ impl App {
         // 记住切换前的路径：同一整轨文件的 CUE 分轨切换走文件内 Seek（不重开）。
         let prev_path = self.current_path.clone();
         let same_file = prev_path.as_ref() == Some(&path);
+        let prev_cover = same_file
+            .then(|| {
+                self.current_metadata
+                    .as_ref()
+                    .and_then(|md| md.cover.clone())
+            })
+            .flatten();
         self.current_metadata = Some(self.get_or_extract_metadata(&path));
         // CUE 分轨：标题/表演者优先取 .cue 内的曲目信息——与列表口径一致，
         // 状态栏与系统媒体面板显示分轨名而非整轨专辑名。
@@ -134,9 +173,13 @@ impl App {
         }
         // 元数据缓存不带封面字节；命中缓存切回时封面缺失，为当前曲目补提取一次，
         // 已确认无封面的文件记负标记，不再重复整文件标签探测。
-        if !same_file {
-            if let Some(md) = self.current_metadata.as_mut() {
-                if md.cover.is_none() && !self.coverless_files.contains(&path) {
+        if let Some(md) = self.current_metadata.as_mut() {
+            if md.cover.is_none() {
+                // 同文件分轨切换：缓存命中的元数据不带封面字节，整体覆盖
+                // 会把旧封面清成 None——从旧元数据搬移封面，封面面板不断片。
+                if let Some(prev) = prev_cover {
+                    md.cover = Some(prev);
+                } else if !same_file && !self.coverless_files.contains(&path) {
                     md.cover = tuneux_mediax::metadata::TrackMetadata::from_file(&path).cover;
                     if md.cover.is_none() {
                         self.coverless_files.insert(path.clone());
@@ -199,9 +242,10 @@ impl App {
             let next = self.playlist.peek_next_item(config.repeat);
             engine.send(audio::AudioCmd::PreloadNext(next.map(preload_target_of)));
         }
-        // 旧曲滞留的测量增益归档（下次播放旧曲时直接复用，免重测）。
+        // 旧曲滞留的测量增益归档（下次播放旧曲时直接复用，免重测）；
+        // 经 cache_replay_gain 走 LRU 上限。
         if let (Some(db), Some(old)) = (stale_gain, prev_path) {
-            self.replay_gain_cache.insert(old, db);
+            self.cache_replay_gain(old, db);
         }
     }
 
@@ -234,6 +278,9 @@ impl App {
                 }
             }
             self.current_path = Some(path.clone());
+            // 新曲目：清空频谱峰值白帽，避免上一曲高峰压在新曲前奏上
+            //（与 play_and_update_current 同口径）。
+            self.spectrum_peaks.borrow_mut().reset();
             if same_file {
                 // 同一整轨文件：封面/歌词复用，不重复解码与读盘。
             } else {
@@ -276,20 +323,28 @@ impl App {
     /// 切到下一首（按 repeat + shuffle 策略）。
     pub fn advance_to_next_track(&mut self, config: &Config) {
         let outcome = self.playlist.next(config.repeat);
-        self.handle_nav_outcome(outcome, config);
+        self.handle_nav_outcome(outcome, config, true);
     }
 
     /// 切到上一首（按 repeat + shuffle 策略）。
     pub fn advance_to_prev_track(&mut self, config: &Config) {
         let outcome = self.playlist.prev(config.repeat);
-        self.handle_nav_outcome(outcome, config);
+        self.handle_nav_outcome(outcome, config, true);
     }
 
-    /// 把 NavOutcome 翻译成实际的播放/暂停操作
-    pub fn handle_nav_outcome(&mut self, outcome: playlist::NavOutcome, config: &Config) {
+    /// 把 NavOutcome 翻译成实际的播放/暂停操作。
+    ///
+    /// `manual` 为 true 表示用户手动切曲（n/p 键）：清零连续失败计数；
+    /// 主循环的自动推进（曲终 / 失败跳曲 / 扫描池首播）传 false。
+    pub fn handle_nav_outcome(
+        &mut self,
+        outcome: playlist::NavOutcome,
+        config: &Config,
+        manual: bool,
+    ) {
         match outcome {
             playlist::NavOutcome::Switch(idx) => {
-                self.play_and_update_current(idx, config);
+                self.play_and_update_current(idx, config, manual);
             }
             playlist::NavOutcome::Repeat => {
                 // 单曲循环：重新发 Play 让流再起（CUE 分轨从片段起点起播）。
@@ -348,7 +403,7 @@ impl App {
                         engine.set_replay_gain(rg_gain);
                     }
                     if let Some(db) = stale_gain {
-                        self.replay_gain_cache.insert(path, db);
+                        self.cache_replay_gain(path, db);
                     }
                 }
             }
@@ -368,6 +423,18 @@ impl App {
             return pos;
         };
         playlist::clamp_seek_to_cue(pos, Some(cue))
+    }
+
+    /// 写入 ReplayGain 缓存（LRU 上限，见 replay_gain_insert_lru）。
+    /// 测量结果归档统一走本入口（gapless 切曲、曲终、重播归档），
+    /// 防止删除文件后增益表无界累积并跨会话持久化。
+    pub(crate) fn cache_replay_gain(&mut self, path: std::path::PathBuf, db: f64) {
+        replay_gain_insert_lru(
+            &mut self.replay_gain_cache,
+            &mut self.replay_gain_order,
+            path,
+            db,
+        );
     }
 
     /// 刷新预载目标：循环/随机模式变化后调用，重发 PreloadNext。
@@ -395,9 +462,15 @@ impl App {
         let cue = self.current_cue();
         if let Some(engine) = &self.engine {
             let is_playing = engine.is_playing();
+            // 无 end_ms 的末轨用「分轨起点 + 引擎区间时长」折算绝对终点：
+            // engine.duration() 是区间相对长度，与绝对坐标的 position() 量纲不同。
+            let start = cue
+                .as_ref()
+                .map(|c| c.start_ms as f64 / 1000.0)
+                .unwrap_or(0.0);
             let end_secs = match cue.as_ref().and_then(|c| c.end_ms) {
                 Some(ms) => ms as f64 / 1000.0,
-                None => engine.duration(),
+                None => start + engine.duration(),
             };
             // 末尾态双判据：进度判定（有时长曲目）∪ 引擎末尾标志——
             // 无时长曲目（Opus 后端 duration=0；FFmpeg 探测失败亦无时长）
@@ -424,6 +497,7 @@ impl App {
                         engine,
                         self.current_path.as_deref(),
                         &mut self.replay_gain_cache,
+                        &mut self.replay_gain_order,
                         &decision,
                     );
                 }
@@ -446,5 +520,59 @@ impl App {
             let v = (engine.volume() - 0.05).max(0.0);
             engine.send(audio::AudioCmd::SetVolume(v));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{BTreeMap, VecDeque};
+
+    /// ReplayGain 缓存 LRU：新条目入队尾，超上限逐出队头（最久未用）；
+    /// 命中旧条目移到队尾（最近使用）不触发逐出。
+    #[test]
+    fn replay_gain_cache_lru_evicts_oldest() {
+        let mut cache: BTreeMap<std::path::PathBuf, f64> = BTreeMap::new();
+        let mut order: VecDeque<std::path::PathBuf> = VecDeque::new();
+        for i in 0..REPLAY_GAIN_CACHE_MAX {
+            replay_gain_insert_lru(
+                &mut cache,
+                &mut order,
+                std::path::PathBuf::from(format!("/t{i}.mp3")),
+                i as f64,
+            );
+        }
+        assert_eq!(cache.len(), REPLAY_GAIN_CACHE_MAX);
+        // 触达最旧条目：移到队尾（最近使用）
+        replay_gain_insert_lru(
+            &mut cache,
+            &mut order,
+            std::path::PathBuf::from("/t0.mp3"),
+            0.0,
+        );
+        assert_eq!(cache.len(), REPLAY_GAIN_CACHE_MAX);
+        // 插入新条目：逐出的应是最久未用的 /t1.mp3，而非刚触达的 /t0.mp3
+        replay_gain_insert_lru(
+            &mut cache,
+            &mut order,
+            std::path::PathBuf::from("/new.mp3"),
+            9.9,
+        );
+        assert_eq!(cache.len(), REPLAY_GAIN_CACHE_MAX, "上限恒定");
+        assert!(
+            cache.contains_key(&std::path::PathBuf::from("/t0.mp3")),
+            "最近使用的 /t0.mp3 不应被逐出"
+        );
+        assert!(
+            !cache.contains_key(&std::path::PathBuf::from("/t1.mp3")),
+            "最久未用的 /t1.mp3 应被逐出"
+        );
+        assert!(cache.contains_key(&std::path::PathBuf::from("/new.mp3")));
+        // 使用序与缓存表同步：逐出后队头应是最久未用条目
+        assert_eq!(
+            order.front(),
+            Some(&std::path::PathBuf::from("/t2.mp3")),
+            "逐出后队头应是最久未用条目"
+        );
     }
 }

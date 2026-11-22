@@ -15,9 +15,6 @@ url = "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz"
 # 源码包 SHA-256（官方发布页口径；素材区原件与官方下载双渠道核验一致）
 sha256 = "8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e"
 
-# GPG 签名（可选二次校验；素材区已归档同名 .asc）
-asc_url = "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz.asc"
-
 # 构建配置（LGPL 纯度：不出现 --enable-gpl / --enable-nonfree）
 # 全量原生组件 + 禁外部库自动探测：许可合规由配置保证，不依赖构建机环境
 # --disable-x86asm：CI runner 不保证装 nasm/yasm（x86 汇编器），禁用后走

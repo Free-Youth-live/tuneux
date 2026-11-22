@@ -29,7 +29,7 @@ ringbuf.workspace = true
 crossbeam-channel.workspace = true
 rubato.workspace = true
 rustfft.workspace = true
-opus-decoder = "0.1.1"
+opus-decoder.workspace = true
 
 [dev-dependencies]
 # wavicle 仅作自研 WavPack 解码器的测试对拍参照物（生产解码已自研，
